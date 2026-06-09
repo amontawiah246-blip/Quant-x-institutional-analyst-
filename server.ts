@@ -124,8 +124,18 @@ function runPythonEngine(candlesByTF: Record<string, Candle[]>): Promise<any> {
       resolve(null); // graceful fallback
     });
 
-    proc.stdin.write(payload);
-    proc.stdin.end();
+    proc.stdin.on('error', (err) => {
+      console.warn('Python stdin error:', err.message);
+      resolve(null);
+    });
+
+    try {
+      proc.stdin.write(payload);
+      proc.stdin.end();
+    } catch (e: any) {
+      console.warn('Python stdin write error:', e.message);
+      resolve(null);
+    }
   });
 }
 
@@ -408,6 +418,46 @@ INTEGRITY RULES:
 `.trim();
 }
 
+function generateRuleBasedSummary(asset: string, mode: string, engineData: any): string {
+  const summary = engineData._summary || {};
+  const mlScore = summary.ml_score?.score ?? 0;
+  
+  const scoreVerdict = mlScore > 60 ? 'HIGH PROBABILITY' : mlScore > 40 ? 'MARGINAL' : 'REJECTED';
+  
+  return `## MARKET SUMMARY (RULE-BASED FALLBACK)
+- **Asset:** ${asset}  
+- **Mode:** ${mode}  
+- **Timestamp:** ${new Date().toISOString()}  
+- **Current Price:** ${summary.asset_price || 'N/A'}  
+- **HTF Bias:** ${summary.htf_trend || 'N/A'}  
+- **Confluence Score:** ${mlScore}/100  
+- **Trade Grade:** ${scoreVerdict}
+
+---
+
+## 🚦 AI UNAVAILABLE — SYSTEM NOTIFICATION
+The advanced Gemini AI model is currently experiencing high demand (HTTP 503) or quota limitations. 
+The system has automatically fallen back to the deterministic **Rule-Based Engine** to ensure continuous operation.
+To restore full AI qualitative reasoning, please configure a \`GITHUB_TOKEN\` in the AI Studio Settings to enable the ChatGPT fallback.
+
+---
+
+## STRUCTURE ANALYSIS
+### HTF (${summary.htf || 'N/A'}):
+- Trend: **${summary.htf_trend || 'N/A'}**
+- EMA Alignment: ${summary.htf_ema_trend || 'N/A'}
+
+### ML SIGNAL SCORING
+- **Score:** ${mlScore} / 100
+- **Method:** ${summary.ml_score?.method || 'N/A'}
+- **HTF Filter Applied:** ${summary.ml_score?.htf_filter_applied ? 'YES' : 'NO'}
+
+## EXECUTION PLAN
+**Verdict:** ${scoreVerdict}
+*This is a deterministic output generated because the AI model is temporarily unavailable.*
+`;
+}
+
 // ─── Express server ───────────────────────────────────────────────────────────
 async function startServer() {
   const app = express();
@@ -494,34 +544,81 @@ async function startServer() {
       let responseText = '';
 
       try {
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: promptParts,
-          config: {
-            systemInstruction: buildSystemPrompt(asset, mode),
-            temperature: 0.1,
+        let response;
+        try {
+          response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: promptParts,
+            config: {
+              systemInstruction: buildSystemPrompt(asset, mode),
+              temperature: 0.1,
+            }
+          });
+        } catch (initialErr: any) {
+          const msg = initialErr.message || '';
+          if (msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand') || msg.includes('429')) {
+            console.log('Gemini high demand (503/429), retrying once in 3s...');
+            await new Promise(r => setTimeout(r, 3000));
+            response = await ai.models.generateContent({
+              model: 'gemini-2.5-flash',
+              contents: promptParts,
+              config: {
+                systemInstruction: buildSystemPrompt(asset, mode),
+                temperature: 0.1,
+              }
+            });
+          } else {
+            throw initialErr;
           }
-        });
+        }
         responseText = response.text || '';
       } catch (geminiError: any) {
         console.warn('Gemini failed:', geminiError.message);
         if (process.env.GITHUB_TOKEN) {
+          console.log('Attempting ChatGPT fallback... (GITHUB_TOKEN present)');
           const OpenAI = (await import('openai')).default;
           const client = new OpenAI({
             baseURL: 'https://models.inference.ai.azure.com',
             apiKey: process.env.GITHUB_TOKEN,
           });
-          const fallback = await client.chat.completions.create({
-            model: 'gpt-4o',
-            messages: [
-              { role: 'system', content: buildSystemPrompt(asset, mode) },
-              { role: 'user',   content: userPrompt },
-            ],
-            temperature: 0.1,
-          });
-          responseText = fallback.choices[0].message?.content || '';
+          
+          let fallbackCandleBlock = `# LIVE OHLCV DATA — ${asset}\nFetched: ${new Date().toISOString()}\n`;
+          for (const tf of timeframes) {
+              const candles = candlesByTF[tf.label];
+              if (candles && candles.length > 0) {
+                  const last = candles[candles.length - 1];
+                  const oldest = candles[0];
+                  fallbackCandleBlock += `\n${tf.label}: ${candles.length} candles | From ${oldest.date} to ${last.date} | Last close: ${last.close}\n`;
+                  const rows = candles.slice(-50).map((c: any) => `${c.date},${c.open},${c.high},${c.low},${c.close}`);
+                  fallbackCandleBlock += `time,open,high,low,close\n${rows.join('\n')}\n`;
+              }
+          }
+
+          const fallbackUserPrompt = [
+            fallbackCandleBlock,
+            engineBlock,
+            newsBlock,
+            `Perform a complete institutional analysis for ${asset} in ${mode}.`,
+            hasHighImpactEvent ? `⚠️ HIGH-IMPACT EVENT IN NEWS.` : ``
+          ].join('\n\n');
+
+          try {
+            const fallback = await client.chat.completions.create({
+              model: 'gpt-4o',
+              messages: [
+                { role: 'system', content: buildSystemPrompt(asset, mode) },
+                { role: 'user',   content: fallbackUserPrompt },
+              ],
+              temperature: 0.1,
+            });
+            responseText = fallback.choices[0].message?.content || '';
+          } catch (fbErr: any) {
+            console.warn('Fallback failed:', fbErr.message);
+            responseText = generateRuleBasedSummary(asset, mode, data);
+          }
         } else {
-          throw geminiError;
+          console.warn('No GITHUB_TOKEN and Gemini failed. Falling back to rule-based summary.');
+          responseText = generateRuleBasedSummary(asset, mode, data);
         }
       }
 
@@ -541,7 +638,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
+    app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
