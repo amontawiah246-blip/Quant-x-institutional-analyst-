@@ -17,8 +17,8 @@ export function AnalysisResult({ result, isLoading }: AnalysisResultProps) {
           <div className="w-16 h-16 border-2 border-slate-900 border-t-transparent rounded-full animate-spin absolute inset-0"></div>
         </div>
         <div className="flex flex-col items-center space-y-2 text-sm tracking-widest uppercase font-medium">
-          <span className="animate-pulse">Connecting to Institutional Feeds...</span>
-          <span className="text-xs text-slate-300">Processing liquidity pools & structure</span>
+          <span className="animate-pulse">Fetching live market data from Deriv...</span>
+          <span className="text-xs text-slate-300">Running structure & confluence engines</span>
         </div>
       </div>
     );
