@@ -4,7 +4,7 @@ export const MARKETS: Record<MarketCategory, string[]> = {
   Forex:   ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD'],
   Metals:  ['XAUUSD', 'XAGUSD'],
   Crypto:  ['BTCUSD', 'ETHUSD', 'SOLUSD'],
-  Indices: ['US30', 'NAS100', 'SPX500'],
+  Indices: ['BOOM1000', 'CRASH1000', 'VOL75', 'VOL100'],
 };
 
 // Deriv WebSocket symbol map — used server-side
@@ -15,7 +15,7 @@ export const DERIV_SYMBOLS: Record<string, string> = {
   NZDUSD: 'frxNZDUSD',
   XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD',
   BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD',
-  US30:   'WLDAUD',    NAS100: 'frxXAUUSD',  SPX500: 'frxXAUUSD',
+  BOOM1000: 'BOOM1000', CRASH1000: 'CRASH1000', VOL75: 'R_75', VOL100: 'R_100',
 };
 
 export type TradingMode = 'SCALPING MODE' | 'SWING MODE';

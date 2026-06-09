@@ -3,16 +3,20 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import WebSocket from 'ws';
+import { spawn } from 'child_process';
 
+// ─── Deriv Symbol Map ─────────────────────────────────────────────────────────
 const DERIV_SYMBOLS: Record<string, string> = {
   EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
   USDCHF: 'frxUSDCHF', AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
   NZDUSD: 'frxNZDUSD',
   XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD',
   BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD',
-  US30: 'WLDAUD', NAS100: 'frxXAUUSD', SPX500: 'frxXAUUSD',
+  BOOM1000: 'BOOM1000', CRASH1000: 'CRASH1000',
+  VOL75: 'R_75', VOL100: 'R_100',
 };
 
+// ─── Timeframes per mode ──────────────────────────────────────────────────────
 const TIMEFRAMES: Record<string, { granularity: number; label: string }[]> = {
   'SCALPING MODE': [
     { granularity: 14400, label: '4H' },
@@ -28,17 +32,22 @@ const TIMEFRAMES: Record<string, { granularity: number; label: string }[]> = {
   ],
 };
 
+// ─── Candle interface ─────────────────────────────────────────────────────────
 interface Candle {
   epoch: number;
   open: number;
   high: number;
   low: number;
   close: number;
+  date?: string;
 }
 
+// ─── Deriv WebSocket fetcher with buffer fix ──────────────────────────────────
 function fetchDerivCandles(symbol: string, granularity: number, count = 500): Promise<Candle[]> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
+    let buffer = '';
+
     const timeout = setTimeout(() => {
       ws.terminate();
       reject(new Error(`Timeout fetching ${symbol} @ ${granularity}s`));
@@ -55,11 +64,12 @@ function fetchDerivCandles(symbol: string, granularity: number, count = 500): Pr
       }));
     });
 
-    ws.on('message', (raw: string) => {
-      clearTimeout(timeout);
-      ws.close();
+    ws.on('message', (raw: Buffer | string) => {
+      buffer += raw.toString();
       try {
-        const data = JSON.parse(raw.toString());
+        const data = JSON.parse(buffer);
+        clearTimeout(timeout);
+        ws.close();
         if (data.error) return reject(new Error(data.error.message));
         const candles: Candle[] = (data.candles || []).map((c: any) => ({
           epoch: c.epoch,
@@ -67,10 +77,11 @@ function fetchDerivCandles(symbol: string, granularity: number, count = 500): Pr
           high:  parseFloat(c.high),
           low:   parseFloat(c.low),
           close: parseFloat(c.close),
+          date:  new Date(c.epoch * 1000).toISOString().slice(0, 16),
         }));
         resolve(candles);
-      } catch (e) {
-        reject(e);
+      } catch {
+        // incomplete chunk, wait for more
       }
     });
 
@@ -78,33 +89,112 @@ function fetchDerivCandles(symbol: string, granularity: number, count = 500): Pr
   });
 }
 
-function formatCandles(candles: Candle[], label: string): string {
-  if (!candles.length) return `${label}: NO DATA\n`;
-  const rows = candles.slice(-100).map(c =>
-    `${new Date(c.epoch * 1000).toISOString().slice(0, 16)},${c.open},${c.high},${c.low},${c.close}`
-  );
-  const last = candles[candles.length - 1];
-  return `\n### ${label} (last 100 of ${candles.length} candles — most recent last)\ntime,open,high,low,close\n${rows.join('\n')}\nCURRENT PRICE: ${last.close}\n`;
-}
+// ─── Python engine caller ─────────────────────────────────────────────────────
+function runPythonEngine(candlesByTF: Record<string, Candle[]>): Promise<any> {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({ candles: candlesByTF });
+    const enginePath = path.join(process.cwd(), 'engine.py');
 
-function calcATR(candles: Candle[], period = 14): number {
-  if (candles.length < period + 1) return 0;
-  const trs = candles.slice(-period - 1).map((c, i, arr) => {
-    if (i === 0) return c.high - c.low;
-    const prev = arr[i - 1];
-    return Math.max(c.high - c.low, Math.abs(c.high - prev.close), Math.abs(c.low - prev.close));
+    // Try python3 first, fall back to python
+    const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+    const proc = spawn(pythonCmd, [enginePath], { timeout: 30000 });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+
+    proc.on('close', (code: number) => {
+      if (code !== 0 || !stdout.trim()) {
+        console.warn('Python engine warning:', stderr || 'no output');
+        resolve(null); // graceful fallback — analysis continues without engine
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        console.warn('Python engine JSON parse error');
+        resolve(null);
+      }
+    });
+
+    proc.on('error', (err: Error) => {
+      console.warn('Python not available:', err.message);
+      resolve(null); // graceful fallback
+    });
+
+    proc.stdin.write(payload);
+    proc.stdin.end();
   });
-  return trs.slice(1).reduce((a, b) => a + b, 0) / period;
 }
 
-const NEWS_SOURCES: { url: string; name: string }[] = [
-  { url: 'https://www.financemagnates.com/trending/',        name: 'Finance Magnates' },
-  { url: 'https://www.forexlive.com/',                       name: 'ForexLive' },
-  { url: 'https://www.dailyfx.com/news',                     name: 'DailyFX' },
-  { url: 'https://tradingeconomics.com/commodity/gold',      name: 'Trading Economics' },
-  { url: 'https://www.investing.com/news/commodities-news',  name: 'Investing.com' },
-];
+// ─── Format engine results into prompt block ──────────────────────────────────
+function formatEngineResults(engineData: any): string {
+  if (!engineData || engineData.error) {
+    return '\n# ENGINE RESULTS: Not available — Gemini will calculate from raw data.\n';
+  }
 
+  const summary = engineData._summary || {};
+  let block = `\n# PRE-CALCULATED ENGINE RESULTS\n`;
+  block += `HTF: ${summary.htf || 'N/A'} | ETF: ${summary.etf || 'N/A'} | HTF Trend: ${summary.htf_trend || 'N/A'}\n`;
+  block += `Session: ${summary.session?.session || 'N/A'} | Session Score: ${summary.session?.score ?? 'N/A'}/5\n`;
+  block += `Current Price: ${summary.asset_price || 'N/A'}\n\n`;
+
+  const tfs = Object.keys(engineData).filter(k => k !== '_summary');
+
+  for (const tf of tfs) {
+    const d = engineData[tf];
+    block += `## ${tf} ENGINE OUTPUT\n`;
+    block += `ATR(14): ${d.atr} | Trend: ${d.trend} | Price: ${d.current_price}\n`;
+
+    if (d.bos_choch?.length) {
+      block += `\nSTRUCTURE EVENTS:\n`;
+      d.bos_choch.forEach((e: any) => {
+        block += `  ${e.type} @ ${e.price} on ${e.date}\n`;
+      });
+    }
+
+    if (d.swing_highs?.length || d.swing_lows?.length) {
+      block += `\nSWING POINTS:\n`;
+      d.swing_highs?.forEach((s: any) => block += `  SH @ ${s.price} on ${s.date}\n`);
+      d.swing_lows?.forEach((s: any)  => block += `  SL @ ${s.price} on ${s.date}\n`);
+    }
+
+    if (d.fvg_fresh?.length) {
+      block += `\nFRESH FVGs:\n`;
+      d.fvg_fresh.forEach((f: any) => {
+        block += `  ${f.direction}FVG ${f.bottom}-${f.top} formed ${f.date} | ATR ratio: ${f.atr_ratio}x\n`;
+      });
+    }
+
+    if (d.ob_fresh?.length) {
+      block += `\nFRESH ORDER BLOCKS:\n`;
+      d.ob_fresh.forEach((o: any) => {
+        block += `  ${o.direction}OB ${o.low}-${o.high} formed ${o.date} | Impulse: ${o.atr_ratio}x ATR\n`;
+      });
+    }
+
+    if (d.liquidity) {
+      block += `\nLIQUIDITY:\n`;
+      d.liquidity.bsl?.forEach((b: any) => block += `  BSL @ ${b.price} — ${b.status} (${b.distance_pct}% away)\n`);
+      d.liquidity.ssl?.forEach((s: any) => block += `  SSL @ ${s.price} — ${s.status} (${s.distance_pct}% away)\n`);
+      d.liquidity.equal_highs?.forEach((e: any) => block += `  EQH ~ ${e.avg}\n`);
+      d.liquidity.equal_lows?.forEach((e: any)  => block += `  EQL ~ ${e.avg}\n`);
+    }
+
+    if (d.premium_discount) {
+      const pd = d.premium_discount;
+      block += `\nPREMIUM/DISCOUNT: ${pd.status} @ ${pd.percentage}% | Range ${pd.range_low}-${pd.range_high} | EQ: ${pd.equilibrium}\n`;
+    }
+
+    block += '\n';
+  }
+
+  return block;
+}
+
+// ─── News scraper ─────────────────────────────────────────────────────────────
 const HIGH_IMPACT_EVENTS = [
   'CPI', 'NFP', 'nonfarm payroll', 'FOMC', 'interest rate decision',
   'GDP', 'PPI', 'retail sales', 'unemployment', 'Fed meeting',
@@ -125,10 +215,32 @@ const ASSET_KEYWORDS: Record<string, string[]> = {
   BTCUSD: ['bitcoin', 'BTC', 'crypto'],
   ETHUSD: ['ethereum', 'ETH', 'crypto'],
   SOLUSD: ['solana', 'SOL', 'crypto'],
-  US30:   ['dow', 'US30', 'wall street', 'DJIA'],
-  NAS100: ['nasdaq', 'NAS100', 'tech stocks', 'NDX'],
-  SPX500: ['S&P', 'SPX', 'SPX500', 'S&P 500'],
+  BOOM1000: ['boom', 'volatility', 'synthetic'],
+  CRASH1000: ['crash', 'volatility', 'synthetic'],
+  VOL75: ['volatility', 'vol75', 'synthetic'],
+  VOL100: ['volatility', 'vol100', 'synthetic'],
 };
+
+function getNewsSources(asset: string): { url: string; name: string }[] {
+  const isCrypto = ['BTCUSD', 'ETHUSD', 'SOLUSD'].includes(asset);
+  const isGold   = ['XAUUSD', 'XAGUSD'].includes(asset);
+  const base = [
+    { url: 'https://www.financemagnates.com/trending/', name: 'Finance Magnates' },
+    { url: 'https://www.forexlive.com/',                name: 'ForexLive' },
+    { url: 'https://www.dailyfx.com/news',              name: 'DailyFX' },
+  ];
+  if (isGold) {
+    base.push({ url: 'https://tradingeconomics.com/commodity/gold',      name: 'Trading Economics' });
+    base.push({ url: 'https://www.investing.com/news/commodities-news',  name: 'Investing.com' });
+  } else if (isCrypto) {
+    base.push({ url: 'https://coindesk.com/markets/',    name: 'CoinDesk' });
+    base.push({ url: 'https://cointelegraph.com/',       name: 'CoinTelegraph' });
+  } else {
+    base.push({ url: 'https://www.investing.com/news/forex-news',        name: 'Investing.com Forex' });
+    base.push({ url: 'https://tradingeconomics.com/calendar',            name: 'Economic Calendar' });
+  }
+  return base;
+}
 
 interface NewsResult {
   source: string;
@@ -139,240 +251,164 @@ interface NewsResult {
 
 async function scrapeNews(asset: string): Promise<NewsResult[]> {
   const keywords = ASSET_KEYWORDS[asset] || [asset.toLowerCase()];
+  const sources  = getNewsSources(asset);
   const results: NewsResult[] = [];
 
   await Promise.allSettled(
-    NEWS_SOURCES.map(async (source) => {
+    sources.map(async (source) => {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 8000);
-
         const response = await fetch(source.url, {
           signal: controller.signal,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; research-bot/1.0)',
-            'Accept': 'text/html',
-          },
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; research-bot/1.0)', 'Accept': 'text/html' },
         });
         clearTimeout(timeout);
-
         if (!response.ok) return;
-
         const html = await response.text();
-
         const text = html
           .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
           .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
           .replace(/<[^>]+>/g, ' ')
-          .replace(/&nbsp;/g, ' ')
-          .replace(/&amp;/g, '&')
-          .replace(/&lt;/g, '<')
-          .replace(/&gt;/g, '>')
-          .replace(/\s{2,}/g, ' ')
-          .trim();
-
-        const sentences = text
-          .split(/[.\n]/)
-          .map(s => s.trim())
-          .filter(s => s.length > 40 && s.length < 300);
-
-        const relevant = sentences.filter(s =>
-          keywords.some(kw => s.toLowerCase().includes(kw.toLowerCase()))
-        ).slice(0, 8);
-
+          .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+          .replace(/\s{2,}/g, ' ').trim();
+        const sentences = text.split(/[.\n]/).map(s => s.trim()).filter(s => s.length > 40 && s.length < 300);
+        const relevant  = sentences.filter(s => keywords.some(kw => s.toLowerCase().includes(kw.toLowerCase()))).slice(0, 8);
         if (relevant.length === 0) return;
-
         const eventWarnings: string[] = [];
         const allText = relevant.join(' ').toLowerCase();
         for (const event of HIGH_IMPACT_EVENTS) {
-          if (allText.includes(event.toLowerCase())) {
-            eventWarnings.push(event);
-          }
+          if (allText.includes(event.toLowerCase())) eventWarnings.push(event);
         }
-
-        results.push({
-          source: source.name,
-          headlines: relevant,
-          hasHighImpactEvent: eventWarnings.length > 0,
-          eventWarnings,
-        });
-      } catch {
-        // silently skip failed sources
-      }
+        results.push({ source: source.name, headlines: relevant, hasHighImpactEvent: eventWarnings.length > 0, eventWarnings });
+      } catch { /* silently skip */ }
     })
   );
-
   return results;
 }
 
 function formatNewsBlock(newsResults: NewsResult[], asset: string): string {
-  if (newsResults.length === 0) {
-    return '\n# MACRO NEWS: No news sources reachable. Proceed with price data only.\n';
-  }
-
-  const allEventWarnings = [...new Set(newsResults.flatMap(r => r.eventWarnings))];
+  if (newsResults.length === 0) return '\n# MACRO NEWS: No sources reachable. Analysis based on price data only.\n';
+  const allWarnings  = [...new Set(newsResults.flatMap(r => r.eventWarnings))];
   const hasHighImpact = newsResults.some(r => r.hasHighImpactEvent);
-
   let block = `\n# MACRO & FUNDAMENTAL NEWS FOR ${asset}\nScraped: ${new Date().toISOString()}\n`;
-
   if (hasHighImpact) {
-    block += `\n⚠️ HIGH-IMPACT EVENT DETECTED: ${allEventWarnings.join(', ')}\n`;
-    block += `TRADE PAUSE RECOMMENDATION: Do not enter new positions until this event resolves.\n`;
+    block += `\n⚠️ HIGH-IMPACT EVENT DETECTED: ${allWarnings.join(', ')}\n`;
+    block += `TRADE PAUSE RECOMMENDATION: Do not enter new positions until event resolves.\n`;
   }
-
-  for (const result of newsResults) {
-    block += `\n## ${result.source}\n`;
-    result.headlines.forEach((h, i) => {
-      block += `${i + 1}. ${h}\n`;
-    });
+  for (const r of newsResults) {
+    block += `\n## ${r.source}\n`;
+    r.headlines.forEach((h, i) => { block += `${i + 1}. ${h}\n`; });
   }
-
-  block += `\nEND OF NEWS BLOCK\n`;
+  block += '\nEND OF NEWS BLOCK\n';
   return block;
 }
 
+// ─── System prompt ────────────────────────────────────────────────────────────
 function buildSystemPrompt(asset: string, mode: string): string {
   return `
-You are QUANT-X, a deterministic quantitative market analysis engine. You are NOT a chatbot. You are not allowed to speculate, hallucinate prices, or invent levels. Every price level you state must come directly from the OHLCV data provided. Every macro reason you state must come from the news data provided. If data is insufficient to calculate a value, write INSUFFICIENT DATA.
+You are QUANT-X, an institutional market analysis engine. You receive three data sources:
+1. Raw OHLCV candle data from Deriv live feed
+2. Pre-calculated engine results from a Python SMC engine (BOS, CHoCH, FVG, OB, Liquidity, Premium/Discount — all mathematically precise)
+3. Live macro news scraped from financial websites
 
-ENGINE DEFINITIONS — APPLY THESE EXACT RULES
+YOUR ROLE:
+- The Python engine has already done all the math. You do NOT need to recalculate levels from scratch.
+- Your job is to INTERPRET the engine results, cross-reference with the news, apply confluence scoring, and produce the execution plan.
+- If engine results are available, use those exact prices. Do not invent your own levels.
+- If engine results say INSUFFICIENT DATA for a field, note it but continue with available data.
 
-SWING DETECTION:
-Swing High = candle[i].high is the highest among 5 candles left and 5 candles right
-Swing Low  = candle[i].low  is the lowest  among 5 candles left and 5 candles right
-Label every swing high and swing low in each timeframe.
+CONFLUENCE SCORING — SHOW YOUR WORKING EXACTLY LIKE THIS:
+  Structure alignment (HTF BOS matches trade direction): [0 or 20]
+  Liquidity target present and logical: [0 or 15]
+  HTF trend confirmed on ETF via CHoCH: [0 or 15]
+  Fresh Order Block at entry zone: [0 or 10]
+  Fresh FVG at entry zone: [0 or 10]
+  S/D zone overlaps with OB: [0 or 10]
+  Price in Premium/Discount alignment: [0 or 10]
+  Price action confirmation candle: [0 or 5]
+  Session score (from engine): [0 or 5]
+  SUBTOTAL: [sum all above]
+  HTF Hard Filter: If HTF trend ≠ trade direction → cap at 40. Applied: [YES/NO]
+  FINAL SCORE: [n]/100
 
-BOS (Break of Structure):
-Bullish BOS = candle CLOSES above the most recent confirmed Swing High
-Bearish BOS = candle CLOSES below the most recent confirmed Swing Low
-The candle must CLOSE beyond the swing — a wick does not count.
-Output: "BOS BULL @ [price] on [date]" or "BOS BEAR @ [price] on [date]"
+Each component is binary. Full points or zero. No halves. No quarters.
+Trade Grade: A+ = 90-100 | A = 80-89 | B = 70-79 | C = 60-69 | REJECT = below 60
 
-CHOCH (Change of Character):
-Bullish trend = series of HH and HL confirmed by BOS
-CHoCH bearish signal = price CLOSES below the most recent HL in a bullish trend
-Bearish trend = series of LH and LL confirmed by BOS
-CHoCH bullish signal = price CLOSES above the most recent LH in a bearish trend
-Output: "CHoCH @ [price] on [date] — [bullish/bearish] trend broken"
-
-FAIR VALUE GAP:
-Bullish FVG  = candle[i-1].high < candle[i+1].low
-Bearish FVG  = candle[i-1].low  > candle[i+1].high
-Minimum size: gap must be > ATR(14) x 0.15 — discard smaller gaps
-Mitigated when price CLOSES inside the gap
-Output: "BFVG [top]-[bottom] formed [date] — [fresh/mitigated]"
-
-ORDER BLOCK:
-Bullish OB = last bearish candle BEFORE a bullish BOS impulse of at least ATR(14) x 1.5
-Bearish OB = last bullish candle BEFORE a bearish BOS impulse of at least ATR(14) x 1.5
-Fresh = price has NOT returned to the OB range after formation
-Mitigated = price has traded through 50% of the OB body
-Output: "BOB [high]-[low] formed [date] — [fresh/mitigated]"
-
-LIQUIDITY:
-BSL = confirmed Swing Highs not yet taken
-SSL = confirmed Swing Lows not yet taken
-EQH = two or more swing highs within ATR(14) x 0.05 of each other
-EQL = two or more swing lows  within ATR(14) x 0.05 of each other
-Sweep = price wicks beyond a level but CLOSES back inside
-List the 3 most significant BSL and SSL levels with exact prices.
-
-SUPPLY AND DEMAND ZONES:
-Demand Zone = from the lowest low of the base to the highest open before price left up
-Supply Zone = from the highest high of the base to the lowest open before price left down
-Fresh = price has not returned since formation
-Mitigated = price has traded into the zone at least once
-
-PREMIUM / DISCOUNT:
-Use the most recent swing range on the HTF.
-Equilibrium  = 50% of range
-Discount     = below 50%
-Premium      = above 50%
-Deep Discount = below 25%
-Deep Premium  = above 75%
-Output exact percentage of where current price sits.
-
-CONFLUENCE SCORING:
-Market Structure alignment HTF matches LTF direction: 20 pts
-Liquidity target present and logical: 15 pts
-HTF bias confirmed on LTF CHoCH: 15 pts
-Order Block in discount or premium zone: 10 pts
-Fair Value Gap present and fresh: 10 pts
-Supply/Demand zone overlap with OB: 10 pts
-Premium/Discount alignment: 10 pts
-Price action confirmation: 5 pts
-Session context alignment: 5 pts
-TOTAL: 0-100
-HTF HARD FILTER: If HTF BOS direction does not match trade direction, cap score at 40. No exceptions.
-Grade: A+ = 90-100 | A = 80-89 | B = 70-79 | C = 60-69 | REJECT = below 60
+SESSION RULES:
+London session         = 07:00–11:00 UTC → 5 pts
+London/NY overlap      = 12:00–15:00 UTC → 5 pts
+New York session       = 15:00–20:00 UTC → 5 pts
+Asian session          = 00:00–06:00 UTC → 0 pts for forex
+Crypto and synthetics  = 5 pts always
 
 NEWS AND MACRO RULES:
-- You will receive live macro news scraped from financial news sites.
-- You MUST use this news to explain WHY price is moving in the Market Narrative section.
-- If the news says gold is falling due to rate hike fears, your bias must reflect that. You cannot produce a bullish bias if the macro context from the news is bearish.
-- If a HIGH-IMPACT EVENT WARNING appears in the data (CPI, NFP, FOMC, rate decision, Fed speakers, Powell), your Execution Plan MUST include a trade pause warning regardless of confluence score.
-- If no news is available, state "No macro context available — analysis based on price data only."
+- You MUST explain WHY price is moving using the news provided. Not optional.
+- If news says rate hike fears, your bias must reflect that.
+- If HIGH-IMPACT EVENT detected, Execution Plan must include trade pause warning regardless of score.
+- If no news available, state that clearly.
 
-OUTPUT FORMAT — MANDATORY — USE THIS EXACT STRUCTURE:
+OUTPUT FORMAT — MANDATORY:
 
 ## MARKET SUMMARY
 - **Asset:** ${asset}
 - **Mode:** ${mode}
-- **Timestamp:** [ISO timestamp of most recent candle]
-- **Current Price:** [exact value from data]
+- **Timestamp:** [from engine data]
+- **Current Price:** [from engine data]
 - **HTF Bias:** [Strong Bullish / Bullish / Neutral / Bearish / Strong Bearish]
 - **Market Regime:** [Trending / Ranging / Expansion / Accumulation / Distribution]
-- **P/D Position:** [Deep Discount / Discount / Equilibrium / Premium / Deep Premium] — [exact %]
+- **P/D Position:** [from engine] — [exact %]
 - **Confluence Score:** [n]/100
 - **Trade Grade:** [A+ / A / B / C / REJECTED]
 
 ## MACRO CONTEXT
-[2-3 sentences explaining the fundamental reason price is moving, sourced from the news provided. If CPI/NFP/FOMC is upcoming, state it here with a trade pause warning.]
+[2-3 sentences from news. What is driving price. Any upcoming events.]
 
 ## STRUCTURE ANALYSIS
-[Every BOS and CHoCH found across all timeframes with prices and dates. Start HTF then LTF. Minimum 3 events.]
+[List every BOS and CHoCH from engine results across all timeframes. HTF first then down to ETF.]
 
 ## LIQUIDITY MAP
-[3 most significant BSL levels and 3 SSL levels with exact prices. Note which are swept and which are resting.]
+[BSL and SSL levels from engine. Which are resting, which swept. Distance from current price.]
 
 ## KEY LEVELS
-[2 most relevant fresh OBs, 2 fresh FVGs, 2 fresh S/D zones with exact price ranges.]
+[Fresh OBs, fresh FVGs, S/D zones from engine. Exact prices only.]
+
+## CONFLUENCE SCORECARD
+[Show the full scoring breakdown as specified above]
 
 ## MARKET NARRATIVE
-[3-5 sentences combining price structure AND macro reason. Reference actual structural events and news drivers together.]
+[3-5 sentences combining structure from engine + macro from news. Why is smart money doing what it is doing.]
 
 ## EXECUTION PLAN
 - **Direction:** [Bullish / Bearish / NEUTRAL — NO TRADE]
-- **Wait Condition:** [Specific price event required before entry]
-- **Entry Zone:** [Specific price range from data]
-- **Invalidation:** [Specific price from data]
-- **Target 1 (TP1):** [Price]
-- **Target 2 (TP2):** [Price]
-- **Target 3 (TP3):** [Price]
+- **Wait Condition:** [Specific event required before entry]
+- **Entry Zone:** [Exact prices from engine]
+- **Invalidation:** [Exact price from engine]
+- **Target 1 (TP1):** [Next SSL or BSL from engine]
+- **Target 2 (TP2):** [Next structural level]
+- **Target 3 (TP3):** [HTF target]
 - **Estimated R:R:** [ratio]
-- **News Warning:** [TRADE PAUSE — event name pending / CLEAR — no high-impact events]
+- **News Warning:** [TRADE PAUSE — event / CLEAR]
 
-If confluence score is below 60 or HTF hard filter is triggered, output this instead:
-
-# NO TRADE SETUP FOUND
+If score below 60 or HTF hard filter triggered:
+# ⛔ NO TRADE SETUP FOUND
 **Score:** [n]/100
 **Reason:**
-1. [Structural reason from data]
-2. [Liquidity reason from data]
-3. [Macro/news reason if applicable]
-4. [Session or timing issue]
-5. [What must change for a valid setup]
+1. [From engine data]
+2. [From engine data]
+3. [From news if applicable]
+4. [Session]
+5. [What must change]
 
 INTEGRITY RULES:
-- Every price you mention must exist in the provided OHLCV data.
-- Every macro statement must come from the provided news block.
-- Never use approximately, around, or roughly for prices. Use exact values.
-- Never invent news events or macro drivers not in the data.
-- If data is insufficient write INSUFFICIENT DATA.
-- Temperature is 0.1. Be deterministic. Be precise.
+- Every price comes from the engine results or OHLCV data. Never invented.
+- Every macro statement comes from the news block.
+- If engine returned null for a field, write INSUFFICIENT DATA.
+- Temperature 0.1. Deterministic. Precise.
 `.trim();
 }
 
+// ─── Express server ───────────────────────────────────────────────────────────
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -393,42 +429,56 @@ async function startServer() {
         return res.status(400).json({ error: `No Deriv symbol mapping for: ${asset}` });
       }
 
+      // ── 1. Fetch live candles from Deriv ─────────────────────────────────
       const timeframes = TIMEFRAMES[mode] || TIMEFRAMES['SCALPING MODE'];
-      let marketDataBlock = `# LIVE MARKET DATA — ${asset} (${derivSymbol})\nFetched: ${new Date().toISOString()}\n`;
+      const candlesByTF: Record<string, Candle[]> = {};
+      let rawCandleBlock = `# LIVE OHLCV DATA — ${asset}\nFetched: ${new Date().toISOString()}\n`;
 
       const candleResults = await Promise.allSettled(
         timeframes.map(tf => fetchDerivCandles(derivSymbol, tf.granularity, 500))
       );
 
       for (let i = 0; i < timeframes.length; i++) {
-        const tf = timeframes[i];
+        const tf     = timeframes[i];
         const result = candleResults[i];
         if (result.status === 'fulfilled' && result.value.length > 0) {
-          marketDataBlock += formatCandles(result.value, tf.label);
-          const atr = calcATR(result.value);
-          marketDataBlock += `ATR(14) on ${tf.label}: ${atr.toFixed(5)}\n`;
+          candlesByTF[tf.label] = result.value;
+          const last   = result.value[result.value.length - 1];
+          const oldest = result.value[0];
+          rawCandleBlock += `\n${tf.label}: ${result.value.length} candles | From ${oldest.date} to ${last.date} | Last close: ${last.close}\n`;
+          // Send last 200 candles as CSV
+          const rows = result.value.slice(-200).map(c =>
+            `${c.date},${c.open},${c.high},${c.low},${c.close}`
+          );
+          rawCandleBlock += `time,open,high,low,close\n${rows.join('\n')}\n`;
         } else {
-          marketDataBlock += `\n### ${tf.label}: FETCH FAILED\n`;
+          rawCandleBlock += `\n${tf.label}: FETCH FAILED\n`;
         }
       }
 
-      const newsResults = await scrapeNews(asset);
-      const newsBlock = formatNewsBlock(newsResults, asset);
+      // ── 2. Run Python engine ─────────────────────────────────────────────
+      const engineData   = await runPythonEngine(candlesByTF);
+      const engineBlock  = formatEngineResults(engineData);
+
+      // ── 3. Scrape news ───────────────────────────────────────────────────
+      const newsResults       = await scrapeNews(asset);
+      const newsBlock         = formatNewsBlock(newsResults, asset);
       const hasHighImpactEvent = newsResults.some(r => r.hasHighImpactEvent);
 
+      // ── 4. Build prompt ──────────────────────────────────────────────────
       const userPrompt = [
-        marketDataBlock,
+        rawCandleBlock,
+        engineBlock,
         newsBlock,
         `Perform a complete institutional analysis for ${asset} in ${mode}.`,
-        `Base ALL price levels strictly on the OHLCV data above.`,
-        `Use the news block to explain WHY price is moving — macro drivers, Fed expectations, geopolitical context.`,
+        `The Python engine has pre-calculated all levels. Use those exact values.`,
+        `Use the news to explain WHY price is moving.`,
         hasHighImpactEvent
-          ? `WARNING: HIGH-IMPACT EVENT IN NEWS. Your Execution Plan MUST include a trade pause warning.`
-          : `No high-impact events detected in news.`,
+          ? `⚠️ HIGH-IMPACT EVENT IN NEWS. Execution Plan MUST include a trade pause warning.`
+          : `No high-impact events detected.`,
       ].join('\n\n');
 
       const promptParts: any[] = [{ text: userPrompt }];
-
       if (image) {
         promptParts.push({
           inlineData: {
@@ -436,11 +486,10 @@ async function startServer() {
             mimeType: 'image/jpeg',
           }
         });
-        promptParts.push({
-          text: 'A chart image has been provided. Cross-reference your OHLCV data analysis with the visual structure in the image. Note any discrepancies.'
-        });
+        promptParts.push({ text: 'Chart image provided. Cross-reference visual structure with engine results. Note any discrepancies.' });
       }
 
+      // ── 5. Call Gemini ───────────────────────────────────────────────────
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       let responseText = '';
 
@@ -456,7 +505,6 @@ async function startServer() {
         responseText = response.text || '';
       } catch (geminiError: any) {
         console.warn('Gemini failed:', geminiError.message);
-
         if (process.env.GITHUB_TOKEN) {
           const OpenAI = (await import('openai')).default;
           const client = new OpenAI({
@@ -500,6 +548,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`QUANT-X server running on http://localhost:${PORT}`);
+    console.log(`Python engine: ${path.join(process.cwd(), 'engine.py')}`);
   });
 }
 
