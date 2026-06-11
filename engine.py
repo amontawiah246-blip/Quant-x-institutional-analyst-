@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-QUANT-X Engine v2 — Institutional SMC/ICT + TA-Lib + ML Signal Scoring + Backtesting
-Called by server.ts as a child process.
-Reads JSON from stdin, writes JSON to stdout.
-
-LIBRARY STRATEGY (AI Studio compatible):
-- Tries to import TA-Lib, numpy, pandas, sklearn for full power
-- If any library is missing, falls back to pure Python implementations
-- App NEVER crashes due to missing libraries
-- Every feature degrades gracefully
+QUANT-X Engine v3 — Institutional Grade
+Upgrades over v2:
+- Fixed P/D percentage (never negative)
+- RSI contradiction penalty in scoring
+- Adjusted backtest win rate (20% haircut)
+- Hurst Exponent regime detection
+- ADX-based regime classification
+- Volatility percentile regime
+- Volume profile proxy (POC, HVN, LVN, Value Area)
+- Liquidity sweep quality scoring
+- Economic calendar from Forex Factory free JSON API
+- SQLite signal tracking for real statistical edge validation
+- Adaptive per-asset weights from real outcome history
+- Sharpe/Sortino/MaxDD from real trade history
+- Monte Carlo simulation (when 100+ real trades available)
 """
 
 import sys
 import json
 import math
-from datetime import datetime, timezone
+import sqlite3
+import os
+import random
+from datetime import datetime, timezone, timedelta
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 
-# ─── Library imports with graceful fallback ───────────────────────────────────
 HAS_NUMPY   = False
 HAS_TALIB   = False
 HAS_PANDAS  = False
@@ -47,17 +57,758 @@ try:
 except ImportError:
     pass
 
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'quant_signals.db')
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — TECHNICAL INDICATORS
-# TA-Lib used when available, pure Python fallback otherwise
+# SECTION 0 — SQLITE DATABASE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        asset TEXT NOT NULL,
+        mode TEXT,
+        timestamp TEXT NOT NULL,
+        direction TEXT,
+        entry_low REAL,
+        entry_high REAL,
+        tp1 REAL,
+        tp2 REAL,
+        tp3 REAL,
+        sl REAL,
+        confluence_score REAL,
+        htf_trend TEXT,
+        etf_trend TEXT,
+        rsi_htf REAL,
+        atr REAL,
+        regime TEXT,
+        session TEXT,
+        outcome TEXT DEFAULT NULL,
+        outcome_checked_at TEXT DEFAULT NULL,
+        pnl_atr REAL DEFAULT NULL,
+        exit_price REAL DEFAULT NULL,
+        bars_to_exit INTEGER DEFAULT NULL,
+        notes TEXT DEFAULT NULL
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS asset_weights (
+        asset TEXT PRIMARY KEY,
+        w_structure REAL DEFAULT 20,
+        w_liquidity REAL DEFAULT 15,
+        w_choch REAL DEFAULT 15,
+        w_ob REAL DEFAULT 10,
+        w_fvg REAL DEFAULT 10,
+        w_sd REAL DEFAULT 10,
+        w_pd REAL DEFAULT 10,
+        w_pa REAL DEFAULT 5,
+        w_session REAL DEFAULT 5,
+        total_trades INTEGER DEFAULT 0,
+        win_rate REAL DEFAULT NULL,
+        last_updated TEXT DEFAULT NULL
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_performance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        asset TEXT NOT NULL,
+        trades INTEGER DEFAULT 0,
+        wins INTEGER DEFAULT 0,
+        losses INTEGER DEFAULT 0,
+        pnl_atr REAL DEFAULT 0,
+        win_rate REAL DEFAULT NULL
+    )''')
+    conn.commit()
+    conn.close()
+
+
+def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl,
+                score, htf_trend, etf_trend, rsi_htf, atr, regime='', session=''):
+    """Save a new signal to database. Returns the signal ID."""
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''INSERT INTO signals
+            (asset, mode, timestamp, direction, entry_low, entry_high,
+             tp1, tp2, tp3, sl, confluence_score, htf_trend, etf_trend,
+             rsi_htf, atr, regime, session)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (asset, mode, datetime.now(timezone.utc).isoformat(),
+             direction, entry_low, entry_high, tp1, tp2, tp3, sl,
+             score, htf_trend, etf_trend, rsi_htf, atr, regime, session))
+        signal_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return signal_id
+    except Exception as e:
+        return None
+
+
+def fetch_current_price_deriv(asset):
+    """
+    Fetch the current live price for an asset from Deriv WebSocket.
+    Uses HTTP fallback since we cannot use asyncio WebSocket from sync Python.
+    Falls back to Deriv REST-like tick endpoint.
+    """
+    DERIV_SYMBOLS = {
+        'XAUUSD': 'frxXAUUSD', 'XAGUSD': 'frxXAGUSD',
+        'EURUSD': 'frxEURUSD', 'GBPUSD': 'frxGBPUSD',
+        'USDJPY': 'frxUSDJPY', 'USDCHF': 'frxUSDCHF',
+        'AUDUSD': 'frxAUDUSD', 'USDCAD': 'frxUSDCAD',
+        'NZDUSD': 'frxNZDUSD',
+        'BTCUSD': 'cryBTCUSD', 'ETHUSD': 'cryETHUSD', 'SOLUSD': 'crySOLUSD',
+        'BOOM1000': 'BOOM1000', 'CRASH1000': 'CRASH1000',
+        'VOL75': 'R_75', 'VOL100': 'R_100',
+    }
+    symbol = DERIV_SYMBOLS.get(asset)
+    if not symbol:
+        return None
+
+    # Use Deriv's ticks_history with count=1 via their REST-compatible endpoint
+    url = f'https://api.deriv.com/websockets/v3?ticks={symbol}&subscribe=0&app_id=1089'
+    # Fallback: use the candles endpoint to get latest close
+    candles_url = (
+        f'https://api.deriv.com/websockets/v3?'
+        f'ticks_history={symbol}&end=latest&count=1&style=candles&granularity=60&app_id=1089'
+    )
+
+    # Try direct tick price first
+    try:
+        req = Request(
+            f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
+            f'&end=latest&count=1&style=ticks&app_id=1089',
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            prices = data.get('history', {}).get('prices', [])
+            if prices:
+                return float(prices[-1])
+    except Exception:
+        pass
+
+    # Try candle close
+    try:
+        req = Request(
+            f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
+            f'&end=latest&count=1&style=candles&granularity=300&app_id=1089',
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            candles = data.get('candles', [])
+            if candles:
+                return float(candles[-1]['close'])
+    except Exception:
+        pass
+
+    return None
+
+
+def check_and_update_outcomes(asset=None):
+    """
+    Core outcome verification loop.
+
+    For every signal older than 1 hour with no outcome:
+    - Fetch current price from Deriv
+    - Check if price has hit TP1 or SL
+    - Mark WIN, LOSS, or OPEN
+    - Update the database
+    - Recalculate asset weights if enough data
+
+    Returns a summary of what was checked and updated.
+    """
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Get all signals without outcomes, older than 1 hour
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+
+        if asset:
+            c.execute('''SELECT id, asset, direction, entry_low, entry_high,
+                         tp1, sl, atr, timestamp, confluence_score
+                         FROM signals
+                         WHERE outcome IS NULL
+                         AND timestamp < ?
+                         AND asset = ?
+                         ORDER BY timestamp ASC LIMIT 50''',
+                      (cutoff, asset))
+        else:
+            c.execute('''SELECT id, asset, direction, entry_low, entry_high,
+                         tp1, sl, atr, timestamp, confluence_score
+                         FROM signals
+                         WHERE outcome IS NULL
+                         AND timestamp < ?
+                         ORDER BY timestamp ASC LIMIT 50''',
+                      (cutoff,))
+
+        pending = c.fetchall()
+        conn.close()
+
+        if not pending:
+            return {
+                'checked': 0,
+                'updated': 0,
+                'message': 'No pending signals to check.',
+                'details': []
+            }
+
+        updated  = 0
+        details  = []
+        assets_to_retrain = set()
+
+        for row in pending:
+            sig_id, sig_asset, direction, entry_low, entry_high, \
+            tp1, sl, atr, timestamp, score = row
+
+            current_price = fetch_current_price_deriv(sig_asset)
+
+            if current_price is None:
+                details.append({
+                    'id':     sig_id,
+                    'asset':  sig_asset,
+                    'status': 'PRICE_FETCH_FAILED',
+                    'note':   'Could not fetch current price from Deriv'
+                })
+                continue
+
+            entry_mid = (entry_low + entry_high) / 2 if entry_low and entry_high else entry_low
+
+            outcome   = None
+            exit_price = None
+            pnl_atr   = None
+            note      = None
+
+            if direction == 'Bearish' or direction == 'BEARISH' or direction == 'SHORT':
+                # Short trade: TP is below entry, SL is above entry
+                if tp1 and current_price <= tp1:
+                    outcome    = 'WIN'
+                    exit_price = tp1
+                    pnl_atr    = round((entry_mid - tp1) / atr, 3) if atr else None
+                    note       = f'TP1 hit at {tp1}. Price now {current_price}.'
+                elif sl and current_price >= sl:
+                    outcome    = 'LOSS'
+                    exit_price = sl
+                    pnl_atr    = round((entry_mid - sl) / atr, 3) if atr else None
+                    note       = f'SL hit at {sl}. Price now {current_price}.'
+                else:
+                    # Check if signal is older than 48 hours — mark as EXPIRED
+                    sig_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    if (datetime.now(timezone.utc) - sig_time).total_seconds() > 48 * 3600:
+                        outcome    = 'EXPIRED'
+                        exit_price = current_price
+                        pnl_atr    = round((entry_mid - current_price) / atr, 3) if atr else None
+                        note       = f'Signal expired after 48h. Price now {current_price}.'
+
+            elif direction == 'Bullish' or direction == 'BULLISH' or direction == 'LONG':
+                # Long trade: TP is above entry, SL is below entry
+                if tp1 and current_price >= tp1:
+                    outcome    = 'WIN'
+                    exit_price = tp1
+                    pnl_atr    = round((tp1 - entry_mid) / atr, 3) if atr else None
+                    note       = f'TP1 hit at {tp1}. Price now {current_price}.'
+                elif sl and current_price <= sl:
+                    outcome    = 'LOSS'
+                    exit_price = sl
+                    pnl_atr    = round((sl - entry_mid) / atr, 3) if atr else None
+                    note       = f'SL hit at {sl}. Price now {current_price}.'
+                else:
+                    sig_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    if (datetime.now(timezone.utc) - sig_time).total_seconds() > 48 * 3600:
+                        outcome    = 'EXPIRED'
+                        exit_price = current_price
+                        pnl_atr    = round((current_price - entry_mid) / atr, 3) if atr else None
+                        note       = f'Signal expired after 48h. Price now {current_price}.'
+
+            if outcome:
+                conn2 = sqlite3.connect(DB_PATH)
+                c2 = conn2.cursor()
+                c2.execute('''UPDATE signals SET
+                    outcome = ?,
+                    outcome_checked_at = ?,
+                    exit_price = ?,
+                    pnl_atr = ?,
+                    notes = ?
+                    WHERE id = ?''',
+                    (outcome,
+                     datetime.now(timezone.utc).isoformat(),
+                     exit_price, pnl_atr, note, sig_id))
+                conn2.commit()
+                conn2.close()
+                updated += 1
+                assets_to_retrain.add(sig_asset)
+
+            details.append({
+                'id':            sig_id,
+                'asset':         sig_asset,
+                'direction':     direction,
+                'entry':         entry_mid,
+                'tp1':           tp1,
+                'sl':            sl,
+                'current_price': current_price,
+                'outcome':       outcome or 'STILL OPEN',
+                'pnl_atr':       pnl_atr,
+                'note':          note or f'Still open. Price {current_price} between SL {sl} and TP1 {tp1}.'
+            })
+
+        # Retrain adaptive weights for assets with new outcomes
+        for retrain_asset in assets_to_retrain:
+            update_adaptive_weights(retrain_asset)
+
+        return {
+            'checked': len(pending),
+            'updated': updated,
+            'message': f'Checked {len(pending)} signals, updated {updated} outcomes.',
+            'details': details
+        }
+
+    except Exception as e:
+        return {
+            'checked': 0,
+            'updated': 0,
+            'message': f'Error during outcome check: {str(e)}',
+            'details': []
+        }
+
+
+def update_adaptive_weights(asset):
+    """
+    Recalculate per-asset confluence weights based on real outcome history.
+    Called automatically after new outcomes are recorded.
+    Requires 50+ outcomes to apply — uses defaults below that threshold.
+    """
+    try:
+        outcomes = get_real_outcomes(asset)
+        if len(outcomes) < 50:
+            return  # not enough data yet
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        # Get all real outcomes with full signal data
+        c.execute('''SELECT confluence_score, outcome, pnl_atr, rsi_htf,
+                     htf_trend, etf_trend, atr, regime, session
+                     FROM signals
+                     WHERE asset = ? AND outcome IN ('WIN','LOSS')
+                     ORDER BY id DESC LIMIT 200''', (asset,))
+        rows = c.fetchall()
+        conn.close()
+
+        if len(rows) < 50:
+            return
+
+        wins   = [r for r in rows if r[1] == 'WIN']
+        losses = [r for r in rows if r[1] == 'LOSS']
+        total  = len(rows)
+        wr     = len(wins) / total
+
+        # Simple weight adjustment:
+        # Components that correlate with wins get boosted
+        # Components that don't get reduced
+        # This is a simplified gradient — real XGBoost would replace this later
+
+        # Score-to-win correlation
+        win_scores  = [r[0] for r in wins   if r[0] is not None]
+        loss_scores = [r[0] for r in losses if r[0] is not None]
+        avg_win_score  = sum(win_scores)  / len(win_scores)  if win_scores  else 65
+        avg_loss_score = sum(loss_scores) / len(loss_scores) if loss_scores else 55
+
+        # Session win rates
+        session_wins = {}
+        for r in rows:
+            sess = r[8] or 'UNKNOWN'
+            if sess not in session_wins:
+                session_wins[sess] = {'w': 0, 't': 0}
+            session_wins[sess]['t'] += 1
+            if r[1] == 'WIN':
+                session_wins[sess]['w'] += 1
+
+        best_session_wr = max(
+            (v['w']/v['t'] for v in session_wins.values() if v['t'] >= 5),
+            default=0.5
+        )
+
+        # Adjust session weight based on whether best sessions have high WR
+        session_weight = 5 if best_session_wr < 0.55 else 8 if best_session_wr > 0.65 else 5
+
+        # Score gap between wins and losses — if high, structure/confluence matters more
+        score_gap = avg_win_score - avg_loss_score
+        structure_boost = min(5, max(0, int(score_gap / 4)))
+
+        new_weights = {
+            'w_structure': min(25, 20 + structure_boost),
+            'w_liquidity': 15,
+            'w_choch':     15,
+            'w_ob':        10,
+            'w_fvg':       10,
+            'w_sd':        10,
+            'w_pd':        10,
+            'w_pa':        5,
+            'w_session':   session_weight,
+        }
+
+        conn3 = sqlite3.connect(DB_PATH)
+        c3 = conn3.cursor()
+        c3.execute('''INSERT INTO asset_weights
+            (asset, w_structure, w_liquidity, w_choch, w_ob, w_fvg,
+             w_sd, w_pd, w_pa, w_session, total_trades, win_rate, last_updated)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(asset) DO UPDATE SET
+            w_structure=excluded.w_structure,
+            w_liquidity=excluded.w_liquidity,
+            w_choch=excluded.w_choch,
+            w_ob=excluded.w_ob,
+            w_fvg=excluded.w_fvg,
+            w_sd=excluded.w_sd,
+            w_pd=excluded.w_pd,
+            w_pa=excluded.w_pa,
+            w_session=excluded.w_session,
+            total_trades=excluded.total_trades,
+            win_rate=excluded.win_rate,
+            last_updated=excluded.last_updated''',
+            (asset,
+             new_weights['w_structure'], new_weights['w_liquidity'],
+             new_weights['w_choch'], new_weights['w_ob'], new_weights['w_fvg'],
+             new_weights['w_sd'], new_weights['w_pd'], new_weights['w_pa'],
+             new_weights['w_session'], total, round(wr, 4),
+             datetime.now(timezone.utc).isoformat()))
+        conn3.commit()
+        conn3.close()
+
+    except Exception:
+        pass
+
+
+def get_signal_dashboard(asset=None, limit=50):
+    """
+    Returns signal history for display in the dashboard.
+    Shows recent signals with outcomes, win rates, streaks.
+    """
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        if asset:
+            c.execute('''SELECT id, asset, mode, timestamp, direction,
+                         entry_low, entry_high, tp1, sl, confluence_score,
+                         outcome, pnl_atr, exit_price, notes, regime, session
+                         FROM signals WHERE asset = ?
+                         ORDER BY id DESC LIMIT ?''', (asset, limit))
+        else:
+            c.execute('''SELECT id, asset, mode, timestamp, direction,
+                         entry_low, entry_high, tp1, sl, confluence_score,
+                         outcome, pnl_atr, exit_price, notes, regime, session
+                         FROM signals
+                         ORDER BY id DESC LIMIT ?''', (limit,))
+
+        rows = c.fetchall()
+
+        # Asset-level stats
+        if asset:
+            c.execute('''SELECT COUNT(*), SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END),
+                         SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END),
+                         AVG(pnl_atr), SUM(pnl_atr)
+                         FROM signals WHERE asset=? AND outcome IN ('WIN','LOSS')''', (asset,))
+        else:
+            c.execute('''SELECT COUNT(*), SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END),
+                         SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END),
+                         AVG(pnl_atr), SUM(pnl_atr)
+                         FROM signals WHERE outcome IN ('WIN','LOSS')''')
+
+        stats = c.fetchone()
+        conn.close()
+
+        total_closed = stats[0] or 0
+        total_wins   = stats[1] or 0
+        total_losses = stats[2] or 0
+        avg_pnl      = round(stats[3] or 0, 3)
+        total_pnl    = round(stats[4] or 0, 3)
+        win_rate     = round(total_wins / total_closed * 100, 1) if total_closed > 0 else None
+
+        signals = []
+        for row in rows:
+            signals.append({
+                'id':         row[0],
+                'asset':      row[1],
+                'mode':       row[2],
+                'timestamp':  row[3],
+                'direction':  row[4],
+                'entry_low':  row[5],
+                'entry_high': row[6],
+                'tp1':        row[7],
+                'sl':         row[8],
+                'score':      row[9],
+                'outcome':    row[10] or 'OPEN',
+                'pnl_atr':   row[11],
+                'exit_price': row[12],
+                'notes':      row[13],
+                'regime':     row[14],
+                'session':    row[15],
+            })
+
+        return {
+            'signals':      signals,
+            'total_closed': total_closed,
+            'total_wins':   total_wins,
+            'total_losses': total_losses,
+            'win_rate_pct': win_rate,
+            'avg_pnl_atr':  avg_pnl,
+            'total_pnl_atr': total_pnl,
+            'pending_count': sum(1 for s in signals if s['outcome'] == 'OPEN'),
+        }
+
+    except Exception as e:
+        return {'error': str(e), 'signals': []}
+
+
+def get_real_outcomes(asset):
+    """Get historical signal outcomes for this asset from database."""
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''SELECT confluence_score, outcome, pnl_atr, rsi_htf, htf_trend
+                     FROM signals WHERE asset=? AND outcome IS NOT NULL
+                     ORDER BY id DESC LIMIT 200''', (asset,))
+        rows = c.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def get_asset_weights(asset):
+    """Get adaptive weights for this asset, or defaults if not enough data."""
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT * FROM asset_weights WHERE asset=?', (asset,))
+        row = c.fetchone()
+        conn.close()
+        if row and row[10] >= 50:  # total_trades >= 50
+            return {
+                'structure': row[1], 'liquidity': row[2], 'choch': row[3],
+                'ob': row[4], 'fvg': row[5], 'sd': row[6],
+                'pd': row[7], 'pa': row[8], 'session': row[9],
+            }
+    except Exception:
+        pass
+    return {
+        'structure': 20, 'liquidity': 15, 'choch': 15,
+        'ob': 10, 'fvg': 10, 'sd': 10,
+        'pd': 10, 'pa': 5, 'session': 5,
+    }
+
+
+def calc_statistical_edge(outcomes):
+    """Calculate real statistical edge metrics from outcome history."""
+    if len(outcomes) < 10:
+        return {'status': 'INSUFFICIENT DATA', 'n': len(outcomes)}
+
+    wins   = [o for o in outcomes if o[1] == 'WIN']
+    losses = [o for o in outcomes if o[1] == 'LOSS']
+    n      = len(outcomes)
+    wr     = len(wins) / n
+
+    pnls = [o[2] for o in outcomes if o[2] is not None]
+    if not pnls:
+        return {'status': 'INSUFFICIENT DATA', 'n': n}
+
+    avg_pnl = sum(pnls) / len(pnls)
+    std_pnl = math.sqrt(sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls)) if len(pnls) > 1 else 0
+    downside_pnls = [p for p in pnls if p < 0]
+    sortino_denom = math.sqrt(sum(p**2 for p in downside_pnls) / len(downside_pnls)) if downside_pnls else 0
+
+    sharpe  = round(avg_pnl / std_pnl, 3) if std_pnl > 0 else 0
+    sortino = round(avg_pnl / sortino_denom, 3) if sortino_denom > 0 else 0
+
+    # Max drawdown
+    equity = 0
+    peak   = 0
+    max_dd = 0
+    for p in pnls:
+        equity += p
+        if equity > peak:
+            peak = equity
+        dd = peak - equity
+        if dd > max_dd:
+            max_dd = dd
+
+    # 95% confidence interval on win rate (Wilson interval)
+    z = 1.96
+    ci_center = (wr + z*z/(2*n)) / (1 + z*z/n)
+    ci_margin  = z * math.sqrt(wr*(1-wr)/n + z*z/(4*n*n)) / (1 + z*z/n)
+    ci_low  = round(max(0, (ci_center - ci_margin) * 100), 1)
+    ci_high = round(min(100, (ci_center + ci_margin) * 100), 1)
+
+    verdict = ('EDGE CONFIRMED' if sharpe > 0.5 and wr >= 0.45 else
+               'MARGINAL EDGE'  if avg_pnl > 0 else 'NO EDGE DETECTED')
+
+    return {
+        'status':        'REAL_DATA',
+        'n':             n,
+        'win_rate_pct':  round(wr * 100, 1),
+        'win_rate_ci':   f'{ci_low}%-{ci_high}% (95% CI)',
+        'avg_pnl_atr':   round(avg_pnl, 3),
+        'sharpe_ratio':  sharpe,
+        'sortino_ratio': sortino,
+        'max_drawdown_atr': round(max_dd, 3),
+        'verdict':       verdict,
+    }
+
+
+def run_monte_carlo(outcomes, n_simulations=5000, n_trades=50):
+    """Monte Carlo simulation of future equity curves."""
+    if len(outcomes) < 30:
+        return {'status': 'INSUFFICIENT DATA — need 30+ real outcomes'}
+
+    pnls = [o[2] for o in outcomes if o[2] is not None]
+    if len(pnls) < 30:
+        return {'status': 'INSUFFICIENT DATA'}
+
+    ruin_count    = 0
+    dd_50_count   = 0
+    positive_count = 0
+    final_equities = []
+
+    for _ in range(n_simulations):
+        equity = 0
+        peak   = 0
+        max_dd = 0
+        ruined = False
+        for _ in range(n_trades):
+            trade = random.choice(pnls)
+            equity += trade
+            if equity > peak:
+                peak = equity
+            dd = peak - equity
+            if dd > max_dd:
+                max_dd = dd
+            if equity < -10:  # 10 ATR drawdown = ruin
+                ruined = True
+                break
+        if ruined:
+            ruin_count += 1
+        if max_dd >= 5:  # 5 ATR = 50% account on 2% risk
+            dd_50_count += 1
+        if equity > 0:
+            positive_count += 1
+        final_equities.append(equity)
+
+    final_equities.sort()
+    p10 = final_equities[int(n_simulations * 0.10)]
+    p50 = final_equities[int(n_simulations * 0.50)]
+    p90 = final_equities[int(n_simulations * 0.90)]
+
+    return {
+        'status':                   'COMPLETE',
+        'simulations':              n_simulations,
+        'trades_per_sim':           n_trades,
+        'prob_positive_pct':        round(positive_count / n_simulations * 100, 1),
+        'prob_ruin_pct':            round(ruin_count / n_simulations * 100, 1),
+        'prob_50pct_dd_pct':        round(dd_50_count / n_simulations * 100, 1),
+        'median_equity_atr':        round(p50, 2),
+        'p10_equity_atr':           round(p10, 2),
+        'p90_equity_atr':           round(p90, 2),
+        'interpretation':           f'{round(positive_count/n_simulations*100,1)}% chance of profit after {n_trades} trades. Ruin probability: {round(ruin_count/n_simulations*100,1)}%.'
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — ECONOMIC CALENDAR (Forex Factory free JSON)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+CALENDAR_ASSET_CURRENCIES = {
+    'XAUUSD': ['USD'], 'XAGUSD': ['USD'],
+    'EURUSD': ['EUR', 'USD'], 'GBPUSD': ['GBP', 'USD'],
+    'USDJPY': ['USD', 'JPY'], 'USDCHF': ['USD', 'CHF'],
+    'AUDUSD': ['AUD', 'USD'], 'USDCAD': ['USD', 'CAD'],
+    'NZDUSD': ['NZD', 'USD'],
+    'BTCUSD': ['USD'], 'ETHUSD': ['USD'], 'SOLUSD': ['USD'],
+    'BOOM1000': [], 'CRASH1000': [], 'VOL75': [], 'VOL100': [],
+}
+
+def fetch_economic_calendar(asset):
+    """Fetch Forex Factory calendar JSON — free, no API key needed."""
+    try:
+        url = 'https://nfs.faireconomy.media/ff_calendar_thisweek.json'
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(req, timeout=8) as resp:
+            events = json.loads(resp.read().decode())
+
+        currencies = CALENDAR_ASSET_CURRENCIES.get(asset, ['USD'])
+        now        = datetime.now(timezone.utc)
+        relevant   = []
+
+        for ev in events:
+            if ev.get('impact', '').lower() != 'high':
+                continue
+            if ev.get('currency', '') not in currencies:
+                continue
+            try:
+                ev_time = datetime.fromisoformat(ev['date'].replace('Z', '+00:00'))
+            except Exception:
+                continue
+
+            minutes_away = (ev_time - now).total_seconds() / 60
+
+            relevant.append({
+                'title':        ev.get('title', 'Unknown Event'),
+                'currency':     ev.get('currency', ''),
+                'time_utc':     ev_time.strftime('%Y-%m-%d %H:%M UTC'),
+                'minutes_away': round(minutes_away),
+                'forecast':     ev.get('forecast', 'N/A'),
+                'previous':     ev.get('previous', 'N/A'),
+                'actual':       ev.get('actual', 'Pending'),
+                'status': (
+                    'IMMINENT'   if -30 <= minutes_away <= 120 else
+                    'JUST_RELEASED' if -30 < minutes_away < 0 else
+                    'UPCOMING'   if minutes_away > 0 else
+                    'PASSED'
+                )
+            })
+
+        relevant.sort(key=lambda x: abs(x['minutes_away']))
+
+        hard_pause    = any(e['status'] in ('IMMINENT', 'JUST_RELEASED') for e in relevant)
+        pause_reason  = None
+        for e in relevant:
+            if e['status'] == 'IMMINENT':
+                pause_reason = f"{e['title']} ({e['currency']}) in {e['minutes_away']} minutes at {e['time_utc']}"
+                break
+            elif e['status'] == 'JUST_RELEASED':
+                pause_reason = f"{e['title']} ({e['currency']}) released {abs(e['minutes_away'])} minutes ago — spreads may be elevated"
+                break
+
+        return {
+            'status':       'OK',
+            'hard_pause':   hard_pause,
+            'pause_reason': pause_reason,
+            'events':       relevant[:5],
+        }
+
+    except Exception as e:
+        return {
+            'status':       'UNAVAILABLE',
+            'hard_pause':   False,
+            'pause_reason': None,
+            'events':       [],
+            'error':        str(e),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — TECHNICAL INDICATORS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def calc_atr(candles, period=14):
-    """Wilder ATR — TA-Lib if available, correct pure Python otherwise."""
     if len(candles) < period + 1:
         return 0.0
-
     if HAS_TALIB and HAS_NUMPY:
         try:
             highs  = np.array([c['high']  for c in candles], dtype=float)
@@ -68,19 +819,13 @@ def calc_atr(candles, period=14):
             return round(float(valid[-1]), 6) if len(valid) > 0 else 0.0
         except Exception:
             pass
-
-    # Pure Python Wilder ATR fallback
     slice_c = candles[-(period * 3):]
     trs = []
     for i in range(1, len(slice_c)):
         curr, prev = slice_c[i], slice_c[i - 1]
-        trs.append(max(
-            curr['high'] - curr['low'],
-            abs(curr['high'] - prev['close']),
-            abs(curr['low']  - prev['close'])
-        ))
+        trs.append(max(curr['high']-curr['low'], abs(curr['high']-prev['close']), abs(curr['low']-prev['close'])))
     if len(trs) < period:
-        return round(sum(trs) / len(trs), 6) if trs else 0.0
+        return round(sum(trs)/len(trs), 6) if trs else 0.0
     atr = sum(trs[:period]) / period
     for i in range(period, len(trs)):
         atr = (atr * (period - 1) + trs[i]) / period
@@ -88,10 +833,8 @@ def calc_atr(candles, period=14):
 
 
 def calc_ema(candles, period=20):
-    """EMA — TA-Lib if available, pure Python otherwise."""
     if len(candles) < period:
         return {'value': None, 'values': []}
-
     if HAS_TALIB and HAS_NUMPY:
         try:
             closes = np.array([c['close'] for c in candles], dtype=float)
@@ -101,8 +844,6 @@ def calc_ema(candles, period=20):
             return {'value': vals[-1] if vals else None, 'values': vals}
         except Exception:
             pass
-
-    # Pure Python EMA fallback
     closes = [c['close'] for c in candles]
     k = 2 / (period + 1)
     ema = sum(closes[:period]) / period
@@ -114,10 +855,8 @@ def calc_ema(candles, period=20):
 
 
 def calc_rsi(candles, period=14):
-    """RSI — TA-Lib if available, pure Python otherwise."""
     if len(candles) < period + 1:
         return {'value': None, 'zone': 'INSUFFICIENT DATA'}
-
     if HAS_TALIB and HAS_NUMPY:
         try:
             closes = np.array([c['close'] for c in candles], dtype=float)
@@ -128,39 +867,72 @@ def calc_rsi(candles, period=14):
                 return {'value': val, 'zone': _rsi_zone(val)}
         except Exception:
             pass
-
-    # Pure Python RSI fallback
     closes = [c['close'] for c in candles]
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    deltas = [closes[i]-closes[i-1] for i in range(1, len(closes))]
     gains  = [max(d, 0) for d in deltas]
     losses = [abs(min(d, 0)) for d in deltas]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
     for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        val = 100.0
-    else:
-        rs  = avg_gain / avg_loss
-        val = round(100 - (100 / (1 + rs)), 2)
+        ag = (ag*(period-1)+gains[i])/period
+        al = (al*(period-1)+losses[i])/period
+    val = round(100 - (100/(1+ag/al)), 2) if al else 100.0
     return {'value': val, 'zone': _rsi_zone(val)}
 
 
 def _rsi_zone(val):
-    if val >= 70:   return 'OVERBOUGHT'
-    if val >= 60:   return 'BULLISH'
-    if val >= 50:   return 'NEUTRAL_BULL'
-    if val >= 40:   return 'NEUTRAL_BEAR'
-    if val >= 30:   return 'BEARISH'
+    if val >= 70: return 'OVERBOUGHT'
+    if val >= 60: return 'BULLISH'
+    if val >= 50: return 'NEUTRAL_BULL'
+    if val >= 40: return 'NEUTRAL_BEAR'
+    if val >= 30: return 'BEARISH'
     return 'OVERSOLD'
 
 
+def calc_adx(candles, period=14):
+    """ADX for trend strength — TA-Lib if available, pure Python otherwise."""
+    if len(candles) < period * 2:
+        return {'adx': None, 'strength': 'INSUFFICIENT DATA'}
+    if HAS_TALIB and HAS_NUMPY:
+        try:
+            highs  = np.array([c['high']  for c in candles], dtype=float)
+            lows   = np.array([c['low']   for c in candles], dtype=float)
+            closes = np.array([c['close'] for c in candles], dtype=float)
+            result = talib.ADX(highs, lows, closes, timeperiod=period)
+            valid  = result[~np.isnan(result)]
+            if len(valid) > 0:
+                adx = round(float(valid[-1]), 2)
+                strength = ('STRONG_TREND' if adx > 25 else 'WEAK_TREND' if adx > 15 else 'NO_TREND')
+                return {'adx': adx, 'strength': strength}
+        except Exception:
+            pass
+    # Pure Python ADX approximation using ATR-based directional movement
+    trs, pdms, ndms = [], [], []
+    for i in range(1, len(candles)):
+        curr, prev = candles[i], candles[i-1]
+        tr  = max(curr['high']-curr['low'], abs(curr['high']-prev['close']), abs(curr['low']-prev['close']))
+        pdm = max(curr['high']-prev['high'], 0) if curr['high']-prev['high'] > prev['low']-curr['low'] else 0
+        ndm = max(prev['low']-curr['low'],   0) if prev['low']-curr['low'] > curr['high']-prev['high'] else 0
+        trs.append(tr); pdms.append(pdm); ndms.append(ndm)
+    if len(trs) < period:
+        return {'adx': None, 'strength': 'INSUFFICIENT DATA'}
+    atr14  = sum(trs[:period])/period
+    pdi14  = sum(pdms[:period])/period
+    ndi14  = sum(ndms[:period])/period
+    for i in range(period, len(trs)):
+        atr14 = (atr14*(period-1)+trs[i])/period
+        pdi14 = (pdi14*(period-1)+pdms[i])/period
+        ndi14 = (ndi14*(period-1)+ndms[i])/period
+    pdi = 100*pdi14/atr14 if atr14 else 0
+    ndi = 100*ndi14/atr14 if atr14 else 0
+    dx  = 100*abs(pdi-ndi)/(pdi+ndi) if (pdi+ndi) else 0
+    strength = 'STRONG_TREND' if dx > 25 else 'WEAK_TREND' if dx > 15 else 'NO_TREND'
+    return {'adx': round(dx, 2), 'strength': strength, 'pdi': round(pdi,2), 'ndi': round(ndi,2)}
+
+
 def calc_bollinger(candles, period=20, std_dev=2):
-    """Bollinger Bands — TA-Lib if available, pure Python otherwise."""
     if len(candles) < period:
         return {'upper': None, 'middle': None, 'lower': None, 'width': None, 'position': None}
-
     if HAS_TALIB and HAS_NUMPY:
         try:
             closes = np.array([c['close'] for c in candles], dtype=float)
@@ -169,683 +941,687 @@ def calc_bollinger(candles, period=20, std_dev=2):
             u = round(float(upper[~np.isnan(upper)][-1]), 6)
             m = round(float(middle[~np.isnan(middle)][-1]), 6)
             l = round(float(lower[~np.isnan(lower)][-1]), 6)
-            width = round((u - l) / m * 100, 3) if m else 0
-            pos   = round((last_close - l) / (u - l) * 100, 2) if (u - l) else 50
-            return {'upper': u, 'middle': m, 'lower': l, 'width': width, 'position': pos,
-                    'squeeze': width < 2.0, 'expansion': width > 5.0}
+            width = round((u-l)/m*100, 3) if m else 0
+            pos   = round((last_close-l)/(u-l)*100, 2) if (u-l) else 50
+            return {'upper':u,'middle':m,'lower':l,'width':width,'position':pos,'squeeze':width<2.0,'expansion':width>5.0}
         except Exception:
             pass
-
-    # Pure Python Bollinger fallback
     closes = [c['close'] for c in candles[-period:]]
-    mean   = sum(closes) / period
-    var    = sum((x - mean) ** 2 for x in closes) / period
-    std    = math.sqrt(var)
-    u = round(mean + std_dev * std, 6)
-    m = round(mean, 6)
-    l = round(mean - std_dev * std, 6)
+    mean = sum(closes)/period
+    std  = math.sqrt(sum((x-mean)**2 for x in closes)/period)
+    u,m,l = round(mean+std_dev*std,6), round(mean,6), round(mean-std_dev*std,6)
     last_close = candles[-1]['close']
-    width = round((u - l) / m * 100, 3) if m else 0
-    pos   = round((last_close - l) / (u - l) * 100, 2) if (u - l) else 50
-    return {'upper': u, 'middle': m, 'lower': l, 'width': width, 'position': pos,
-            'squeeze': width < 2.0, 'expansion': width > 5.0}
+    width = round((u-l)/m*100, 3) if m else 0
+    pos   = round((last_close-l)/(u-l)*100, 2) if (u-l) else 50
+    return {'upper':u,'middle':m,'lower':l,'width':width,'position':pos,'squeeze':width<2.0,'expansion':width>5.0}
 
 
 def calc_macd(candles, fast=12, slow=26, signal=9):
-    """MACD — TA-Lib if available, pure Python otherwise."""
-    if len(candles) < slow + signal:
-        return {'macd': None, 'signal': None, 'histogram': None, 'direction': 'INSUFFICIENT DATA'}
-
+    if len(candles) < slow+signal:
+        return {'macd':None,'signal':None,'histogram':None,'direction':'INSUFFICIENT DATA'}
     if HAS_TALIB and HAS_NUMPY:
         try:
             closes = np.array([c['close'] for c in candles], dtype=float)
             macd, sig, hist = talib.MACD(closes, fastperiod=fast, slowperiod=slow, signalperiod=signal)
-            valid_hist = hist[~np.isnan(hist)]
-            valid_macd = macd[~np.isnan(macd)]
-            valid_sig  = sig[~np.isnan(sig)]
-            if len(valid_hist) >= 2:
-                m = round(float(valid_macd[-1]), 6)
-                s = round(float(valid_sig[-1]),  6)
-                h = round(float(valid_hist[-1]), 6)
-                direction = 'BULLISH' if h > 0 and h > valid_hist[-2] else \
-                            'BEARISH' if h < 0 and h < valid_hist[-2] else 'NEUTRAL'
-                return {'macd': m, 'signal': s, 'histogram': h, 'direction': direction}
+            vh = hist[~np.isnan(hist)]
+            vm = macd[~np.isnan(macd)]
+            vs = sig[~np.isnan(sig)]
+            if len(vh) >= 2:
+                h = round(float(vh[-1]),6)
+                direction = 'BULLISH' if h>0 and h>vh[-2] else 'BEARISH' if h<0 and h<vh[-2] else 'NEUTRAL'
+                return {'macd':round(float(vm[-1]),6),'signal':round(float(vs[-1]),6),'histogram':h,'direction':direction}
         except Exception:
             pass
-
-    # Pure Python MACD fallback
     closes = [c['close'] for c in candles]
-    def ema_series(data, p):
-        k = 2 / (p + 1)
-        e = sum(data[:p]) / p
-        res = [e]
-        for v in data[p:]:
-            e = v * k + e * (1 - k)
-            res.append(e)
+    def ema_s(data, p):
+        k = 2/(p+1); e = sum(data[:p])/p; res=[e]
+        for v in data[p:]: e=v*k+e*(1-k); res.append(e)
         return res
-    ema_fast = ema_series(closes, fast)
-    ema_slow = ema_series(closes, slow)
-    min_len  = min(len(ema_fast), len(ema_slow))
-    macd_line = [ema_fast[-(min_len - i)] - ema_slow[-(min_len - i)] for i in range(min_len)]
-    sig_line  = ema_series(macd_line, signal)
-    hist_line = [macd_line[i + (len(macd_line) - len(sig_line))] - sig_line[i] for i in range(len(sig_line))]
-    if len(hist_line) >= 2:
-        h = round(hist_line[-1], 6)
-        direction = 'BULLISH' if h > 0 and h > hist_line[-2] else \
-                    'BEARISH' if h < 0 and h < hist_line[-2] else 'NEUTRAL'
-        return {'macd': round(macd_line[-1], 6), 'signal': round(sig_line[-1], 6),
-                'histogram': h, 'direction': direction}
-    return {'macd': None, 'signal': None, 'histogram': None, 'direction': 'INSUFFICIENT DATA'}
+    ef=ema_s(closes,fast); es=ema_s(closes,slow)
+    ml=min(len(ef),len(es)); ml_line=[ef[-(ml-i)]-es[-(ml-i)] for i in range(ml)]
+    sl_line=ema_s(ml_line,signal)
+    hl=[ml_line[i+(len(ml_line)-len(sl_line))]-sl_line[i] for i in range(len(sl_line))]
+    if len(hl)>=2:
+        h=round(hl[-1],6)
+        direction='BULLISH' if h>0 and h>hl[-2] else 'BEARISH' if h<0 and h<hl[-2] else 'NEUTRAL'
+        return {'macd':round(ml_line[-1],6),'signal':round(sl_line[-1],6),'histogram':h,'direction':direction}
+    return {'macd':None,'signal':None,'histogram':None,'direction':'INSUFFICIENT DATA'}
 
 
 def calc_vwap(candles):
-    """VWAP — intraday volume-weighted average price."""
-    # Deriv doesn't provide volume so we use typical price as proxy
-    if len(candles) < 2:
-        return None
-    typical_prices = [(c['high'] + c['low'] + c['close']) / 3 for c in candles]
-    # Use price range as volume proxy (wider range = higher activity)
-    proxy_vols = [c['high'] - c['low'] for c in candles]
-    total_vol  = sum(proxy_vols)
-    if total_vol == 0:
-        return round(sum(typical_prices) / len(typical_prices), 6)
-    vwap = sum(tp * pv for tp, pv in zip(typical_prices, proxy_vols)) / total_vol
-    return round(vwap, 6)
+    if len(candles) < 2: return None
+    tps = [(c['high']+c['low']+c['close'])/3 for c in candles]
+    pvs = [c['high']-c['low'] for c in candles]
+    tv  = sum(pvs)
+    if tv == 0: return round(sum(tps)/len(tps),6)
+    return round(sum(tp*pv for tp,pv in zip(tps,pvs))/tv, 6)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — SMC/ICT STRUCTURE ENGINES (unchanged from v1, proven correct)
+# SECTION 3 — MARKET REGIME ENGINE (Hurst + ADX + Volatility Percentile)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calc_hurst_exponent(candles, max_lag=20):
+    """
+    Hurst Exponent via R/S analysis.
+    H > 0.6 = trending  |  H = 0.5 = random walk  |  H < 0.4 = mean reverting
+    """
+    if len(candles) < max_lag * 2:
+        return {'hurst': None, 'regime': 'INSUFFICIENT DATA'}
+    closes = [c['close'] for c in candles]
+    lags   = range(2, max_lag)
+    rs_vals = []
+    for lag in lags:
+        sub = closes[-lag*2:]
+        chunks = [sub[i:i+lag] for i in range(0, len(sub)-lag+1, lag)]
+        rs_chunk = []
+        for chunk in chunks:
+            if len(chunk) < 2: continue
+            mean = sum(chunk)/len(chunk)
+            deviations = [x-mean for x in chunk]
+            cum_dev    = []
+            cum = 0
+            for d in deviations:
+                cum += d
+                cum_dev.append(cum)
+            R = max(cum_dev) - min(cum_dev)
+            S = math.sqrt(sum((x-mean)**2 for x in chunk)/len(chunk))
+            if S > 0:
+                rs_chunk.append(R/S)
+        if rs_chunk:
+            rs_vals.append((math.log(lag), math.log(sum(rs_chunk)/len(rs_chunk))))
+    if len(rs_vals) < 4:
+        return {'hurst': None, 'regime': 'INSUFFICIENT DATA'}
+    # Linear regression on log-log plot
+    n    = len(rs_vals)
+    sx   = sum(v[0] for v in rs_vals)
+    sy   = sum(v[1] for v in rs_vals)
+    sxy  = sum(v[0]*v[1] for v in rs_vals)
+    sx2  = sum(v[0]**2 for v in rs_vals)
+    H    = round((n*sxy - sx*sy) / (n*sx2 - sx*sx), 3)
+    if H > 0.6:    regime = 'TRENDING'
+    elif H < 0.4:  regime = 'MEAN_REVERTING'
+    else:           regime = 'RANDOM_WALK'
+    return {'hurst': H, 'regime': regime}
+
+
+def calc_volatility_percentile(candles, period=14, lookback=100):
+    """
+    Current ATR vs its historical distribution over lookback candles.
+    Returns percentile 0-100. High = expansion, Low = compression.
+    """
+    if len(candles) < lookback + period:
+        return {'percentile': None, 'regime': 'INSUFFICIENT DATA'}
+    current_atr = calc_atr(candles, period)
+    historical_atrs = []
+    for i in range(lookback):
+        idx = len(candles) - lookback + i
+        if idx > period:
+            a = calc_atr(candles[:idx], period)
+            if a > 0:
+                historical_atrs.append(a)
+    if not historical_atrs:
+        return {'percentile': None, 'regime': 'INSUFFICIENT DATA'}
+    historical_atrs.sort()
+    rank = sum(1 for a in historical_atrs if a <= current_atr)
+    pct  = round(rank / len(historical_atrs) * 100, 1)
+    regime = ('VOLATILITY_EXPANSION' if pct >= 80 else
+              'VOLATILITY_COMPRESSION' if pct <= 20 else
+              'NORMAL_VOLATILITY')
+    return {'percentile': pct, 'regime': regime, 'current_atr': current_atr}
+
+
+def classify_market_regime(candles, atr):
+    """
+    Full regime classification combining Hurst + ADX + Volatility Percentile.
+    Returns a single regime label with trading implications.
+    """
+    hurst   = calc_hurst_exponent(candles)
+    adx     = calc_adx(candles)
+    vol_pct = calc_volatility_percentile(candles)
+
+    h = hurst.get('hurst')
+    a = adx.get('adx')
+    v = vol_pct.get('percentile')
+
+    # Classify based on combination
+    if h is not None and a is not None and v is not None:
+        if h > 0.6 and a > 25:
+            regime = 'TRENDING_STRONG'
+            implication = 'Follow trend. Use BOS+OB entries. Wide targets.'
+        elif h > 0.55 and a > 20:
+            regime = 'TRENDING_MODERATE'
+            implication = 'Follow trend with caution. Tighter stops.'
+        elif h < 0.4 and a < 20:
+            regime = 'MEAN_REVERTING'
+            implication = 'Fade extremes. Enter at premium/discount. Tight targets.'
+        elif v >= 80:
+            regime = 'VOLATILITY_EXPANSION'
+            implication = 'Breakout mode. Wait for direction then follow. Wide stops.'
+        elif v <= 20:
+            regime = 'VOLATILITY_COMPRESSION'
+            implication = 'Breakout imminent. Do not trade range. Prepare for expansion.'
+        else:
+            regime = 'TRANSITIONING'
+            implication = 'Market transitioning. Reduce size. Wait for clear regime.'
+    else:
+        regime = 'UNKNOWN'
+        implication = 'Insufficient data for regime classification.'
+
+    return {
+        'regime':       regime,
+        'implication':  implication,
+        'hurst':        hurst,
+        'adx':          adx,
+        'volatility':   vol_pct,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — VOLUME PROFILE PROXY
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calc_volume_profile(candles, bins=20):
+    """
+    Volume Profile Proxy using price range and time as volume proxy.
+    Returns POC, Value Area High/Low, HVN, LVN.
+    """
+    if len(candles) < 20:
+        return {'status': 'INSUFFICIENT DATA'}
+
+    price_min = min(c['low']  for c in candles)
+    price_max = max(c['high'] for c in candles)
+    price_range = price_max - price_min
+
+    if price_range <= 0:
+        return {'status': 'INSUFFICIENT DATA'}
+
+    bin_size = price_range / bins
+    profile  = [0.0] * bins
+
+    for c in candles:
+        # Use candle body size as activity proxy
+        body   = abs(c['close'] - c['open'])
+        range_ = c['high'] - c['low']
+        activity = body + range_ * 0.5  # weighted activity
+
+        # Distribute activity across price range of candle
+        low_bin  = int((c['low']  - price_min) / bin_size)
+        high_bin = int((c['high'] - price_min) / bin_size)
+        low_bin  = max(0, min(low_bin,  bins-1))
+        high_bin = max(0, min(high_bin, bins-1))
+        span = high_bin - low_bin + 1
+        for b in range(low_bin, high_bin + 1):
+            profile[b] += activity / span
+
+    # Find POC (highest activity bin)
+    poc_bin   = profile.index(max(profile))
+    poc_price = round(price_min + (poc_bin + 0.5) * bin_size, 6)
+
+    # Value Area (70% of total activity around POC)
+    total_activity = sum(profile)
+    target_activity = total_activity * 0.70
+    va_low_bin  = poc_bin
+    va_high_bin = poc_bin
+    va_activity = profile[poc_bin]
+
+    while va_activity < target_activity:
+        expand_up   = profile[va_high_bin + 1] if va_high_bin + 1 < bins else 0
+        expand_down = profile[va_low_bin  - 1] if va_low_bin  - 1 >= 0  else 0
+        if expand_up >= expand_down and va_high_bin + 1 < bins:
+            va_high_bin += 1
+            va_activity += profile[va_high_bin]
+        elif va_low_bin - 1 >= 0:
+            va_low_bin -= 1
+            va_activity += profile[va_low_bin]
+        else:
+            break
+
+    vah = round(price_min + (va_high_bin + 1) * bin_size, 6)
+    val = round(price_min + va_low_bin * bin_size, 6)
+
+    # HVN (top 3 bins outside value area)
+    sorted_bins = sorted(enumerate(profile), key=lambda x: x[1], reverse=True)
+    hvn = []
+    lvn = []
+    avg_activity = total_activity / bins
+    for idx, act in sorted_bins:
+        price_level = round(price_min + (idx + 0.5) * bin_size, 6)
+        if act > avg_activity * 1.5:
+            hvn.append({'price': price_level, 'activity_ratio': round(act / avg_activity, 2)})
+        elif act < avg_activity * 0.5:
+            lvn.append({'price': price_level, 'activity_ratio': round(act / avg_activity, 2)})
+
+    current_price = candles[-1]['close']
+    poc_relation = ('ABOVE_POC' if current_price > poc_price else
+                    'BELOW_POC' if current_price < poc_price else 'AT_POC')
+
+    return {
+        'status':       'OK',
+        'poc':          poc_price,
+        'vah':          vah,
+        'val':          val,
+        'poc_relation': poc_relation,
+        'hvn':          hvn[:3],
+        'lvn':          lvn[:3],
+        'price_range':  round(price_range, 6),
+        'note':         f'POC={poc_price} | VAH={vah} | VAL={val} | Price is {poc_relation}',
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — SMC/ICT STRUCTURE ENGINES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def detect_swings(candles, left=5, right=5):
     swing_highs, swing_lows = [], []
     for i in range(left, len(candles) - right):
-        w_h = [candles[j]['high'] for j in range(i - left, i + right + 1)]
-        w_l = [candles[j]['low']  for j in range(i - left, i + right + 1)]
-        if candles[i]['high'] == max(w_h):
-            swing_highs.append({'index': i, 'price': candles[i]['high'],
-                                 'epoch': candles[i]['epoch'],
-                                 'date':  candles[i].get('date', str(candles[i]['epoch']))})
-        if candles[i]['low'] == min(w_l):
-            swing_lows.append({'index': i, 'price': candles[i]['low'],
-                                'epoch': candles[i]['epoch'],
-                                'date':  candles[i].get('date', str(candles[i]['epoch']))})
+        wh = [candles[j]['high'] for j in range(i-left, i+right+1)]
+        wl = [candles[j]['low']  for j in range(i-left, i+right+1)]
+        if candles[i]['high'] == max(wh):
+            swing_highs.append({'index':i,'price':candles[i]['high'],'epoch':candles[i]['epoch'],'date':candles[i].get('date',str(candles[i]['epoch']))})
+        if candles[i]['low'] == min(wl):
+            swing_lows.append({'index':i,'price':candles[i]['low'],'epoch':candles[i]['epoch'],'date':candles[i].get('date',str(candles[i]['epoch']))})
     return swing_highs, swing_lows
 
 
 def detect_bos_choch(candles, swing_highs, swing_lows):
     events, trend = [], 'NEUTRAL'
-    all_swings = sorted(
-        [('SH', sh) for sh in swing_highs] + [('SL', sl) for sl in swing_lows],
-        key=lambda x: x[1]['index']
-    )
+    all_swings = sorted([('SH',sh) for sh in swing_highs]+[('SL',sl) for sl in swing_lows], key=lambda x:x[1]['index'])
     confirmed_sh, confirmed_sl = [], []
     for i, c in enumerate(candles):
         for stype, swing in all_swings:
             if swing['index'] == i:
-                (confirmed_sh if stype == 'SH' else confirmed_sl).append(swing)
+                (confirmed_sh if stype=='SH' else confirmed_sl).append(swing)
         if confirmed_sh:
-            latest_sh = confirmed_sh[-1]
-            if c['close'] > latest_sh['price'] and latest_sh['index'] < i:
-                etype = 'CHoCH' if trend == 'BEARISH' else 'BOS'
-                events.append({'type': f'{etype} BULL', 'price': latest_sh['price'],
-                                'candle_price': c['close'], 'epoch': c['epoch'],
-                                'date': c.get('date', str(c['epoch'])), 'index': i})
+            lsh = confirmed_sh[-1]
+            if c['close'] > lsh['price'] and lsh['index'] < i:
+                etype = 'CHoCH' if trend=='BEARISH' else 'BOS'
+                events.append({'type':f'{etype} BULL','price':lsh['price'],'candle_price':c['close'],'epoch':c['epoch'],'date':c.get('date',str(c['epoch'])),'index':i})
                 trend, confirmed_sh = 'BULLISH', []
         if confirmed_sl:
-            latest_sl = confirmed_sl[-1]
-            if c['close'] < latest_sl['price'] and latest_sl['index'] < i:
-                etype = 'CHoCH' if trend == 'BULLISH' else 'BOS'
-                events.append({'type': f'{etype} BEAR', 'price': latest_sl['price'],
-                                'candle_price': c['close'], 'epoch': c['epoch'],
-                                'date': c.get('date', str(c['epoch'])), 'index': i})
+            lsl = confirmed_sl[-1]
+            if c['close'] < lsl['price'] and lsl['index'] < i:
+                etype = 'CHoCH' if trend=='BULLISH' else 'BOS'
+                events.append({'type':f'{etype} BEAR','price':lsl['price'],'candle_price':c['close'],'epoch':c['epoch'],'date':c.get('date',str(c['epoch'])),'index':i})
                 trend, confirmed_sl = 'BEARISH', []
     return events, trend
 
 
 def detect_fvg(candles, atr):
-    fvgs, min_size = [], atr * 0.15 if atr > 0 else 0
-    for i in range(1, len(candles) - 1):
-        prev, curr, nxt = candles[i-1], candles[i], candles[i+1]
-        if prev['high'] < nxt['low']:
-            gs = nxt['low'] - prev['high']
-            if gs >= min_size:
-                mit = any(candles[j]['close'] <= nxt['low'] and candles[j]['close'] >= prev['high']
-                          for j in range(i + 2, len(candles)))
-                fvgs.append({'direction': 'BULL', 'top': round(nxt['low'], 6),
-                             'bottom': round(prev['high'], 6), 'size': round(gs, 6),
-                             'atr_ratio': round(gs / atr, 3) if atr else 0,
-                             'epoch': curr['epoch'], 'date': curr.get('date', str(curr['epoch'])),
-                             'status': 'MITIGATED' if mit else 'FRESH', 'index': i})
-        if prev['low'] > nxt['high']:
-            gs = prev['low'] - nxt['high']
-            if gs >= min_size:
-                mit = any(candles[j]['close'] >= nxt['high'] and candles[j]['close'] <= prev['low']
-                          for j in range(i + 2, len(candles)))
-                fvgs.append({'direction': 'BEAR', 'top': round(prev['low'], 6),
-                             'bottom': round(nxt['high'], 6), 'size': round(gs, 6),
-                             'atr_ratio': round(gs / atr, 3) if atr else 0,
-                             'epoch': curr['epoch'], 'date': curr.get('date', str(curr['epoch'])),
-                             'status': 'MITIGATED' if mit else 'FRESH', 'index': i})
+    fvgs, min_size = [], atr*0.15 if atr>0 else 0
+    for i in range(1, len(candles)-1):
+        prev,curr,nxt = candles[i-1],candles[i],candles[i+1]
+        if prev['high']<nxt['low']:
+            gs=nxt['low']-prev['high']
+            if gs>=min_size:
+                mit=any(candles[j]['close']<=nxt['low'] and candles[j]['close']>=prev['high'] for j in range(i+2,len(candles)))
+                fvgs.append({'direction':'BULL','top':round(nxt['low'],6),'bottom':round(prev['high'],6),'size':round(gs,6),'atr_ratio':round(gs/atr,3) if atr else 0,'epoch':curr['epoch'],'date':curr.get('date',str(curr['epoch'])),'status':'MITIGATED' if mit else 'FRESH','index':i})
+        if prev['low']>nxt['high']:
+            gs=prev['low']-nxt['high']
+            if gs>=min_size:
+                mit=any(candles[j]['close']>=nxt['high'] and candles[j]['close']<=prev['low'] for j in range(i+2,len(candles)))
+                fvgs.append({'direction':'BEAR','top':round(prev['low'],6),'bottom':round(nxt['high'],6),'size':round(gs,6),'atr_ratio':round(gs/atr,3) if atr else 0,'epoch':curr['epoch'],'date':curr.get('date',str(curr['epoch'])),'status':'MITIGATED' if mit else 'FRESH','index':i})
     return fvgs
 
 
 def detect_order_blocks(candles, bos_events, atr):
-    obs, min_impulse = [], atr * 1.5 if atr > 0 else 0
+    obs, min_imp = [], atr*1.5 if atr>0 else 0
     for event in bos_events:
-        if 'BOS' not in event['type']:
-            continue
-        bos_idx   = event['index']
-        direction = 'BULL' if 'BULL' in event['type'] else 'BEAR'
-        imp_c     = candles[max(0, bos_idx - 10):bos_idx + 1]
-        if not imp_c:
-            continue
-        imp_size = max(c['high'] for c in imp_c) - min(c['low'] for c in imp_c)
-        if imp_size < min_impulse:
-            continue
-        ob_candle, ob_idx = None, -1
-        for j in range(bos_idx - 1, max(0, bos_idx - 15), -1):
-            c = candles[j]
-            if (direction == 'BULL' and c['close'] < c['open']) or \
-               (direction == 'BEAR' and c['close'] > c['open']):
-                ob_candle, ob_idx = c, j
-                break
-        if ob_candle is None:
-            continue
-        mid = (ob_candle['open'] + ob_candle['close']) / 2
-        mit = any((direction == 'BULL' and candles[j]['low'] <= mid) or
-                  (direction == 'BEAR' and candles[j]['high'] >= mid)
-                  for j in range(bos_idx + 1, len(candles)))
-        obs.append({'direction': direction,
-                    'high': round(max(ob_candle['open'], ob_candle['close']), 6),
-                    'low':  round(min(ob_candle['open'], ob_candle['close']), 6),
-                    'full_high': round(ob_candle['high'], 6),
-                    'full_low':  round(ob_candle['low'],  6),
-                    'impulse_size': round(imp_size, 6),
-                    'atr_ratio': round(imp_size / atr, 2) if atr else 0,
-                    'epoch': ob_candle['epoch'],
-                    'date':  ob_candle.get('date', str(ob_candle['epoch'])),
-                    'status': 'MITIGATED' if mit else 'FRESH',
-                    'index': ob_idx})
+        if 'BOS' not in event['type']: continue
+        bos_idx=event['index']; direction='BULL' if 'BULL' in event['type'] else 'BEAR'
+        imp_c=candles[max(0,bos_idx-10):bos_idx+1]
+        if not imp_c: continue
+        imp_size=max(c['high'] for c in imp_c)-min(c['low'] for c in imp_c)
+        if imp_size<min_imp: continue
+        ob_candle,ob_idx=None,-1
+        for j in range(bos_idx-1,max(0,bos_idx-15),-1):
+            c=candles[j]
+            if (direction=='BULL' and c['close']<c['open']) or (direction=='BEAR' and c['close']>c['open']):
+                ob_candle,ob_idx=c,j; break
+        if ob_candle is None: continue
+        mid=(ob_candle['open']+ob_candle['close'])/2
+        mit=any((direction=='BULL' and candles[j]['low']<=mid) or (direction=='BEAR' and candles[j]['high']>=mid) for j in range(bos_idx+1,len(candles)))
+        touch_count=sum(1 for j in range(bos_idx+1,len(candles)) if candles[j]['low']<=ob_candle['high'] and candles[j]['high']>=ob_candle['low'])
+        obs.append({'direction':direction,'high':round(max(ob_candle['open'],ob_candle['close']),6),'low':round(min(ob_candle['open'],ob_candle['close']),6),'full_high':round(ob_candle['high'],6),'full_low':round(ob_candle['low'],6),'impulse_size':round(imp_size,6),'atr_ratio':round(imp_size/atr,2) if atr else 0,'epoch':ob_candle['epoch'],'date':ob_candle.get('date',str(ob_candle['epoch'])),'status':'MITIGATED' if mit else 'FRESH','touch_count':touch_count,'index':ob_idx})
     return obs
 
 
 def detect_liquidity(candles, swing_highs, swing_lows, atr):
-    tol, last_close = atr * 0.05 if atr > 0 else 0, candles[-1]['close'] if candles else 0
+    tol=atr*0.05 if atr>0 else 0; last_close=candles[-1]['close'] if candles else 0
 
     def sweep_status(swings, is_high):
-        result = []
+        result=[]
         for sw in swings:
-            swept = False
-            for j in range(sw['index'] + 1, len(candles)):
-                c = candles[j]
-                if is_high and c['high'] > sw['price']:
-                    swept = c['close'] < sw['price']
+            swept=False; sweep_strength=0; displacement=0
+            for j in range(sw['index']+1,len(candles)):
+                c=candles[j]
+                if is_high and c['high']>sw['price']:
+                    wick_beyond=c['high']-sw['price']
+                    swept=c['close']<sw['price']
+                    if swept:
+                        sweep_strength=round(wick_beyond/atr,2) if atr else 0
+                        if j+1<len(candles): displacement=round(abs(candles[j+1]['close']-candles[j+1]['open'])/atr,2) if atr else 0
                     break
-                elif not is_high and c['low'] < sw['price']:
-                    swept = c['close'] > sw['price']
+                elif not is_high and c['low']<sw['price']:
+                    wick_beyond=sw['price']-c['low']
+                    swept=c['close']>sw['price']
+                    if swept:
+                        sweep_strength=round(wick_beyond/atr,2) if atr else 0
+                        if j+1<len(candles): displacement=round(abs(candles[j+1]['close']-candles[j+1]['open'])/atr,2) if atr else 0
                     break
-            result.append({'price': sw['price'], 'epoch': sw['epoch'],
-                           'date':  sw.get('date', str(sw['epoch'])),
-                           'status': 'SWEPT' if swept else 'RESTING',
-                           'distance_pct': round(abs(sw['price'] - last_close) / last_close * 100, 3) if last_close else 0})
+            quality='HIGH' if sweep_strength>1.5 and displacement>1.0 else 'MEDIUM' if sweep_strength>0.5 else 'LOW' if swept else 'N/A'
+            result.append({'price':sw['price'],'epoch':sw['epoch'],'date':sw.get('date',str(sw['epoch'])),'status':'SWEPT' if swept else 'RESTING','distance_pct':round(abs(sw['price']-last_close)/last_close*100,3) if last_close else 0,'sweep_strength_atr':sweep_strength,'displacement_atr':displacement,'sweep_quality':quality})
         return result
 
-    bsl = sweep_status(swing_highs, True)
-    ssl = sweep_status(swing_lows, False)
-    eqh = [{'price_1': swing_highs[i]['price'], 'price_2': swing_highs[j]['price'],
-             'avg': round((swing_highs[i]['price'] + swing_highs[j]['price']) / 2, 6)}
-           for i in range(len(swing_highs)) for j in range(i+1, len(swing_highs))
-           if abs(swing_highs[i]['price'] - swing_highs[j]['price']) <= tol]
-    eql = [{'price_1': swing_lows[i]['price'], 'price_2': swing_lows[j]['price'],
-             'avg': round((swing_lows[i]['price'] + swing_lows[j]['price']) / 2, 6)}
-           for i in range(len(swing_lows)) for j in range(i+1, len(swing_lows))
-           if abs(swing_lows[i]['price'] - swing_lows[j]['price']) <= tol]
+    bsl=sweep_status(swing_highs,True); ssl=sweep_status(swing_lows,False)
+    eqh=[{'price_1':swing_highs[i]['price'],'price_2':swing_highs[j]['price'],'avg':round((swing_highs[i]['price']+swing_highs[j]['price'])/2,6)} for i in range(len(swing_highs)) for j in range(i+1,len(swing_highs)) if abs(swing_highs[i]['price']-swing_highs[j]['price'])<=tol]
+    eql=[{'price_1':swing_lows[i]['price'],'price_2':swing_lows[j]['price'],'avg':round((swing_lows[i]['price']+swing_lows[j]['price'])/2,6)} for i in range(len(swing_lows)) for j in range(i+1,len(swing_lows)) if abs(swing_lows[i]['price']-swing_lows[j]['price'])<=tol]
     return {
-        'bsl': sorted([x for x in bsl if x['status'] == 'RESTING'], key=lambda x: x['distance_pct'])[:5],
-        'ssl': sorted([x for x in ssl if x['status'] == 'RESTING'], key=lambda x: x['distance_pct'])[:5],
-        'equal_highs': eqh[:3], 'equal_lows': eql[:3]
+        'bsl':sorted([x for x in bsl if x['status']=='RESTING'],key=lambda x:x['distance_pct'])[:5],
+        'ssl':sorted([x for x in ssl if x['status']=='RESTING'],key=lambda x:x['distance_pct'])[:5],
+        'swept_bsl':[x for x in bsl if x['status']=='SWEPT' and x['sweep_quality']=='HIGH'][-3:],
+        'swept_ssl':[x for x in ssl if x['status']=='SWEPT' and x['sweep_quality']=='HIGH'][-3:],
+        'equal_highs':eqh[:3],'equal_lows':eql[:3]
     }
 
 
 def calc_premium_discount(candles, swing_highs, swing_lows):
     if not swing_highs or not swing_lows:
-        return {'status': 'INSUFFICIENT DATA', 'percentage': None}
-    last_close = candles[-1]['close']
-    rh = max(swing_highs, key=lambda x: x['index'])['price']
-    rl = max(swing_lows,  key=lambda x: x['index'])['price']
-    rng = rh - rl
-    if rng <= 0:
-        return {'status': 'INSUFFICIENT DATA', 'percentage': None}
-    pct = round((last_close - rl) / rng * 100, 2)
-    status = 'DEEP PREMIUM' if pct >= 75 else 'PREMIUM' if pct >= 50 else \
-             'DISCOUNT' if pct >= 25 else 'DEEP DISCOUNT'
-    return {'status': status, 'percentage': pct,
-            'range_high': round(rh, 6), 'range_low': round(rl, 6),
-            'equilibrium': round(rl + rng * 0.5, 6), 'current': round(last_close, 6)}
+        return {'status':'INSUFFICIENT DATA','percentage':None}
+    last_close=candles[-1]['close']
+    rsh=max(swing_highs,key=lambda x:x['index']); rsl=max(swing_lows,key=lambda x:x['index'])
+    range_high=rsh['price']; range_low=rsl['price']
+    below_range=last_close<range_low; above_range=last_close>range_high
+    if last_close>range_high: range_high=last_close
+    if last_close<range_low:  range_low=last_close
+    rng=range_high-range_low
+    if rng<=0: return {'status':'INSUFFICIENT DATA','percentage':None}
+    pct=round(max(0.0,min(100.0,(last_close-range_low)/rng*100)),2)
+    status='DEEP PREMIUM' if pct>=75 else 'PREMIUM' if pct>=50 else 'DISCOUNT' if pct>=25 else 'DEEP DISCOUNT'
+    note=('PRICE BELOW SWING RANGE — strong bearish extension' if below_range else
+          'PRICE ABOVE SWING RANGE — strong bullish extension' if above_range else
+          'PRICE WITHIN SWING RANGE')
+    return {'status':status,'percentage':pct,'range_high':round(range_high,6),'range_low':round(range_low,6),'equilibrium':round(range_low+rng*0.5,6),'current':round(last_close,6),'below_range':below_range,'above_range':above_range,'note':note}
 
 
 def calc_session(latest_epoch):
-    dt   = datetime.fromtimestamp(latest_epoch, tz=timezone.utc)
-    hour = dt.hour
-    if 7  <= hour < 11: return {'session': 'LONDON',           'score': 5}
-    if 12 <= hour < 15: return {'session': 'LONDON_NY_OVERLAP','score': 5}
-    if 15 <= hour < 20: return {'session': 'NEW_YORK',         'score': 5}
-    if 0  <= hour < 6:  return {'session': 'ASIAN',            'score': 0}
-    return {'session': 'OFF_HOURS', 'score': 2}
+    dt=datetime.fromtimestamp(latest_epoch,tz=timezone.utc); hour=dt.hour
+    if 7<=hour<11:  return {'session':'LONDON','score':5}
+    if 12<=hour<15: return {'session':'LONDON_NY_OVERLAP','score':5}
+    if 15<=hour<20: return {'session':'NEW_YORK','score':5}
+    if 0<=hour<6:   return {'session':'ASIAN','score':0}
+    return {'session':'OFF_HOURS','score':2}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — ML SIGNAL SCORING
-# Uses sklearn LogisticRegression when available, rule-based scoring as fallback
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def build_feature_vector(tf_data, indicators):
-    """
-    Build a normalised feature vector for ML scoring.
-    Features represent the current market state numerically.
-    """
-    features = []
-
-    # 1. Trend encoding: BULLISH=1, BEARISH=-1, NEUTRAL=0
-    trend_enc = {'BULLISH': 1, 'BEARISH': -1, 'NEUTRAL': 0}
-    features.append(trend_enc.get(tf_data.get('trend', 'NEUTRAL'), 0))
-
-    # 2. Premium/Discount percentage (0-100 normalised to -1 to 1)
-    pd = tf_data.get('premium_discount', {})
-    pct = pd.get('percentage')
-    features.append((pct / 50.0 - 1.0) if pct is not None else 0.0)
-
-    # 3. Fresh OBs count (normalised)
-    features.append(min(len(tf_data.get('ob_fresh', [])), 5) / 5.0)
-
-    # 4. Fresh FVGs count (normalised)
-    features.append(min(len(tf_data.get('fvg_fresh', [])), 5) / 5.0)
-
-    # 5. Resting BSL count
-    liq = tf_data.get('liquidity', {})
-    features.append(min(len(liq.get('bsl', [])), 5) / 5.0)
-
-    # 6. Resting SSL count
-    features.append(min(len(liq.get('ssl', [])), 5) / 5.0)
-
-    # 7. RSI normalised (0-100 → -1 to 1)
-    rsi_val = indicators.get('rsi', {}).get('value')
-    features.append((rsi_val / 50.0 - 1.0) if rsi_val is not None else 0.0)
-
-    # 8. MACD direction: BULLISH=1, BEARISH=-1, NEUTRAL=0
-    macd_dir = indicators.get('macd', {}).get('direction', 'NEUTRAL')
-    features.append(trend_enc.get(macd_dir, 0))
-
-    # 9. Bollinger position (0-100 → -1 to 1)
-    bb_pos = indicators.get('bollinger', {}).get('position')
-    features.append((bb_pos / 50.0 - 1.0) if bb_pos is not None else 0.0)
-
-    # 10. Structure events count in last 8 events
-    bos_count = sum(1 for e in tf_data.get('bos_choch', []) if 'BOS' in e['type'])
-    features.append(min(bos_count, 5) / 5.0)
-
-    return features
-
-
-def ml_signal_score(htf_data, etf_data, indicators_by_tf, session_score):
-    """
-    ML-based confluence score.
-    When sklearn is available: uses LogisticRegression trained on synthetic
-    institutional patterns (correct confluence = positive class).
-    When sklearn unavailable: uses weighted rule-based scoring.
-    Returns score 0-100.
-    """
-    if HAS_SKLEARN and HAS_NUMPY:
-        try:
-            htf_features = build_feature_vector(htf_data, indicators_by_tf.get('htf', {}))
-            etf_features = build_feature_vector(etf_data, indicators_by_tf.get('etf', {}))
-            combined     = htf_features + etf_features + [session_score / 5.0]
-
-            # Synthetic training data representing high-confluence vs low-confluence setups
-            # Format: [htf_trend, htf_pd, htf_obs, htf_fvg, htf_bsl, htf_ssl, htf_rsi, htf_macd, htf_bb, htf_bos,
-            #          etf_trend, etf_pd, etf_obs, etf_fvg, etf_bsl, etf_ssl, etf_rsi, etf_macd, etf_bb, etf_bos, session]
-            X_train = [
-                # HIGH confluence long setups (label=1)
-                [-1,-0.5,0.8,0.6,0.2,0.8,-0.3,-1,0.8,0.8,  -1,-0.5,0.6,0.8,0.2,0.8,-0.4,-1,0.7,0.6, 1.0],
-                [-1,-0.6,0.6,0.8,0.0,1.0,-0.5,-1,0.9,0.6,  -1,-0.4,0.8,0.6,0.0,0.8,-0.5,-1,0.8,0.8, 0.6],
-                [1, -0.4,0.8,0.4,0.4,0.4,-0.2,1,-0.5,0.6,   1,-0.5,0.6,0.6,0.2,0.4,-0.3,1,-0.6,0.6, 1.0],
-                # HIGH confluence short setups (label=1)
-                [1, 0.5,0.8,0.6,0.8,0.2,0.3,1,-0.8,0.8,    1,0.4,0.6,0.8,0.8,0.2,0.4,1,-0.7,0.6, 1.0],
-                [1, 0.6,0.6,0.8,0.6,0.0,0.5,1,-0.9,0.6,    1,0.5,0.8,0.6,0.8,0.0,0.5,1,-0.8,0.8, 0.6],
-                # LOW confluence setups (label=0)
-                [1, 0.2,0.2,0.2,0.2,0.2,0.1,1,0.0,0.2,     -1,-0.2,0.4,0.2,0.2,0.4,-0.1,-1,0.1,0.2,0.0],
-                [-1,0.3,0.4,0.2,0.4,0.2,-0.1,-1,0.3,0.4,   1, 0.2,0.2,0.4,0.2,0.2, 0.1, 1,-0.1,0.2,0.0],
-                [0, 0.0,0.2,0.2,0.2,0.2,0.0, 0,0.0,0.2,    0, 0.0,0.2,0.2,0.2,0.2, 0.0, 0,0.0,0.2,0.4],
-                [1,-0.2,0.4,0.4,0.4,0.6,0.0, 1,0.2,0.4,    -1,0.3,0.2,0.4,0.4,0.2, 0.0,-1,0.3,0.4,0.0],
-            ]
-            y_train = [1, 1, 1, 1, 1, 0, 0, 0, 0]
-
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_train)
-            x_input  = scaler.transform([combined])
-
-            clf = LogisticRegression(max_iter=500, random_state=42)
-            clf.fit(X_scaled, y_train)
-
-            prob = clf.predict_proba(x_input)[0][1]  # probability of high-confluence
-            raw_score = round(prob * 100, 1)
-
-            # Apply HTF hard filter
-            htf_trend = htf_data.get('trend', 'NEUTRAL')
-            etf_trend = etf_data.get('trend', 'NEUTRAL')
-            htf_filter_applied = False
-            if htf_trend != 'NEUTRAL' and etf_trend != 'NEUTRAL' and htf_trend != etf_trend:
-                raw_score = min(raw_score, 40)
-                htf_filter_applied = True
-
-            return {
-                'score':              raw_score,
-                'method':             'ML_LOGISTIC_REGRESSION',
-                'htf_filter_applied': htf_filter_applied,
-                'features_htf':       htf_features,
-                'features_etf':       etf_features,
-            }
-        except Exception as e:
-            pass  # fall through to rule-based
-
-    # Rule-based fallback scoring
-    return rule_based_score(htf_data, etf_data, session_score)
-
-
-def rule_based_score(htf_data, etf_data, session_score):
-    """Deterministic rule-based confluence scoring when ML unavailable."""
-    score = 0
-    breakdown = {}
-
-    htf_trend = htf_data.get('trend', 'NEUTRAL')
-    etf_trend = etf_data.get('trend', 'NEUTRAL')
-
-    # Structure alignment
-    if htf_trend != 'NEUTRAL' and htf_trend == etf_trend:
-        score += 20; breakdown['structure'] = 20
-    else:
-        breakdown['structure'] = 0
-
-    # Liquidity target
-    liq = etf_data.get('liquidity', {})
-    if (liq.get('bsl') and etf_trend == 'BULLISH') or (liq.get('ssl') and etf_trend == 'BEARISH'):
-        score += 15; breakdown['liquidity'] = 15
-    else:
-        breakdown['liquidity'] = 0
-
-    # CHoCH on ETF confirming HTF
-    choch_events = [e for e in etf_data.get('bos_choch', []) if 'CHoCH' in e['type']]
-    if choch_events:
-        last_choch = choch_events[-1]
-        if ('BULL' in last_choch['type'] and htf_trend == 'BULLISH') or \
-           ('BEAR' in last_choch['type'] and htf_trend == 'BEARISH'):
-            score += 15; breakdown['choch_confirmation'] = 15
-        else:
-            breakdown['choch_confirmation'] = 0
-    else:
-        breakdown['choch_confirmation'] = 0
-
-    # Fresh OB
-    if etf_data.get('ob_fresh'):
-        score += 10; breakdown['order_block'] = 10
-    else:
-        breakdown['order_block'] = 0
-
-    # Fresh FVG
-    if etf_data.get('fvg_fresh'):
-        score += 10; breakdown['fvg'] = 10
-    else:
-        breakdown['fvg'] = 0
-
-    # S/D overlap (check if OB price range overlaps with FVG)
-    obs = etf_data.get('ob_fresh', [])
-    fvgs = etf_data.get('fvg_fresh', [])
-    overlap = False
-    for ob in obs:
-        for fvg in fvgs:
-            if ob['low'] <= fvg['top'] and ob['high'] >= fvg['bottom']:
-                overlap = True
-                break
-    if overlap:
-        score += 10; breakdown['sd_overlap'] = 10
-    else:
-        breakdown['sd_overlap'] = 0
-
-    # Premium/Discount alignment
-    pd = etf_data.get('premium_discount', {})
-    pd_status = pd.get('status', '')
-    if (etf_trend == 'BULLISH' and 'DISCOUNT' in pd_status) or \
-       (etf_trend == 'BEARISH' and 'PREMIUM' in pd_status):
-        score += 10; breakdown['pd_alignment'] = 10
-    else:
-        breakdown['pd_alignment'] = 0
-
-    # Price action (approximate via recent candle structure)
-    breakdown['pa_confirmation'] = 0  # requires live candle — noted for Gemini
-    breakdown['session'] = session_score
-
-    score += session_score
-
-    htf_filter_applied = False
-    if htf_trend != 'NEUTRAL' and etf_trend != 'NEUTRAL' and htf_trend != etf_trend:
-        score = min(score, 40)
-        htf_filter_applied = True
-
-    return {
-        'score':              round(score, 1),
-        'method':             'RULE_BASED',
-        'breakdown':          breakdown,
-        'htf_filter_applied': htf_filter_applied,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — BACKTESTING ENGINE
-# Runs historical confluence scoring over all candles
-# Returns win rate, expectancy, and best timeframe/session combos
+# SECTION 6 — BACKTESTING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs):
-    """
-    Lightweight vectorised backtest over historical candles.
-    For each BOS event, checks if a trade in that direction would have hit
-    TP (1.5x ATR) before SL (1x ATR). Records outcome.
-    Returns win rate, expectancy, and trade log.
-    """
-    if len(candles) < 50:
-        return {'status': 'INSUFFICIENT DATA', 'trades': 0}
-
-    trades   = []
-    tp_ratio = 1.5  # TP = 1.5x ATR
-    sl_ratio = 1.0  # SL = 1.0x ATR
-
-    bos_only = [e for e in bos_events if 'BOS' in e['type']]
-
+    if len(candles)<50: return {'status':'INSUFFICIENT DATA','trades':0}
+    trades=[]; tp_ratio=1.5; sl_ratio=1.0
+    bos_only=[e for e in bos_events if 'BOS' in e['type']]
     for event in bos_only:
-        idx       = event['index']
-        direction = 'LONG' if 'BULL' in event['type'] else 'SHORT'
-        entry     = candles[idx]['close']
-        atr_at    = calc_atr(candles[:idx + 1]) if idx >= 14 else atr
-
-        if atr_at == 0:
-            continue
-
-        tp_price = entry + atr_at * tp_ratio if direction == 'LONG' else entry - atr_at * tp_ratio
-        sl_price = entry - atr_at * sl_ratio if direction == 'LONG' else entry + atr_at * sl_ratio
-
-        outcome    = 'OPEN'
-        exit_price = None
-        bars_held  = 0
-
-        for j in range(idx + 1, min(idx + 50, len(candles))):
-            c = candles[j]
-            bars_held += 1
-            if direction == 'LONG':
-                if c['low'] <= sl_price:
-                    outcome = 'LOSS'; exit_price = sl_price; break
-                if c['high'] >= tp_price:
-                    outcome = 'WIN';  exit_price = tp_price; break
+        idx=event['index']; direction='LONG' if 'BULL' in event['type'] else 'SHORT'
+        entry=candles[idx]['close']; atr_at=calc_atr(candles[:idx+1]) if idx>=14 else atr
+        if atr_at==0: continue
+        tp=entry+atr_at*tp_ratio if direction=='LONG' else entry-atr_at*tp_ratio
+        sl=entry-atr_at*sl_ratio if direction=='LONG' else entry+atr_at*sl_ratio
+        outcome='OPEN'; exit_price=None; bars=0
+        for j in range(idx+1,min(idx+50,len(candles))):
+            c=candles[j]; bars+=1
+            if direction=='LONG':
+                if c['low']<=sl:   outcome='LOSS'; exit_price=sl; break
+                if c['high']>=tp:  outcome='WIN';  exit_price=tp; break
             else:
-                if c['high'] >= sl_price:
-                    outcome = 'LOSS'; exit_price = sl_price; break
-                if c['low'] <= tp_price:
-                    outcome = 'WIN';  exit_price = tp_price; break
+                if c['high']>=sl:  outcome='LOSS'; exit_price=sl; break
+                if c['low']<=tp:   outcome='WIN';  exit_price=tp; break
+        if outcome!='OPEN':
+            pnl=(exit_price-entry) if direction=='LONG' else (entry-exit_price)
+            trades.append({'direction':direction,'entry':round(entry,6),'exit':round(exit_price,6),'outcome':outcome,'pnl_atr':round(pnl/atr_at,3),'bars':bars,'date':candles[idx].get('date',str(candles[idx]['epoch']))})
+    if not trades: return {'status':'NO TRADES FOUND','trades':0}
+    wins=[t for t in trades if t['outcome']=='WIN']; losses=[t for t in trades if t['outcome']=='LOSS']
+    wr=round(len(wins)/len(trades)*100,1)
+    aw=round(sum(t['pnl_atr'] for t in wins)/len(wins),3) if wins else 0
+    al=round(sum(t['pnl_atr'] for t in losses)/len(losses),3) if losses else 0
+    exp=round((wr/100*aw)+((1-wr/100)*al),3)
+    pf=round(abs(sum(t['pnl_atr'] for t in wins))/abs(sum(t['pnl_atr'] for t in losses)),3) if losses and wins else 0
+    return {
+        'status':'COMPLETE','trades':len(trades),'wins':len(wins),'losses':len(losses),
+        'win_rate_pct':wr,'win_rate_adjusted_pct':round(wr*0.80,1),
+        'avg_win_atr':aw,'avg_loss_atr':al,'expectancy_atr':exp,'profit_factor':pf,
+        'recent_trades':trades[-5:],
+        'verdict':'EDGE CONFIRMED' if exp>0.2 and wr>=45 else 'MARGINAL EDGE' if exp>0 else 'NO EDGE DETECTED',
+        'backtest_note':'Entry at BOS candle close. Real slippage not modelled. Adjusted win rate applies 20% haircut.',
+    }
 
-        if outcome != 'OPEN':
-            pnl = (exit_price - entry) if direction == 'LONG' else (entry - exit_price)
-            trades.append({
-                'direction': direction,
-                'entry':     round(entry, 6),
-                'exit':      round(exit_price, 6),
-                'outcome':   outcome,
-                'pnl_atr':   round(pnl / atr_at, 3),
-                'bars':      bars_held,
-                'date':      candles[idx].get('date', str(candles[idx]['epoch']))
-            })
 
-    if not trades:
-        return {'status': 'NO TRADES FOUND', 'trades': 0}
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ML SCORING WITH RSI PENALTY
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    wins       = [t for t in trades if t['outcome'] == 'WIN']
-    losses     = [t for t in trades if t['outcome'] == 'LOSS']
-    win_rate   = round(len(wins) / len(trades) * 100, 1)
-    avg_win    = round(sum(t['pnl_atr'] for t in wins)   / len(wins),   3) if wins   else 0
-    avg_loss   = round(sum(t['pnl_atr'] for t in losses) / len(losses), 3) if losses else 0
-    expectancy = round((win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss), 3)
-    profit_factor = round(abs(sum(t['pnl_atr'] for t in wins)) /
-                          abs(sum(t['pnl_atr'] for t in losses)), 3) if losses and wins else 0
+def build_feature_vector(tf_data, indicators):
+    trend_enc={'BULLISH':1,'BEARISH':-1,'NEUTRAL':0}
+    features=[]
+    features.append(trend_enc.get(tf_data.get('trend','NEUTRAL'),0))
+    pd=tf_data.get('premium_discount',{}); pct=pd.get('percentage')
+    features.append((pct/50.0-1.0) if pct is not None else 0.0)
+    features.append(min(len(tf_data.get('ob_fresh',[])),5)/5.0)
+    features.append(min(len(tf_data.get('fvg_fresh',[])),5)/5.0)
+    liq=tf_data.get('liquidity',{})
+    features.append(min(len(liq.get('bsl',[])),5)/5.0)
+    features.append(min(len(liq.get('ssl',[])),5)/5.0)
+    rsi_val=indicators.get('rsi',{}).get('value')
+    features.append((rsi_val/50.0-1.0) if rsi_val is not None else 0.0)
+    macd_dir=indicators.get('macd',{}).get('direction','NEUTRAL')
+    features.append(trend_enc.get(macd_dir,0))
+    bb_pos=indicators.get('bollinger',{}).get('position')
+    features.append((bb_pos/50.0-1.0) if bb_pos is not None else 0.0)
+    bos_count=sum(1 for e in tf_data.get('bos_choch',[]) if 'BOS' in e['type'])
+    features.append(min(bos_count,5)/5.0)
+    return features
+
+
+def ml_signal_score(htf_data, etf_data, indicators_by_tf, session_score, asset=''):
+    real_outcomes = get_real_outcomes(asset) if asset else []
+
+    if HAS_SKLEARN and HAS_NUMPY:
+        try:
+            htf_features=build_feature_vector(htf_data,indicators_by_tf.get('htf',{}))
+            etf_features=build_feature_vector(etf_data,indicators_by_tf.get('etf',{}))
+            combined=htf_features+etf_features+[session_score/5.0]
+
+            if len(real_outcomes) >= 20:
+                # Train on REAL outcomes from database
+                X_real=[]; y_real=[]
+                for row in real_outcomes:
+                    score_norm = row[0]/100.0 if row[0] else 0.5
+                    rsi_norm   = (row[3]/50.0-1.0) if row[3] else 0.0
+                    trend_enc2 = {'BULLISH':1,'BEARISH':-1,'NEUTRAL':0}
+                    trend_feat = trend_enc2.get(row[4],'NEUTRAL') if len(row)>4 else 0
+                    feature_row = [score_norm, rsi_norm, trend_feat] + [0.5]*18
+                    X_real.append(feature_row)
+                    y_real.append(1 if row[1]=='WIN' else 0)
+                X_train = X_real
+                y_train = y_real
+                training_source = f'REAL_DATA ({len(real_outcomes)} trades)'
+            else:
+                # Synthetic fallback
+                X_train=[
+                    [-1,-0.5,0.8,0.6,0.2,0.8,-0.3,-1,0.8,0.8,-1,-0.5,0.6,0.8,0.2,0.8,-0.4,-1,0.7,0.6,1.0],
+                    [-1,-0.6,0.6,0.8,0.0,1.0,-0.5,-1,0.9,0.6,-1,-0.4,0.8,0.6,0.0,0.8,-0.5,-1,0.8,0.8,0.6],
+                    [1,-0.4,0.8,0.4,0.4,0.4,-0.2,1,-0.5,0.6,1,-0.5,0.6,0.6,0.2,0.4,-0.3,1,-0.6,0.6,1.0],
+                    [1,0.5,0.8,0.6,0.8,0.2,0.3,1,-0.8,0.8,1,0.4,0.6,0.8,0.8,0.2,0.4,1,-0.7,0.6,1.0],
+                    [1,0.6,0.6,0.8,0.6,0.0,0.5,1,-0.9,0.6,1,0.5,0.8,0.6,0.8,0.0,0.5,1,-0.8,0.8,0.6],
+                    [1,0.2,0.2,0.2,0.2,0.2,0.1,1,0.0,0.2,-1,-0.2,0.4,0.2,0.2,0.4,-0.1,-1,0.1,0.2,0.0],
+                    [-1,0.3,0.4,0.2,0.4,0.2,-0.1,-1,0.3,0.4,1,0.2,0.2,0.4,0.2,0.2,0.1,1,-0.1,0.2,0.0],
+                    [0,0.0,0.2,0.2,0.2,0.2,0.0,0,0.0,0.2,0,0.0,0.2,0.2,0.2,0.2,0.0,0,0.0,0.2,0.4],
+                    [1,-0.2,0.4,0.4,0.4,0.6,0.0,1,0.2,0.4,-1,0.3,0.2,0.4,0.4,0.2,0.0,-1,0.3,0.4,0.0],
+                ]
+                y_train=[1,1,1,1,1,0,0,0,0]
+                training_source='SYNTHETIC (accumulate real trades for real ML)'
+
+            scaler=StandardScaler(); X_scaled=scaler.fit_transform(X_train)
+            x_input=scaler.transform([combined])
+            clf=LogisticRegression(max_iter=500,random_state=42)
+            clf.fit(X_scaled,y_train)
+            prob=clf.predict_proba(x_input)[0][1]
+            raw_score=round(prob*100,1)
+
+            htf_trend=htf_data.get('trend','NEUTRAL'); etf_trend=etf_data.get('trend','NEUTRAL')
+            htf_filter=False
+            if htf_trend!='NEUTRAL' and etf_trend!='NEUTRAL' and htf_trend!=etf_trend:
+                raw_score=min(raw_score,40); htf_filter=True
+
+            htf_rsi=indicators_by_tf.get('htf',{}).get('rsi',{}).get('value')
+            rsi_penalty=0; rsi_reason=None
+            if htf_rsi is not None:
+                if htf_rsi<30 and etf_trend=='BEARISH':
+                    rsi_penalty=10; rsi_reason=f'HTF RSI oversold ({htf_rsi}) — penalised for shorting exhausted move'
+                elif htf_rsi>70 and etf_trend=='BULLISH':
+                    rsi_penalty=10; rsi_reason=f'HTF RSI overbought ({htf_rsi}) — penalised for buying exhausted move'
+            raw_score=max(0,raw_score-rsi_penalty)
+
+            stat_edge=calc_statistical_edge(real_outcomes) if real_outcomes else {'status':'NO_REAL_DATA'}
+            monte_carlo=run_monte_carlo(real_outcomes) if len(real_outcomes)>=30 else {'status':'Need 30+ real outcomes'}
+
+            return {
+                'score':raw_score,'method':'ML_LOGISTIC_REGRESSION','training_source':training_source,
+                'htf_filter_applied':htf_filter,'rsi_penalty':rsi_penalty,'rsi_penalty_reason':rsi_reason,
+                'statistical_edge':stat_edge,'monte_carlo':monte_carlo,
+                'features_htf':htf_features,'features_etf':etf_features,
+            }
+        except Exception:
+            pass
+
+    return rule_based_score(htf_data, etf_data, indicators_by_tf, session_score)
+
+
+def rule_based_score(htf_data, etf_data, indicators_by_tf, session_score):
+    score=0; breakdown={}
+    htf_trend=htf_data.get('trend','NEUTRAL'); etf_trend=etf_data.get('trend','NEUTRAL')
+    weights=get_asset_weights('')
+
+    if htf_trend!='NEUTRAL' and htf_trend==etf_trend:
+        score+=weights['structure']; breakdown['structure']=weights['structure']
+    else: breakdown['structure']=0
+
+    liq=etf_data.get('liquidity',{})
+    if (liq.get('bsl') and etf_trend=='BULLISH') or (liq.get('ssl') and etf_trend=='BEARISH'):
+        score+=weights['liquidity']; breakdown['liquidity']=weights['liquidity']
+    else: breakdown['liquidity']=0
+
+    choch_events=[e for e in etf_data.get('bos_choch',[]) if 'CHoCH' in e['type']]
+    if choch_events:
+        lc=choch_events[-1]
+        if ('BULL' in lc['type'] and htf_trend=='BULLISH') or ('BEAR' in lc['type'] and htf_trend=='BEARISH'):
+            score+=weights['choch']; breakdown['choch']=weights['choch']
+        else: breakdown['choch']=0
+    else: breakdown['choch']=0
+
+    if etf_data.get('ob_fresh'): score+=weights['ob']; breakdown['ob']=weights['ob']
+    else: breakdown['ob']=0
+
+    if etf_data.get('fvg_fresh'): score+=weights['fvg']; breakdown['fvg']=weights['fvg']
+    else: breakdown['fvg']=0
+
+    obs=etf_data.get('ob_fresh',[]); fvgs=etf_data.get('fvg_fresh',[])
+    overlap=any(ob['low']<=fvg['top'] and ob['high']>=fvg['bottom'] for ob in obs for fvg in fvgs)
+    if overlap: score+=weights['sd']; breakdown['sd']=weights['sd']
+    else: breakdown['sd']=0
+
+    pd=etf_data.get('premium_discount',{}); pd_status=pd.get('status','')
+    if (etf_trend=='BULLISH' and 'DISCOUNT' in pd_status) or (etf_trend=='BEARISH' and 'PREMIUM' in pd_status):
+        score+=weights['pd']; breakdown['pd']=weights['pd']
+    else: breakdown['pd']=0
+
+    breakdown['pa']=0; breakdown['session']=session_score; score+=session_score
+
+    htf_filter=False
+    if htf_trend!='NEUTRAL' and etf_trend!='NEUTRAL' and htf_trend!=etf_trend:
+        score=min(score,40); htf_filter=True
+
+    htf_rsi=indicators_by_tf.get('htf',{}).get('rsi',{}).get('value') if indicators_by_tf else None
+    rsi_penalty=0; rsi_reason=None
+    if htf_rsi is not None:
+        if htf_rsi<30 and etf_trend=='BEARISH':
+            rsi_penalty=10; rsi_reason=f'HTF RSI oversold ({htf_rsi}) — penalised for shorting exhausted move'
+        elif htf_rsi>70 and etf_trend=='BULLISH':
+            rsi_penalty=10; rsi_reason=f'HTF RSI overbought ({htf_rsi}) — penalised for buying exhausted move'
+    final_score=max(0,round(score-rsi_penalty,1)); breakdown['rsi_penalty']=-rsi_penalty
 
     return {
-        'status':         'COMPLETE',
-        'trades':         len(trades),
-        'wins':           len(wins),
-        'losses':         len(losses),
-        'win_rate_pct':   win_rate,
-        'avg_win_atr':    avg_win,
-        'avg_loss_atr':   avg_loss,
-        'expectancy_atr': expectancy,
-        'profit_factor':  profit_factor,
-        'recent_trades':  trades[-5:],
-        'verdict':        'EDGE CONFIRMED' if expectancy > 0.2 and win_rate >= 45 else
-                          'MARGINAL EDGE'  if expectancy > 0   else 'NO EDGE DETECTED',
+        'score':final_score,'method':'RULE_BASED','breakdown':breakdown,
+        'htf_filter_applied':htf_filter,'rsi_penalty':rsi_penalty,'rsi_penalty_reason':rsi_reason,
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — MAIN ENGINE ORCHESTRATOR
+# SECTION 8 — MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_engine(candles_by_tf):
-    result   = {}
-    tf_order = ['D1', '4H', '1H', '15M', '5M']
-    avail_tfs = [tf for tf in tf_order if tf in candles_by_tf and len(candles_by_tf[tf]) > 20]
+def run_engine(candles_by_tf, asset=''):
+    result={}
+    tf_order=['D1','4H','1H','15M','5M']
+    avail=[tf for tf in tf_order if tf in candles_by_tf and len(candles_by_tf[tf])>20]
+    if not avail: return {'error':'No valid timeframes provided'}
 
-    if not avail_tfs:
-        return {'error': 'No valid timeframes provided'}
+    htf=avail[0]; etf=avail[-1]; indicators_by_tf={'htf':{},'etf':{}}
 
-    htf = avail_tfs[0]
-    etf = avail_tfs[-1]
-    indicators_by_tf = {'htf': {}, 'etf': {}}
+    for tf in avail:
+        candles=candles_by_tf[tf]
+        atr=calc_atr(candles)
+        sh,sl=detect_swings(candles)
+        bos,trend=detect_bos_choch(candles,sh,sl)
+        fvgs=detect_fvg(candles,atr)
+        obs=detect_order_blocks(candles,bos,atr)
+        liq=detect_liquidity(candles,sh,sl,atr)
+        pd=calc_premium_discount(candles,sh,sl)
+        regime=classify_market_regime(candles,atr)
+        vol_profile=calc_volume_profile(candles)
+        ema20=calc_ema(candles,20); ema50=calc_ema(candles,50); ema200=calc_ema(candles,200)
+        rsi=calc_rsi(candles); bb=calc_bollinger(candles); macd=calc_macd(candles); vwap=calc_vwap(candles)
+        adx=calc_adx(candles)
 
-    for tf in avail_tfs:
-        candles = candles_by_tf[tf]
+        ema_trend='NEUTRAL'
+        if ema20['value'] and ema50['value'] and ema200['value']:
+            if ema20['value']>ema50['value']>ema200['value']: ema_trend='STRONG_BULLISH'
+            elif ema20['value']<ema50['value']<ema200['value']: ema_trend='STRONG_BEARISH'
+            elif ema20['value']>ema50['value']: ema_trend='BULLISH'
+            elif ema20['value']<ema50['value']: ema_trend='BEARISH'
 
-        # Core SMC calculations
-        atr              = calc_atr(candles)
-        swing_highs, swing_lows = detect_swings(candles)
-        bos_events, trend       = detect_bos_choch(candles, swing_highs, swing_lows)
-        fvgs             = detect_fvg(candles, atr)
-        obs              = detect_order_blocks(candles, bos_events, atr)
-        liquidity        = detect_liquidity(candles, swing_highs, swing_lows, atr)
-        pd_analysis      = calc_premium_discount(candles, swing_highs, swing_lows)
+        indicators={'ema_20':ema20,'ema_50':ema50,'ema_200':ema200,'rsi':rsi,'bollinger':bb,'macd':macd,'vwap':vwap,'adx':adx}
 
-        # TA indicators
-        ema_20  = calc_ema(candles, 20)
-        ema_50  = calc_ema(candles, 50)
-        ema_200 = calc_ema(candles, 200)
-        rsi     = calc_rsi(candles)
-        bb      = calc_bollinger(candles)
-        macd    = calc_macd(candles)
-        vwap    = calc_vwap(candles)
+        backtest=None
+        if tf==htf: backtest=run_backtest(candles,atr,sh,sl,bos,fvgs,obs)
+        if tf==htf: indicators_by_tf['htf']={**indicators,'rsi':rsi,'macd':macd,'bollinger':bb}
+        if tf==etf: indicators_by_tf['etf']={**indicators,'rsi':rsi,'macd':macd,'bollinger':bb}
 
-        indicators = {
-            'ema_20':     ema_20,
-            'ema_50':     ema_50,
-            'ema_200':    ema_200,
-            'rsi':        rsi,
-            'bollinger':  bb,
-            'macd':       macd,
-            'vwap':       vwap,
+        result[tf]={
+            'atr':atr,'trend':trend,'ema_trend':ema_trend,'current_price':candles[-1]['close'],
+            'swing_highs':sh[-5:],'swing_lows':sl[-5:],'bos_choch':bos[-8:],
+            'fvg_fresh':[f for f in fvgs if f['status']=='FRESH'][-5:],
+            'fvg_mitigated':[f for f in fvgs if f['status']=='MITIGATED'][-3:],
+            'ob_fresh':[o for o in obs if o['status']=='FRESH'][-5:],
+            'ob_mitigated':[o for o in obs if o['status']=='MITIGATED'][-3:],
+            'liquidity':liq,'premium_discount':pd,'indicators':indicators,
+            'regime':regime,'volume_profile':vol_profile,'backtest':backtest,
         }
 
-        # EMA trend alignment
-        ema_trend = 'NEUTRAL'
-        if ema_20['value'] and ema_50['value'] and ema_200['value']:
-            if ema_20['value'] > ema_50['value'] > ema_200['value']:
-                ema_trend = 'STRONG_BULLISH'
-            elif ema_20['value'] < ema_50['value'] < ema_200['value']:
-                ema_trend = 'STRONG_BEARISH'
-            elif ema_20['value'] > ema_50['value']:
-                ema_trend = 'BULLISH'
-            elif ema_20['value'] < ema_50['value']:
-                ema_trend = 'BEARISH'
+    etf_candles=candles_by_tf[etf]
+    session=calc_session(etf_candles[-1]['epoch']) if etf_candles else {'session':'UNKNOWN','score':0}
+    calendar=fetch_economic_calendar(asset)
+    ml_score=ml_signal_score(result.get(htf,{}),result.get(etf,{}),indicators_by_tf,session.get('score',0),asset)
 
-        # Backtest (only on HTF to avoid performance hit)
-        backtest = None
-        if tf == htf:
-            backtest = run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs)
-
-        # Store indicators for ML use
-        if tf == htf: indicators_by_tf['htf'] = {**indicators, 'rsi': rsi, 'macd': macd, 'bollinger': bb}
-        if tf == etf: indicators_by_tf['etf'] = {**indicators, 'rsi': rsi, 'macd': macd, 'bollinger': bb}
-
-        result[tf] = {
-            'atr':            atr,
-            'trend':          trend,
-            'ema_trend':      ema_trend,
-            'current_price':  candles[-1]['close'],
-            'swing_highs':    swing_highs[-5:],
-            'swing_lows':     swing_lows[-5:],
-            'bos_choch':      bos_events[-8:],
-            'fvg_fresh':      [f for f in fvgs if f['status'] == 'FRESH'][-5:],
-            'fvg_mitigated':  [f for f in fvgs if f['status'] == 'MITIGATED'][-3:],
-            'ob_fresh':       [o for o in obs if o['status'] == 'FRESH'][-5:],
-            'ob_mitigated':   [o for o in obs if o['status'] == 'MITIGATED'][-3:],
-            'liquidity':      liquidity,
-            'premium_discount': pd_analysis,
-            'indicators':     indicators,
-            'backtest':       backtest,
-        }
-
-    # Session
-    etf_candles = candles_by_tf[etf]
-    session = calc_session(etf_candles[-1]['epoch']) if etf_candles else {'session': 'UNKNOWN', 'score': 0}
-
-    # ML confluence score
-    htf_data = result.get(htf, {})
-    etf_data = result.get(etf, {})
-    ml_score = ml_signal_score(htf_data, etf_data, indicators_by_tf, session.get('score', 0))
-
-    # Library status report
-    libs_available = {
-        'numpy':   HAS_NUMPY,
-        'talib':   HAS_TALIB,
-        'pandas':  HAS_PANDAS,
-        'sklearn': HAS_SKLEARN,
+    result['_summary']={
+        'htf':htf,'etf':etf,
+        'htf_trend':result.get(htf,{}).get('trend','NEUTRAL'),
+        'htf_ema_trend':result.get(htf,{}).get('ema_trend','NEUTRAL'),
+        'session':session,'asset_price':etf_candles[-1]['close'] if etf_candles else 0,
+        'ml_score':ml_score,'calendar':calendar,
+        'libs_available':{'numpy':HAS_NUMPY,'talib':HAS_TALIB,'pandas':HAS_PANDAS,'sklearn':HAS_SKLEARN},
     }
-
-    result['_summary'] = {
-        'htf':              htf,
-        'etf':              etf,
-        'htf_trend':        htf_data.get('trend', 'NEUTRAL'),
-        'htf_ema_trend':    htf_data.get('ema_trend', 'NEUTRAL'),
-        'session':          session,
-        'asset_price':      etf_candles[-1]['close'] if etf_candles else 0,
-        'ml_score':         ml_score,
-        'libs_available':   libs_available,
-    }
-
     return result
 
 
@@ -853,13 +1629,54 @@ def main():
     try:
         raw  = sys.stdin.read()
         data = json.loads(raw)
-        result = run_engine(data.get('candles', {}))
-        print(json.dumps(result))
+
+        operation = data.get('operation', 'analyze')
+
+        if operation == 'analyze':
+            result = run_engine(data.get('candles', {}), data.get('asset', ''))
+            print(json.dumps(result))
+
+        elif operation == 'check_outcomes':
+            asset = data.get('asset', None)
+            result = check_and_update_outcomes(asset)
+            print(json.dumps(result))
+
+        elif operation == 'get_dashboard':
+            asset = data.get('asset', None)
+            limit = data.get('limit', 50)
+            result = get_signal_dashboard(asset, limit)
+            print(json.dumps(result))
+
+        elif operation == 'save_signal':
+            sig = data.get('signal', {})
+            signal_id = save_signal(
+                asset      = sig.get('asset', ''),
+                mode       = sig.get('mode', ''),
+                direction  = sig.get('direction', ''),
+                entry_low  = sig.get('entry_low'),
+                entry_high = sig.get('entry_high'),
+                tp1        = sig.get('tp1'),
+                tp2        = sig.get('tp2'),
+                tp3        = sig.get('tp3'),
+                sl         = sig.get('sl'),
+                score      = sig.get('score'),
+                htf_trend  = sig.get('htf_trend', ''),
+                etf_trend  = sig.get('etf_trend', ''),
+                rsi_htf    = sig.get('rsi_htf'),
+                atr        = sig.get('atr'),
+                regime     = sig.get('regime', ''),
+                session    = sig.get('session', ''),
+            )
+            print(json.dumps({'signal_id': signal_id, 'status': 'saved' if signal_id else 'failed'}))
+
+        else:
+            print(json.dumps({'error': f'Unknown operation: {operation}'}))
+
         sys.exit(0)
+
     except Exception as e:
         print(json.dumps({'error': str(e)}))
         sys.exit(1)
-
 
 if __name__ == '__main__':
     main()
