@@ -147,9 +147,9 @@ def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl
 
 def fetch_current_price_deriv(asset):
     """
-    Fetch the current live price for an asset from Deriv WebSocket.
-    Uses HTTP fallback since we cannot use asyncio WebSocket from sync Python.
-    Falls back to Deriv REST-like tick endpoint.
+    Fetch current price AND recent candle data for outcome verification.
+    Returns dict with current_price and recent_candles (last 12 x 5min candles).
+    This allows the outcome checker to see if TP/SL was hit between checker runs.
     """
     DERIV_SYMBOLS = {
         'XAUUSD': 'frxXAUUSD', 'XAGUSD': 'frxXAGUSD',
@@ -165,15 +165,35 @@ def fetch_current_price_deriv(asset):
     if not symbol:
         return None
 
-    # Use Deriv's ticks_history with count=1 via their REST-compatible endpoint
-    url = f'https://api.deriv.com/websockets/v3?ticks={symbol}&subscribe=0&app_id=1089'
-    # Fallback: use the candles endpoint to get latest close
-    candles_url = (
-        f'https://api.deriv.com/websockets/v3?'
-        f'ticks_history={symbol}&end=latest&count=1&style=candles&granularity=60&app_id=1089'
-    )
+    # Fetch last 12 x 5-min candles (covers 60 minutes of price history)
+    # This lets us check if TP/SL was touched since the signal was created
+    try:
+        req = Request(
+            f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
+            f'&end=latest&count=12&style=candles&granularity=300&app_id=1089',
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            candles = data.get('candles', [])
+            if candles:
+                recent_candles = [
+                    {
+                        'epoch': c['epoch'],
+                        'high':  float(c['high']),
+                        'low':   float(c['low']),
+                        'close': float(c['close']),
+                    }
+                    for c in candles
+                ]
+                return {
+                    'current_price':  float(candles[-1]['close']),
+                    'recent_candles': recent_candles,
+                }
+    except Exception:
+        pass
 
-    # Try direct tick price first
+    # Fallback: just get current tick price
     try:
         req = Request(
             f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
@@ -184,22 +204,10 @@ def fetch_current_price_deriv(asset):
             data = json.loads(resp.read().decode())
             prices = data.get('history', {}).get('prices', [])
             if prices:
-                return float(prices[-1])
-    except Exception:
-        pass
-
-    # Try candle close
-    try:
-        req = Request(
-            f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
-            f'&end=latest&count=1&style=candles&granularity=300&app_id=1089',
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            candles = data.get('candles', [])
-            if candles:
-                return float(candles[-1]['close'])
+                return {
+                    'current_price':  float(prices[-1]),
+                    'recent_candles': [],
+                }
     except Exception:
         pass
 
@@ -210,21 +218,22 @@ def check_and_update_outcomes(asset=None):
     """
     Core outcome verification loop.
 
+    FIXED: Now checks if price HIT TP/SL at any point in the recent candles,
+    not just where current price is right now. This prevents missed WINs/LOSSes
+    when price touched the level then bounced back before the checker ran.
+
     For every signal older than 1 hour with no outcome:
-    - Fetch current price from Deriv
-    - Check if price has hit TP1 or SL
-    - Mark WIN, LOSS, or OPEN
+    - Fetch last 12 x 5-min candles from Deriv (covers ~60 minutes)
+    - Check if ANY candle's high/low crossed TP1 or SL since signal creation
+    - Mark WIN, LOSS, or EXPIRED (after 48h)
     - Update the database
     - Recalculate asset weights if enough data
-
-    Returns a summary of what was checked and updated.
     """
     try:
         init_db()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
 
-        # Get all signals without outcomes, older than 1 hour
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
 
         if asset:
@@ -256,72 +265,100 @@ def check_and_update_outcomes(asset=None):
                 'details': []
             }
 
-        updated  = 0
-        details  = []
+        updated           = 0
+        details           = []
         assets_to_retrain = set()
 
         for row in pending:
             sig_id, sig_asset, direction, entry_low, entry_high, \
             tp1, sl, atr, timestamp, score = row
 
-            current_price = fetch_current_price_deriv(sig_asset)
+            price_data = fetch_current_price_deriv(sig_asset)
 
-            if current_price is None:
+            if price_data is None:
                 details.append({
                     'id':     sig_id,
                     'asset':  sig_asset,
                     'status': 'PRICE_FETCH_FAILED',
-                    'note':   'Could not fetch current price from Deriv'
+                    'note':   'Could not fetch price from Deriv'
                 })
                 continue
 
-            entry_mid = (entry_low + entry_high) / 2 if entry_low and entry_high else entry_low
+            current_price   = price_data['current_price']
+            recent_candles  = price_data.get('recent_candles', [])
+            entry_mid       = (entry_low + entry_high) / 2 if entry_low and entry_high else (entry_low or 0)
 
-            outcome   = None
+            outcome    = None
             exit_price = None
-            pnl_atr   = None
-            note      = None
+            pnl_atr    = None
+            note       = None
 
-            if direction == 'Bearish' or direction == 'BEARISH' or direction == 'SHORT':
-                # Short trade: TP is below entry, SL is above entry
-                if tp1 and current_price <= tp1:
-                    outcome    = 'WIN'
-                    exit_price = tp1
-                    pnl_atr    = round((entry_mid - tp1) / atr, 3) if atr else None
-                    note       = f'TP1 hit at {tp1}. Price now {current_price}.'
-                elif sl and current_price >= sl:
-                    outcome    = 'LOSS'
-                    exit_price = sl
-                    pnl_atr    = round((entry_mid - sl) / atr, 3) if atr else None
-                    note       = f'SL hit at {sl}. Price now {current_price}.'
-                else:
-                    # Check if signal is older than 48 hours — mark as EXPIRED
-                    sig_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    if (datetime.now(timezone.utc) - sig_time).total_seconds() > 48 * 3600:
-                        outcome    = 'EXPIRED'
-                        exit_price = current_price
-                        pnl_atr    = round((entry_mid - current_price) / atr, 3) if atr else None
-                        note       = f'Signal expired after 48h. Price now {current_price}.'
+            # Parse signal creation time
+            try:
+                sig_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except Exception:
+                sig_time = datetime.now(timezone.utc) - timedelta(hours=2)
 
-            elif direction == 'Bullish' or direction == 'BULLISH' or direction == 'LONG':
-                # Long trade: TP is above entry, SL is below entry
-                if tp1 and current_price >= tp1:
-                    outcome    = 'WIN'
-                    exit_price = tp1
-                    pnl_atr    = round((tp1 - entry_mid) / atr, 3) if atr else None
-                    note       = f'TP1 hit at {tp1}. Price now {current_price}.'
-                elif sl and current_price <= sl:
-                    outcome    = 'LOSS'
-                    exit_price = sl
-                    pnl_atr    = round((sl - entry_mid) / atr, 3) if atr else None
-                    note       = f'SL hit at {sl}. Price now {current_price}.'
-                else:
-                    sig_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    if (datetime.now(timezone.utc) - sig_time).total_seconds() > 48 * 3600:
-                        outcome    = 'EXPIRED'
-                        exit_price = current_price
-                        pnl_atr    = round((current_price - entry_mid) / atr, 3) if atr else None
-                        note       = f'Signal expired after 48h. Price now {current_price}.'
+            is_bearish = direction in ('Bearish', 'BEARISH', 'SHORT')
+            is_bullish = direction in ('Bullish', 'BULLISH', 'LONG')
+
+            # Filter candles to only those AFTER the signal was created
+            relevant_candles = [
+                c for c in recent_candles
+                if datetime.fromtimestamp(c['epoch'], tz=timezone.utc) > sig_time
+            ]
+            # Also add current price as a synthetic candle
+            relevant_candles.append({
+                'high':  current_price,
+                'low':   current_price,
+                'close': current_price,
+                'epoch': int(datetime.now(timezone.utc).timestamp()),
+            })
+
+            if is_bearish:
+                # Short: TP is below entry, SL is above entry
+                for candle in relevant_candles:
+                    if tp1 and candle['low'] <= tp1:
+                        outcome    = 'WIN'
+                        exit_price = tp1
+                        pnl_atr    = round((entry_mid - tp1) / atr, 3) if atr else None
+                        note       = f'TP1 touched at {tp1} (candle low={candle["low"]}). Current: {current_price}'
+                        break
+                    if sl and candle['high'] >= sl:
+                        outcome    = 'LOSS'
+                        exit_price = sl
+                        pnl_atr    = round((entry_mid - sl) / atr, 3) if atr else None
+                        note       = f'SL touched at {sl} (candle high={candle["high"]}). Current: {current_price}'
+                        break
+
+            elif is_bullish:
+                # Long: TP is above entry, SL is below entry
+                for candle in relevant_candles:
+                    if tp1 and candle['high'] >= tp1:
+                        outcome    = 'WIN'
+                        exit_price = tp1
+                        pnl_atr    = round((tp1 - entry_mid) / atr, 3) if atr else None
+                        note       = f'TP1 touched at {tp1} (candle high={candle["high"]}). Current: {current_price}'
+                        break
+                    if sl and candle['low'] <= sl:
+                        outcome    = 'LOSS'
+                        exit_price = sl
+                        pnl_atr    = round((sl - entry_mid) / atr, 3) if atr else None
+                        note       = f'SL touched at {sl} (candle low={candle["low"]}). Current: {current_price}'
+                        break
+
+            # If still open after 48 hours, expire it
+            if outcome is None:
+                hours_open = (datetime.now(timezone.utc) - sig_time).total_seconds() / 3600
+                if hours_open > 48:
+                    outcome    = 'EXPIRED'
+                    exit_price = current_price
+                    pnl_atr    = round(
+                        (entry_mid - current_price) / atr if is_bearish else
+                        (current_price - entry_mid) / atr,
+                        3
+                    ) if atr else None
+                    note = f'Signal expired after {round(hours_open,1)}h. Exit at current price {current_price}.'
 
             if outcome:
                 conn2 = sqlite3.connect(DB_PATH)
@@ -345,16 +382,16 @@ def check_and_update_outcomes(asset=None):
                 'id':            sig_id,
                 'asset':         sig_asset,
                 'direction':     direction,
-                'entry':         entry_mid,
+                'entry':         round(entry_mid, 6),
                 'tp1':           tp1,
                 'sl':            sl,
                 'current_price': current_price,
+                'candles_checked': len(relevant_candles),
                 'outcome':       outcome or 'STILL OPEN',
                 'pnl_atr':       pnl_atr,
-                'note':          note or f'Still open. Price {current_price} between SL {sl} and TP1 {tp1}.'
+                'note':          note or f'Still open after {len(relevant_candles)} candles checked. Price {current_price}.'
             })
 
-        # Retrain adaptive weights for assets with new outcomes
         for retrain_asset in assets_to_retrain:
             update_adaptive_weights(retrain_asset)
 
@@ -369,7 +406,7 @@ def check_and_update_outcomes(asset=None):
         return {
             'checked': 0,
             'updated': 0,
-            'message': f'Error during outcome check: {str(e)}',
+            'message': f'Error: {str(e)}',
             'details': []
         }
 
@@ -1339,10 +1376,26 @@ def calc_premium_discount(candles, swing_highs, swing_lows):
     if rng<=0: return {'status':'INSUFFICIENT DATA','percentage':None}
     pct=round(max(0.0,min(100.0,(last_close-range_low)/rng*100)),2)
     status='DEEP PREMIUM' if pct>=75 else 'PREMIUM' if pct>=50 else 'DISCOUNT' if pct>=25 else 'DEEP DISCOUNT'
-    note=('PRICE BELOW SWING RANGE — strong bearish extension' if below_range else
-          'PRICE ABOVE SWING RANGE — strong bullish extension' if above_range else
-          'PRICE WITHIN SWING RANGE')
-    return {'status':status,'percentage':pct,'range_high':round(range_high,6),'range_low':round(range_low,6),'equilibrium':round(range_low+rng*0.5,6),'current':round(last_close,6),'below_range':below_range,'above_range':above_range,'note':note}
+    if below_range:
+        note = 'BREAKDOWN — Price below entire swing range. Not a discount buy. Bearish continuation territory.'
+        status = 'BREAKDOWN'
+    elif above_range:
+        note = 'BREAKOUT — Price above entire swing range. Not a premium short. Bullish continuation territory.'
+        status = 'BREAKOUT'
+    else:
+        note = 'PRICE WITHIN SWING RANGE'
+
+    return {
+        'status':      status,
+        'percentage':  pct,
+        'range_high':  round(range_high, 6),
+        'range_low':   round(range_low,  6),
+        'equilibrium': round(range_low + rng * 0.5, 6),
+        'current':     round(last_close, 6),
+        'below_range': below_range,
+        'above_range': above_range,
+        'note':        note,
+    }
 
 
 def calc_session(latest_epoch):
