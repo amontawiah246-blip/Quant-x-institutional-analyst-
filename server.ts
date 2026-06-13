@@ -206,7 +206,7 @@ function formatNewsBlock(newsData:Awaited<ReturnType<typeof fetchRSSNews>>, asse
 //   Step 3: If both OpenRouter models fail → skip reasoning, continue without it
 //
 // ANALYSIS LAYER (produces the full institutional analysis):
-//   Step 1: Gemini 2.5 Flash (primary) — up to 3 retries with backoff
+//   Step 1: Gemini 1.5 Flash (primary) — up to 3 retries with backoff
 //   Step 2: If Gemini fails → GPT-4o via old GITHUB_TOKEN (Azure)
 //   Step 3: If GPT-4o fails → GPT-4.1 mini with reasoning via GITHUB_TOKEN2 (new account)
 //   Step 4: If all AI fails → Rule-based summary from Python engine data
@@ -219,11 +219,14 @@ async function fetchOpenRouterReasoning(
 ): Promise<string> {
   if(!process.env.OPENROUTER_API_KEY) return '';
 
-  const summary  = engineData?._summary || {};
+  // Handle both full engine data and early context (when called in parallel before engine finishes)
+  const isEarlyContext = engineData?.htfTrend === 'CALCULATING';
+  const summary  = isEarlyContext ? {} : (engineData?._summary || {});
   const etfKey   = summary.etf || '5M';
   const htfKey   = summary.htf || '4H';
-  const etfData  = engineData?.[etfKey] || {};
-  const htfData  = engineData?.[htfKey] || {};
+  const etfData  = isEarlyContext ? {} : (engineData?.[etfKey] || {});
+  const htfData  = isEarlyContext ? {} : (engineData?.[htfKey] || {});
+  const htfTrend = isEarlyContext ? 'CALCULATING' : (summary.htf_trend || 'N/A');
 
   const last10     = etfCandles.slice(-10);
   const priceNow   = last10[last10.length-1]?.close || 0;
@@ -241,7 +244,7 @@ ASSET: ${asset} | PRICE NOW: ${priceNow}
 LAST 10 CANDLES (${etfKey}): ${moveDir} ${pctChange}% | from ${price10ago} to ${priceNow}
 RANGE: High=${recentHigh} Low=${recentLow}
 ${isSpike?`⚡ SIGNIFICANT SPIKE DETECTED: ${Math.abs(parseFloat(pctChange))}% in last 10 candles`:''}
-HTF TREND: ${summary.htf_trend||'N/A'} | ETF TREND: ${etfData.trend||'N/A'}
+HTF TREND: ${htfTrend} | ETF TREND: ${isEarlyContext ? 'CALCULATING' : (etfData.trend||'N/A')}
 REGIME: ${etfData.regime?.regime||'N/A'} | RSI: ${htfData.indicators?.rsi?.value||'N/A'} [${htfData.indicators?.rsi?.zone||'N/A'}]
 RECENT STRUCTURE: ${etfData.bos_choch?.slice(-4).map((e:any)=>`${e.type}@${e.price} ${e.date}`).join(' | ')||'N/A'}
 BREAKING NEWS: ${newsBlock.split('\n').filter(l=>l.includes('[')&&l.includes('min ago')).slice(0,3).join(' | ')||'None'}
@@ -328,6 +331,32 @@ function formatEngineResults(engineData:any): string {
       block+=`MONTE CARLO: P(profit)=${mc.prob_positive_pct}% P(ruin)=${mc.prob_ruin_pct}% Median:${mc.median_equity_atr}ATR\n`;
     }
   }
+  if(s.cross_asset?.status==='OK'&&s.cross_asset.correlations?.length){
+    const ca=s.cross_asset;
+    block+=`\nCROSS-ASSET INTELLIGENCE: ${ca.asset} | Macro Bias: ${ca.macro_bias}\n`;
+    ca.correlations.filter((c:any)=>c.direction!=='UNAVAILABLE').forEach((c:any)=>{
+      block+=`  ${c.role}(${c.symbol}): ${c.direction} ${c.pct_change}% [${c.strength}]\n`;
+    });
+  }
+  if(s.win_probability){
+    const wp=s.win_probability;
+    block+=`\nPROBABILITY ENGINE (${wp.mode}):\n`;
+    block+=`  Win:${wp.win_pct}% | TP1:${wp.tp1_pct}% | TP2:${wp.tp2_pct}% | TP3:${wp.tp3_pct}% | SL:${wp.sl_pct}%\n`;
+    block+=`  Confidence: ${wp.confidence}${wp.sample_size>0?' (n='+wp.sample_size+')':''}\n`;
+  }
+  if(s.trade_expectancy){
+    const te=s.trade_expectancy;
+    block+=`\nTRADE EXPECTANCY ENGINE:\n`;
+    block+=`  EV=${te.expected_value_r}R | ${te.verdict}\n`;
+    block+=`  ${te.interpretation}\n`;
+    block+=`  Kelly Full:${te.kelly_full_pct}% | Kelly Half:${te.kelly_half_pct}% (use half-Kelly for safety)\n`;
+  }
+  if(s.wyckoff_htf?.phase&&s.wyckoff_htf.phase!=='INSUFFICIENT DATA'){
+    block+=`\nWYCKOFF CROSS-TF:\n`;
+    block+=`  HTF: ${s.wyckoff_htf.phase} (${s.wyckoff_htf.trade_bias}, ${s.wyckoff_htf.confidence}% conf)\n`;
+    block+=`  ETF: ${s.wyckoff_etf?.phase||'N/A'} (${s.wyckoff_etf?.trade_bias||'N/A'})\n`;
+    block+=`  Aligned: ${s.wyckoff_aligned?'YES — both TFs agree':'NO — conflicting phases'}\n`;
+  }
   if(s.calendar){
     const cal=s.calendar;
     if(cal.hard_pause) block+=`\n⛔ CALENDAR HARD PAUSE: ${cal.pause_reason}\n`;
@@ -371,6 +400,13 @@ function formatEngineResults(engineData:any): string {
     if(d.backtest?.status==='COMPLETE'){
       const bt=d.backtest;
       block+=`BACKTEST: WR=${bt.win_rate_pct}%(adj:${bt.win_rate_adjusted_pct}%) PF=${bt.profit_factor} Exp=${bt.expectancy_atr}ATR | ${bt.verdict}\n`;
+    }
+    if(d.wyckoff && d.wyckoff.phase !== 'INSUFFICIENT DATA'){
+      const w=d.wyckoff;
+      block+=`WYCKOFF: ${w.phase} | Bias:${w.trade_bias} | Confidence:${w.confidence}% | Range:${w.range_low}-${w.range_high}\n`;
+      block+=`  ${w.phase_detail}\n`;
+      block+=`  Next: ${w.next_move}\n`;
+      if(w.events?.length) w.events.forEach((e:any)=>block+=`  ${e.type}@${e.price} ${e.date} — ${e.note||''}\n`);
     }
     block+='\n';
   }
@@ -442,6 +478,90 @@ LIQUIDITY: Only HIGH quality sweeps (strength>1.5ATR, displacement>1ATR) = insti
 CALENDAR HARD PAUSE: Show PRE-EVENT SETUP BRIEF — levels and scenarios, never all N/A.
 
 ═══════════════════════════════════════════════════════
+CROSS-ASSET INTELLIGENCE
+═══════════════════════════════════════════════════════
+
+The engine fetches correlated assets from Deriv to give macro context.
+This is critical — especially for Gold. Use these rules:
+
+FOR XAUUSD (Gold):
+- USD proxy (USDJPY) UP = USD strengthening = BEARISH PRESSURE on Gold
+- USD proxy (USDJPY) DOWN = USD weakening = BULLISH SUPPORT for Gold
+- Risk proxy (AUDUSD) DOWN = risk-off environment = safe-haven BULLISH bid for Gold
+- Risk proxy (AUDUSD) UP = risk-on = less safe-haven demand = mild BEARISH for Gold
+- When USD strong AND risk-on: STRONGLY BEARISH for Gold
+- When USD weak AND risk-off: STRONGLY BULLISH for Gold
+- Macro bias conflicts with technical bias: note the conflict explicitly — reduce position size
+
+FOR BTCUSD/ETHUSD (Crypto):
+- AUDUSD UP = risk-on = BULLISH for crypto
+- AUDUSD DOWN = risk-off = BEARISH for crypto
+
+In the MACRO CONTEXT section: always reference the cross-asset data.
+State: "DXY is [strengthening/weakening] and risk sentiment is [on/off] — this [supports/contradicts] the technical bias."
+
+═══════════════════════════════════════════════════════
+PROBABILITY ENGINE
+═══════════════════════════════════════════════════════
+
+The engine provides win probabilities for this specific setup.
+ALWAYS include these in your analysis. Replace vague "high confidence" with actual numbers.
+
+Format for MARKET SUMMARY:
+  Win Probability: [win_pct]% | TP1:[tp1_pct]% | TP2:[tp2_pct]% | SL:[sl_pct]%
+
+If mode=REAL_DATA: this is based on actual historical outcomes — cite sample size.
+If mode=THEORETICAL: this is model-based — note it will improve as real trades accumulate.
+
+PROBABILITY RULES FOR EXECUTION PLAN:
+- Win probability < 45%: REJECT regardless of confluence score
+- Win probability 45-55%: only take if EV is strongly positive
+- Win probability > 60%: good setup, proceed if confluence ≥ 70
+- Win probability > 70%: strong setup
+
+═══════════════════════════════════════════════════════
+TRADE EXPECTANCY ENGINE
+═══════════════════════════════════════════════════════
+
+The engine calculates Expected Value per trade in R multiples.
+EV = (Win% × Avg Reward) - (Loss% × 1R)
+
+ALWAYS include EV in the execution plan:
+- EV < 0: NEGATIVE EV — DO NOT TRADE even if confluence is high
+- EV 0.0-0.3: MARGINAL — consider skipping
+- EV 0.3-0.8: GOOD EDGE — proceed
+- EV > 0.8: STRONG EDGE — high confidence execution
+- EV > 1.5: EXCEPTIONAL — full position size
+
+Kelly Fraction tells you optimal position size as % of account:
+- Full Kelly: theoretical optimum (too aggressive for real trading)
+- Half Kelly: recommended for real trading
+- Example: Half-Kelly 8% of $10,000 account = $800 risk on this trade
+Note: Never use more than 2% risk per trade regardless of Kelly output.
+
+WYCKOFF ENGINE INTERPRETATION:
+The engine now provides Wyckoff phase detection for HTF and ETF. Use it as follows:
+
+ACCUMULATION: Smart money absorbing supply at support. Expect markup. Look for Spring (wick below support + recovery). Bullish bias. Entry: longs on Spring confirmation or range breakout above resistance.
+DISTRIBUTION: Smart money distributing at resistance. Expect markdown. Look for Upthrust (wick above resistance + rejection). Bearish bias. Entry: shorts on Upthrust confirmation or range breakdown below support.
+REACCUMULATION: Mid-uptrend pause. Smart money reloading longs. Bullish continuation expected. Entry: longs on range breakout to upside.
+REDISTRIBUTION: Mid-downtrend bounce. Smart money reloading shorts. Bearish continuation expected. Entry: shorts on range breakdown to downside.
+CAUSE BUILDING: Range with no clear bias yet. Wait for Spring or Upthrust before committing.
+
+Wyckoff + SMC alignment rules:
+- Accumulation Spring = SMC SSL sweep → STRONG LONG signal when both agree
+- Distribution Upthrust = SMC BSL sweep → STRONG SHORT signal when both agree
+- Wyckoff phase contradicts HTF trend = regime transition forming — reduce size
+- wyckoff_aligned=YES means HTF and ETF Wyckoff phases agree = add 10pts to confluence
+
+POSITION SIZING:
+The engine calculates exact lot sizes. You MUST include these in the execution plan.
+Default assumptions: $10,000 account, 1% risk per trade (= $100 risk maximum).
+The lot_size in the engine output is calculated to risk exactly 1% of account on this trade.
+ALWAYS show the position size in the execution plan. This is non-negotiable for real trading.
+If the SL is less than 1x ATR, flag it as "TIGHT STOP — risk of noise stop-out."
+
+═══════════════════════════════════════════════════════
 LEVEL TAP DETECTION
 ═══════════════════════════════════════════════════════
 Before "wait for tap": check if level is already MITIGATED in engine results.
@@ -452,19 +572,23 @@ FVG: mitigated once price closes inside it.
 ═══════════════════════════════════════════════════════
 CONFLUENCE SCORING
 ═══════════════════════════════════════════════════════
-  Structure alignment: [0 or 20]
-  Liquidity target: [0 or 15]
+  Structure alignment (HTF BOS = trade direction): [0 or 20]
+  Liquidity target present and logical: [0 or 15]
   HTF confirmed on ETF CHoCH: [0 or 15]
-  Fresh OB at entry: [0 or 10]
-  Fresh FVG at entry: [0 or 10]
-  S/D overlaps OB: [0 or 10]
-  P/D alignment: [0 or 10]
-  PA confirmation: [0 or 5]
-  Session: [0 or 5]
-  SUBTOTAL: [sum]
+  Fresh OB at entry zone: [0 or 10]
+  Fresh FVG at entry zone: [0 or 10]
+  S/D zone overlaps OB: [0 or 10]
+  P/D alignment (discount for long, premium for short): [0 or 10]
+  Wyckoff phase alignment (both TFs agree AND matches trade direction): [0 or 10]
+  PA confirmation candle: [0 or 5]
+  Session score: [0 or 5]
+  SUBTOTAL: [sum of above — max 110, normalised to 100]
   HTF Hard Filter (≠trade direction → cap 40): [YES/NO]
   RSI Penalty (<30 short or >70 long → -10): [0 or -10] [reason]
-  FINAL SCORE: [n]/100
+  FINAL SCORE: [min(100, subtotal) after filter and penalty]/100
+
+NOTE: Wyckoff adds 10pts when both HTF and ETF Wyckoff phases agree with trade direction.
+This means a perfect A+ setup now requires Wyckoff alignment on top of everything else.
 Grade: A+=90-100 | A=80-89 | B=70-79 | C=60-69 | REJECT<60
 
 ═══════════════════════════════════════════════════════
@@ -528,15 +652,25 @@ If spike just happened: lead with it. Never ignore recent price action.]
 - **Regime Compatibility:** [Yes/No — explain]
 - **Level Status:** [FRESH/TAPPED-reacting/TAPPED-n touches/MITIGATED]
 - **Wait Condition:** [Specific. Never "wait for tap" on MITIGATED level.]
-- **Entry Zone:** [Exact prices]
-- **Invalidation:** [Exact price]
-- **Target 1 (TP1):** [Nearest liquidity — never N/A]
-- **Target 2 (TP2):** [Second level or entry ± 2x ATR — never N/A]
-- **Target 3 (TP3):** [Third level or entry ± 3x ATR — never N/A]
-- **Estimated R:R:** [ratio]
+- **Entry Zone:** [Exact prices from engine]
+- **Invalidation:** [Exact price from engine]
+- **Target 1 (TP1):** [Price] — R:R [ratio] — Reward $[usd from risk plan]
+- **Target 2 (TP2):** [Price] — R:R [ratio] — never N/A
+- **Target 3 (TP3):** [Price] — R:R [ratio] — never N/A
+- **Position Size:** [lot_size] lots (risks $[risk_amount_usd] = [risk_pct]% of $10,000 account)
+- **Break-Even:** Move SL to entry after TP1 hit at [break_even_price]
+- **SL Warning:** [TIGHT STOP — less than 1x ATR, high noise risk / NORMAL STOP / WIDE STOP — consider scaling in]
+- **Wyckoff Context:** [Phase name] — [phase_detail summary in one sentence]
+- **Win Probability:** [win_pct]% | TP1:[tp1_pct]% TP2:[tp2_pct]% SL:[sl_pct]% | [confidence note]
+- **Expected Value:** [ev]R per trade | [verdict]
+- **Cross-Asset Macro:** [macro_bias from engine — how DXY/risk sentiment affects this asset right now]
+- **Kelly Recommendation:** Half-Kelly = [kelly_half_pct]% of account | Max recommended: 2% risk
 - **Calendar Warning:** [HARD PAUSE/UPCOMING Xmin/CLEAR]
 - **Backtest Note:** [raw%/adj%. verdict. note.]
 - **Statistical Confidence:** [Real data or ACCUMULATING]
+
+If score<60 OR HTF hard filter triggered OR win_probability<45% OR expected_value<0:
+# ⛔ NO TRADE SETUP FOUND
 
 INTEGRITY: Every price from engine/data. Never invented. Never cite stale news as current.
 Address all spikes. Both scenarios always. MITIGATED = never entry target. Temp 0.1.
@@ -612,29 +746,39 @@ async function startServer() {
         } else { rawBlock+=`\n${tf.label}: FETCH FAILED\n`; }
       }
 
-      // 2 & 3. Python engine and RSS news (Parallelized for speed)
-      const [enginePromise, newsPromise] = await Promise.allSettled([
+      // 2, 3, 4 — Engine + News + OpenRouter ALL run in parallel
+      // OpenRouter only needs candles (already available), not the engine output
+      // This saves 3-5 seconds by not waiting for engine before starting reasoning
+      const etfLabel      = timeframes[timeframes.length-1]?.label;
+      const etfCandles    = candlesByTF[etfLabel] || [];
+
+      // Build a minimal early context for OpenRouter — candles only, no engine needed
+      const earlyContext = {
+        asset,
+        etfCandles,
+        htfTrend: 'CALCULATING', // engine not done yet — OpenRouter works from candles directly
+      };
+
+      const [engineResult, newsResult, reasoningResult] = await Promise.allSettled([
         runPythonEngine(candlesByTF, asset),
-        fetchRSSNews(asset)
+        fetchRSSNews(asset),
+        fetchOpenRouterReasoning(asset, earlyContext, etfCandles, ''),
       ]);
-      const engineData = enginePromise.status === 'fulfilled' ? enginePromise.value : {error:'Engine failed'};
-      const newsData = newsPromise.status === 'fulfilled' ? newsPromise.value : {items:[], hasHighImpact:false, highImpactEvents:[], freshCount:0, staleCount:0};
 
-      const engineBlock = formatEngineResults(engineData);
-      const newsBlock = formatNewsBlock(newsData as any, asset);
-      const hasHighImpact = (newsData as any).hasHighImpact || false;
+      const engineData = engineResult.status === 'fulfilled' ? engineResult.value : {error:'Engine failed'};
+      const newsData   = newsResult.status  === 'fulfilled' ? newsResult.value  : {items:[], hasHighImpact:false, highImpactEvents:[], freshCount:0, staleCount:0};
+      const openRouterReasoning = reasoningResult.status === 'fulfilled' ? reasoningResult.value : '';
 
-      // 4. Calendar
+      const engineBlock    = formatEngineResults(engineData);
+      const newsBlock      = formatNewsBlock(newsData as any, asset);
+      const hasHighImpact  = (newsData as any).hasHighImpact || false;
+      const reasoningBlock = openRouterReasoning
+        ? `\n# QUANT REASONING CONTEXT (Qwen-2.5)\n${openRouterReasoning}\n`
+        : '';
+
+      // 5. Calendar (from engine result)
       const calHardPause   = engineData?._summary?.calendar?.hard_pause || false;
       const calPauseReason = engineData?._summary?.calendar?.pause_reason || '';
-
-      // 5. OpenRouter reasoning (DeepSeek-R1 → Qwen fallback)
-      const etfLabel   = timeframes[timeframes.length-1]?.label;
-      const etfCandles = candlesByTF[etfLabel] || [];
-      const openRouterReasoning = await fetchOpenRouterReasoning(asset, engineData, etfCandles, newsBlock);
-      const reasoningBlock = openRouterReasoning
-        ? `\n# QUANT REASONING CONTEXT (DeepSeek-R1)\n${openRouterReasoning}\n`
-        : '';
 
       // 6. Build prompt
       const calWarning = calHardPause
@@ -661,7 +805,7 @@ async function startServer() {
       let responseText = ''; let aiUsed = 'none';
 
       // ── ANALYSIS LAYER ────────────────────────────────────────────────────
-      // Step 1: Gemini 2.5 Flash (3 retries with exponential backoff)
+      // Step 1: Gemini 1.5 Flash (3 retries with exponential backoff)
       const ai = new GoogleGenAI({apiKey:process.env.GEMINI_API_KEY});
       try {
         let response:any; let attempt=0;
@@ -669,8 +813,11 @@ async function startServer() {
         while(attempt<3){
           try {
             response=await ai.models.generateContent({
-              model:'gemini-2.5-flash', contents:promptParts,
-              config:{systemInstruction:buildSystemPrompt(asset,mode), temperature:0.1}
+              model:'gemini-1.5-flash', contents:promptParts,
+              config:{
+                systemInstruction: buildSystemPrompt(asset,mode),
+                temperature: 0.1,
+              }
             });
             break;
           } catch(e1:any){
@@ -773,7 +920,7 @@ async function startServer() {
 
   app.listen(PORT,'0.0.0.0',()=>{
     console.log(`QUANT-X on http://localhost:${PORT}`);
-    console.log(`AI Chain: Gemini 2.5 Flash → GPT-4o (GITHUB_TOKEN) → GPT-4.1-mini (GITHUB_TOKEN2) → Rule-based`);
+    console.log(`AI Chain: Gemini 1.5 Flash → GPT-4o (GITHUB_TOKEN) → GPT-4.1-mini (GITHUB_TOKEN2) → Rule-based`);
     console.log(`Reasoning: Qwen-72B (OpenRouter free tier - optimized for speed)`);
     console.log(`OpenRouter: ${process.env.OPENROUTER_API_KEY?'✅ CONFIGURED':'❌ NOT SET'}`);
     console.log(`GPT-4o token: ${process.env.GITHUB_TOKEN?'✅ CONFIGURED':'❌ NOT SET'}`);
