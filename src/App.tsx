@@ -19,7 +19,7 @@ export default function App() {
       .catch(err => console.error('Failed to load architecture doc', err));
   }, []);
 
-  const handleAnalyze = async (asset: string, mode: TradingMode, imageBase64?: string) => {
+  const handleAnalyze = async (asset: string, mode: TradingMode, imageBase64?: string, accountSize?: number, riskPct?: number) => {
     setIsLoading(true);
     setResult(null);
     setActiveTab('analysis');
@@ -30,7 +30,7 @@ export default function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ asset, mode, image: imageBase64 }),
+        body: JSON.stringify({ asset, mode, image: imageBase64, accountSize, riskPct }),
       });
 
       if (!response.ok) {

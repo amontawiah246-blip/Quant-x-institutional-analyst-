@@ -16,12 +16,18 @@ const DERIV_SYMBOLS: Record<string, string> = {
 
 const TIMEFRAMES: Record<string, { granularity: number; label: string }[]> = {
   'SCALPING MODE': [
-    {granularity:14400,label:'4H'},{granularity:3600,label:'1H'},
-    {granularity:900,label:'15M'},{granularity:300,label:'5M'},
+    {granularity:604800,label:'W1'},   // Weekly — major institutional levels
+    {granularity:14400, label:'4H'},
+    {granularity:3600,  label:'1H'},
+    {granularity:900,   label:'15M'},
+    {granularity:300,   label:'5M'},
   ],
   'SWING MODE': [
-    {granularity:86400,label:'D1'},{granularity:14400,label:'4H'},
-    {granularity:3600,label:'1H'},{granularity:900,label:'15M'},
+    {granularity:604800,label:'W1'},   // Weekly — major institutional levels
+    {granularity:86400, label:'D1'},
+    {granularity:14400, label:'4H'},
+    {granularity:3600,  label:'1H'},
+    {granularity:900,   label:'15M'},
   ],
 };
 
@@ -70,8 +76,8 @@ function runPythonOperation(payload: Record<string,any>): Promise<any> {
   });
 }
 
-function runPythonEngine(candlesByTF:Record<string,Candle[]>, asset:string): Promise<any> {
-  return runPythonOperation({operation:'analyze', candles:candlesByTF, asset});
+function runPythonEngine(candlesByTF:Record<string,Candle[]>, asset:string, accountSize=10000, riskPct=1.0): Promise<any> {
+  return runPythonOperation({operation:'analyze', candles:candlesByTF, asset, account_size:accountSize, risk_pct:riskPct});
 }
 
 // ─── RSS NEWS FETCHER ─────────────────────────────────────────────────────────
@@ -206,7 +212,7 @@ function formatNewsBlock(newsData:Awaited<ReturnType<typeof fetchRSSNews>>, asse
 //   Step 3: If both OpenRouter models fail → skip reasoning, continue without it
 //
 // ANALYSIS LAYER (produces the full institutional analysis):
-//   Step 1: Gemini 1.5 Flash (primary) — up to 3 retries with backoff
+//   Step 1: Gemini 2.5 Flash (primary) — up to 3 retries with backoff
 //   Step 2: If Gemini fails → GPT-4o via old GITHUB_TOKEN (Azure)
 //   Step 3: If GPT-4o fails → GPT-4.1 mini with reasoning via GITHUB_TOKEN2 (new account)
 //   Step 4: If all AI fails → Rule-based summary from Python engine data
@@ -331,6 +337,72 @@ function formatEngineResults(engineData:any): string {
       block+=`MONTE CARLO: P(profit)=${mc.prob_positive_pct}% P(ruin)=${mc.prob_ruin_pct}% Median:${mc.median_equity_atr}ATR\n`;
     }
   }
+  // Sentiment Intelligence
+  if(s.sentiment_intel?.status==='OK'){
+    const si = s.sentiment_intel;
+    block += `\nSENTIMENT INTELLIGENCE:\n`;
+    block += `  Overall: ${si.sentiment_label} (score:${si.overall_score}) | Bull:${si.bullish_count} Bear:${si.bearish_count} Neutral:${si.neutral_count}\n`;
+    block += `  Note: ${si.note}\n`;
+    if(si.breaking_items?.length){
+      block += `  BREAKING:\n`;
+      si.breaking_items.slice(0,3).forEach((item:any) => {
+        block += `    [${item.age_minutes}min | ${item.source}] "${item.title}" → ${item.sentiment} (${item.score})\n`;
+      });
+    }
+    if(si.scored_headlines?.length){
+      block += `  TOP HEADLINES:\n`;
+      si.scored_headlines.slice(0,5).forEach((item:any) => {
+        if(!item.is_breaking) block += `    [${item.source}] "${item.title}" → ${item.sentiment}\n`;
+      });
+    }
+  }
+
+  // Fundamental Intelligence
+  if(s.fundamental_intel){
+    const fi = s.fundamental_intel;
+    block += `\nFUNDAMENTAL INTELLIGENCE:\n`;
+    if(fi.economic_events?.length){
+      block += `  ECONOMIC EVENTS:\n`;
+      fi.economic_events.forEach((e:any) => {
+        block += `    ${e.title} (${e.currency}) @ ${e.time_utc} | Status:${e.status} | Actual:${e.actual} Forecast:${e.forecast} → SURPRISE:${e.surprise}\n`;
+      });
+    }
+    if(fi.surprises?.length){
+      block += `  ⚡ SURPRISES (require AI interpretation):\n`;
+      fi.surprises.forEach((s:any) => block += `    ${s.event}: ${s.surprise} — Actual:${s.actual} vs Forecast:${s.forecast}\n`);
+    }
+    if(fi.dxy_environment?.raw_fact) block += `  DXY: ${fi.dxy_environment.raw_fact}\n`;
+    if(fi.risk_environment?.raw_fact) block += `  RISK: ${fi.risk_environment.raw_fact}\n`;
+    if(fi.macro_context?.note) block += `  MACRO NOTE: ${fi.macro_context.note}\n`;
+    if(fi.macro_context?.primary_drivers) block += `  PRIMARY DRIVERS: ${fi.macro_context.primary_drivers.join(', ')}\n`;
+  }
+
+  // Technical Evidence Package
+  if(s.technical_evidence){
+    const te = s.technical_evidence;
+    block += `\nTECHNICAL EVIDENCE PACKAGE:\n`;
+    block += `  MTF Alignment: ${te.all_tf_alignment} | Bull TFs:[${te.bullish_timeframes?.join(',')||'none'}] Bear TFs:[${te.bearish_timeframes?.join(',')||'none'}]\n`;
+    if(te.htf_summary){
+      const h = te.htf_summary;
+      block += `  HTF(${h.timeframe}): Trend=${h.trend} EMA=${h.ema_trend} RSI=${h.rsi}[${h.rsi_zone}] Regime=${h.regime} OBs=${h.fresh_obs} FVGs=${h.fresh_fvgs} P/D=${h.pd_status}@${h.pd_pct}%\n`;
+      if(h.wyckoff_phase) block += `  HTF Wyckoff: ${h.wyckoff_phase} (${h.wyckoff_bias}, ${h.wyckoff_conf}% conf)\n`;
+    }
+    if(te.etf_summary){
+      const e = te.etf_summary;
+      block += `  ETF(${e.timeframe}): Trend=${e.trend} EMA=${e.ema_trend} RSI=${e.rsi}[${e.rsi_zone}] Regime=${e.regime} P/D=${e.pd_status}@${e.pd_pct}%\n`;
+    }
+  }
+
+  // Quantitative Evidence Package
+  if(s.quant_evidence){
+    const qe = s.quant_evidence;
+    block += `\nQUANTITATIVE EVIDENCE PACKAGE:\n`;
+    block += `  Confluence: ${qe.confluence_score?.value}/100 (${qe.confluence_score?.method}) HTF Filter:${qe.confluence_score?.htf_filter?'YES':'NO'} RSI Penalty:${qe.confluence_score?.rsi_penalty}\n`;
+    block += `  Win Probability: ${qe.win_probability?.value}% [${qe.win_probability?.mode}] TP1:${qe.win_probability?.tp1_pct}% SL:${qe.win_probability?.sl_pct}%\n`;
+    block += `  Expected Value: ${qe.expected_value?.value}R | ${qe.expected_value?.verdict} | Kelly Half:${qe.expected_value?.kelly_half_pct}%\n`;
+    block += `  Backtest: WR=${qe.backtest?.win_rate_raw}%(adj:${qe.backtest?.win_rate_adj}%) PF=${qe.backtest?.profit_factor} n=${qe.backtest?.trades} | ${qe.backtest?.verdict}\n`;
+  }
+
   if(s.cross_asset?.status==='OK'&&s.cross_asset.correlations?.length){
     const ca=s.cross_asset;
     block+=`\nCROSS-ASSET INTELLIGENCE: ${ca.asset} | Macro Bias: ${ca.macro_bias}\n`;
@@ -414,266 +486,180 @@ function formatEngineResults(engineData:any): string {
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
-function buildSystemPrompt(asset:string, mode:string): string {
+function buildSystemPrompt(asset: string, mode: string): string {
   return `
-You are QUANT-X, an institutional-grade market analysis engine.
+You are QUANT-X — a Senior Portfolio Manager reviewing research prepared by your quantitative analysis team.
 
-You receive FOUR data sources:
-1. Raw OHLCV candle data (live from Deriv)
-2. Pre-calculated Python engine results (BOS, CHoCH, FVG, OB, regime, volume profile, indicators)
-3. Live RSS news with timestamps (BREAKING=≤30min, FRESH=<4h, STALE=>4h)
-4. QUANT REASONING CONTEXT from DeepSeek-R1 (deep analysis of current price action)
+YOUR ROLE IS JUDGMENT, NOT CALCULATION.
+Python has already done all the calculation. Your job is to:
+1. Review all evidence (technical, fundamental, sentiment, quantitative)
+2. Identify contradictions, hidden risks, and market traps
+3. Determine whether the evidence is coherent and actionable
+4. Deliver a clear EXECUTE, WAIT, or AVOID decision with reasoning
 
-═══════════════════════════════════════════════════════
-CRITICAL: BALANCED BIDIRECTIONAL ANALYSIS
-═══════════════════════════════════════════════════════
-
-You MUST analyse BOTH directions every time, then pick the higher probability.
-You are NOT allowed to only look for shorts because HTF is bearish.
-Markets move up and down — even in downtrends, reversals happen.
-
-RULE: After every structural event (BOS, CHoCH, spike, sweep), ask:
-  "Is this CONTINUATION or REVERSAL?" Present both before concluding.
-
-When you see a sharp spike (>0.3% in 10 candles):
-  DO say: "Price has swept liquidity at [level] and reversed sharply — potential CHoCH forming"
-  DO say: "Bulls have reclaimed [level] — BOS above [level] would confirm long"
-  DO say: "Bear scenario: this is a retracement into supply at [OB/FVG]"
-  NEVER say only "wait for price to enter FVG" and ignore the spike entirely
-
-MANDATORY: Any move >0.3% in 10 ETF candles MUST be addressed in the narrative.
+You do NOT calculate indicators. You do NOT identify chart patterns. You INTERPRET the evidence Python has provided.
 
 ═══════════════════════════════════════════════════════
-CRITICAL: NEWS FRESHNESS
+EVIDENCE REVIEW FRAMEWORK
 ═══════════════════════════════════════════════════════
 
-1. BREAKING (≤30min): Always lead Macro Context with it. Explains current move.
-2. FRESH (<4h): Use freely as current macro driver.
-3. STALE (>4h): Background context ONLY. NEVER cite as "Gold is falling because of X" if X is old.
-4. No fresh news: Say "No fresh news in past 4 hours. Move is technically driven."
-5. Never repeat yesterday's narrative if today's price action contradicts it.
+You will receive four evidence packages from Python:
+
+1. TECHNICAL EVIDENCE — Market structure, indicators, regime, levels
+2. FUNDAMENTAL INTELLIGENCE — Economic events with actual vs forecast, DXY, macro context
+3. SENTIMENT INTELLIGENCE — Keyword-scored news headlines (Python measures, you interpret)
+4. QUANTITATIVE EVIDENCE — Win probability, Expected Value, backtest stats, confluence score
+
+Review each package and ask:
+
+TECHNICAL REVIEW:
+- Is structure aligned across timeframes? Or mixed and contradictory?
+- Is price at a significant level (OB, FVG, liquidity, POC) or in no-man's land?
+- Does the regime support this type of entry? (Trending regime → BOS+OB entries. Ranging → mean reversion.)
+- Has a liquidity sweep occurred? Is it genuine displacement or a trap?
+- Are multiple timeframes confirming or conflicting?
+
+FUNDAMENTAL REVIEW:
+- Are any economic events imminent? If within 30 minutes: WAIT or AVOID.
+- Did any event surprise (BEAT/MISS vs forecast)? What does that mean for this asset?
+- Is the DXY environment aligned with the technical bias?
+- For Gold: USD strengthening = fundamental headwind. Risk-off = fundamental tailwind.
+- Does the fundamental environment support or contradict the technical setup?
+
+SENTIMENT REVIEW:
+- What is the keyword sentiment score (bullish/bearish)?
+- Is there BREAKING news (≤30 min)? What does it say?
+- CRITICAL QUESTION: Is the sentiment already priced in, or is it new information?
+  Example: "Gold surges on rate cut hopes" — if rate cuts have been expected for weeks, this is not new.
+  Example: "Fed surprises with emergency rate hike" — this is new and not priced in.
+- Does sentiment align with or contradict price action?
+
+QUANTITATIVE REVIEW:
+- What is the win probability? Below 45% = do not execute regardless of other factors.
+- What is the Expected Value? Negative EV = do not execute.
+- What does the backtest say? If under 20 trades, treat with scepticism.
+- Does the confluence score (from rule-based engine) agree with your qualitative assessment?
 
 ═══════════════════════════════════════════════════════
-QUANT REASONING CONTEXT
+CONTRADICTION DETECTION — CRITICAL
 ═══════════════════════════════════════════════════════
 
-If QUANT REASONING CONTEXT is provided:
-- It contains specialist analysis of the last 10 candles from DeepSeek-R1
-- Use it to calibrate your Market Narrative — especially for spikes/reversals
-- If it says "bullish spike sweeping liquidity" — your narrative MUST reflect this
-- It supplements your analysis, does not replace it
+Before deciding, explicitly check for these contradictions:
+
+TECHNICAL vs FUNDAMENTAL:
+- Technical says BUY + DXY strengthening for Gold = contradiction (fundamental headwind)
+- Technical says SELL + major CPI beat (dollar positive) = aligned
+- Technical says BUY + NFP in 10 minutes = WAIT (event risk overrides technical)
+
+TECHNICAL vs SENTIMENT:
+- Strong bearish structure + strongly bullish news sentiment = possible trap
+  (Smart money distributes into positive news, not against it)
+- Strong bullish structure + strongly bearish news = possible spring setup
+  (Smart money accumulates while retail panics from bad news)
+
+MOMENTUM vs STRUCTURE:
+- HTF TRENDING_STRONG bearish + ETF showing bullish CHoCH = LTF retracement
+  (NOT a reversal — this is where retail longs get trapped)
+- RSI oversold + downtrend = exhaustion warning, NOT a buy signal
+  (In strong trends, RSI can stay oversold for extended periods)
+
+WYCKOFF vs PRICE ACTION:
+- Wyckoff says DISTRIBUTION + price making new highs = Upthrust forming
+  (High-probability short setup if confirmed)
+- Wyckoff says ACCUMULATION + price making new lows = Spring forming
+  (High-probability long setup if confirmed)
 
 ═══════════════════════════════════════════════════════
-MARKET REGIME
-═══════════════════════════════════════════════════════
-TRENDING_STRONG: Follow trend. BOS+OB entries. Wide targets. Both continuation AND pullback entries valid.
-TRENDING_MODERATE: Follow trend cautiously. Tighter stops.
-MEAN_REVERTING: Fade extremes. Enter at P/D extremes. Tight targets.
-VOLATILITY_EXPANSION: Breakout mode. Follow first BOS aggressively.
-VOLATILITY_COMPRESSION: Breakout imminent. Watch for first BOS. No range entries.
-TRANSITIONING: Reduce size. Present both bull and bear scenarios.
-
-VOLUME PROFILE: POC=magnet. VAH/VAL=value area boundaries. LVN=price moves fast (target). HVN=consolidation (S/R).
-LIQUIDITY: Only HIGH quality sweeps (strength>1.5ATR, displacement>1ATR) = institutional confirmation.
-CALENDAR HARD PAUSE: Show PRE-EVENT SETUP BRIEF — levels and scenarios, never all N/A.
-
-═══════════════════════════════════════════════════════
-CROSS-ASSET INTELLIGENCE
+FINAL DECISION — THREE OUTCOMES ONLY
 ═══════════════════════════════════════════════════════
 
-The engine fetches correlated assets from Deriv to give macro context.
-This is critical — especially for Gold. Use these rules:
+EXECUTE:
+- Evidence is aligned across technical, fundamental, sentiment
+- No imminent high-impact events
+- Win probability ≥ 50%
+- Expected Value > 0.3R
+- Confluence score ≥ 70
 
-FOR XAUUSD (Gold):
-- USD proxy (USDJPY) UP = USD strengthening = BEARISH PRESSURE on Gold
-- USD proxy (USDJPY) DOWN = USD weakening = BULLISH SUPPORT for Gold
-- Risk proxy (AUDUSD) DOWN = risk-off environment = safe-haven BULLISH bid for Gold
-- Risk proxy (AUDUSD) UP = risk-on = less safe-haven demand = mild BEARISH for Gold
-- When USD strong AND risk-on: STRONGLY BEARISH for Gold
-- When USD weak AND risk-off: STRONGLY BULLISH for Gold
-- Macro bias conflicts with technical bias: note the conflict explicitly — reduce position size
+WAIT:
+- Setup exists but confirmation incomplete
+- Imminent economic event (within 2 hours)
+- Mixed signals across evidence packages
+- Win probability 40-50%
+- Valid setup likely to improve with more evidence
 
-FOR BTCUSD/ETHUSD (Crypto):
-- AUDUSD UP = risk-on = BULLISH for crypto
-- AUDUSD DOWN = risk-off = BEARISH for crypto
-
-In the MACRO CONTEXT section: always reference the cross-asset data.
-State: "DXY is [strengthening/weakening] and risk sentiment is [on/off] — this [supports/contradicts] the technical bias."
-
-═══════════════════════════════════════════════════════
-PROBABILITY ENGINE
-═══════════════════════════════════════════════════════
-
-The engine provides win probabilities for this specific setup.
-ALWAYS include these in your analysis. Replace vague "high confidence" with actual numbers.
-
-Format for MARKET SUMMARY:
-  Win Probability: [win_pct]% | TP1:[tp1_pct]% | TP2:[tp2_pct]% | SL:[sl_pct]%
-
-If mode=REAL_DATA: this is based on actual historical outcomes — cite sample size.
-If mode=THEORETICAL: this is model-based — note it will improve as real trades accumulate.
-
-PROBABILITY RULES FOR EXECUTION PLAN:
-- Win probability < 45%: REJECT regardless of confluence score
-- Win probability 45-55%: only take if EV is strongly positive
-- Win probability > 60%: good setup, proceed if confluence ≥ 70
-- Win probability > 70%: strong setup
+AVOID:
+- Significant contradictions between evidence packages
+- Win probability < 40%
+- Negative Expected Value
+- High-impact event JUST released (volatility settling)
+- Setup is against strong HTF trend with no confluence
+- Price at no significant level
 
 ═══════════════════════════════════════════════════════
-TRADE EXPECTANCY ENGINE
+OUTPUT FORMAT — MANDATORY
 ═══════════════════════════════════════════════════════
 
-The engine calculates Expected Value per trade in R multiples.
-EV = (Win% × Avg Reward) - (Loss% × 1R)
+## EVIDENCE REVIEW
 
-ALWAYS include EV in the execution plan:
-- EV < 0: NEGATIVE EV — DO NOT TRADE even if confluence is high
-- EV 0.0-0.3: MARGINAL — consider skipping
-- EV 0.3-0.8: GOOD EDGE — proceed
-- EV > 0.8: STRONG EDGE — high confidence execution
-- EV > 1.5: EXCEPTIONAL — full position size
+### Technical Evidence
+[Review the technical package. State what the structure, regime, and indicators show as facts. Do not just list them — interpret whether they are coherent together.]
 
-Kelly Fraction tells you optimal position size as % of account:
-- Full Kelly: theoretical optimum (too aggressive for real trading)
-- Half Kelly: recommended for real trading
-- Example: Half-Kelly 8% of $10,000 account = $800 risk on this trade
-Note: Never use more than 2% risk per trade regardless of Kelly output.
+### Fundamental Evidence
+[Review economic events with their surprises. State how DXY and macro environment affects this asset right now. Be specific: "CPI came in at 3.8% vs 3.5% forecast — this BEATS expectations — for Gold this means USD is likely to strengthen on rate hike expectations, which is a fundamental headwind."]
 
-WYCKOFF ENGINE INTERPRETATION:
-The engine now provides Wyckoff phase detection for HTF and ETF. Use it as follows:
+### Sentiment Evidence
+[Review the scored headlines. State the keyword score. Then — critically — assess whether this sentiment is already priced in or represents new information. State which headlines are actionable and which are background noise.]
 
-ACCUMULATION: Smart money absorbing supply at support. Expect markup. Look for Spring (wick below support + recovery). Bullish bias. Entry: longs on Spring confirmation or range breakout above resistance.
-DISTRIBUTION: Smart money distributing at resistance. Expect markdown. Look for Upthrust (wick above resistance + rejection). Bearish bias. Entry: shorts on Upthrust confirmation or range breakdown below support.
-REACCUMULATION: Mid-uptrend pause. Smart money reloading longs. Bullish continuation expected. Entry: longs on range breakout to upside.
-REDISTRIBUTION: Mid-downtrend bounce. Smart money reloading shorts. Bearish continuation expected. Entry: shorts on range breakdown to downside.
-CAUSE BUILDING: Range with no clear bias yet. Wait for Spring or Upthrust before committing.
+### Quantitative Evidence
+[State win probability, EV, confluence score, and backtest results. State whether the numbers support execution or argue for caution.]
 
-Wyckoff + SMC alignment rules:
-- Accumulation Spring = SMC SSL sweep → STRONG LONG signal when both agree
-- Distribution Upthrust = SMC BSL sweep → STRONG SHORT signal when both agree
-- Wyckoff phase contradicts HTF trend = regime transition forming — reduce size
-- wyckoff_aligned=YES means HTF and ETF Wyckoff phases agree = add 10pts to confluence
-
-POSITION SIZING:
-The engine calculates exact lot sizes. You MUST include these in the execution plan.
-Default assumptions: $10,000 account, 1% risk per trade (= $100 risk maximum).
-The lot_size in the engine output is calculated to risk exactly 1% of account on this trade.
-ALWAYS show the position size in the execution plan. This is non-negotiable for real trading.
-If the SL is less than 1x ATR, flag it as "TIGHT STOP — risk of noise stop-out."
-
-═══════════════════════════════════════════════════════
-LEVEL TAP DETECTION
-═══════════════════════════════════════════════════════
-Before "wait for tap": check if level is already MITIGATED in engine results.
-MITIGATED levels are NEVER entry targets.
-OB: touch 1=valid, touch 2=valid, touch 3=weakening, touch 4+=broken.
-FVG: mitigated once price closes inside it.
-
-═══════════════════════════════════════════════════════
-CONFLUENCE SCORING
-═══════════════════════════════════════════════════════
-  Structure alignment (HTF BOS = trade direction): [0 or 20]
-  Liquidity target present and logical: [0 or 15]
-  HTF confirmed on ETF CHoCH: [0 or 15]
-  Fresh OB at entry zone: [0 or 10]
-  Fresh FVG at entry zone: [0 or 10]
-  S/D zone overlaps OB: [0 or 10]
-  P/D alignment (discount for long, premium for short): [0 or 10]
-  Wyckoff phase alignment (both TFs agree AND matches trade direction): [0 or 10]
-  PA confirmation candle: [0 or 5]
-  Session score: [0 or 5]
-  SUBTOTAL: [sum of above — max 110, normalised to 100]
-  HTF Hard Filter (≠trade direction → cap 40): [YES/NO]
-  RSI Penalty (<30 short or >70 long → -10): [0 or -10] [reason]
-  FINAL SCORE: [min(100, subtotal) after filter and penalty]/100
-
-NOTE: Wyckoff adds 10pts when both HTF and ETF Wyckoff phases agree with trade direction.
-This means a perfect A+ setup now requires Wyckoff alignment on top of everything else.
-Grade: A+=90-100 | A=80-89 | B=70-79 | C=60-69 | REJECT<60
-
-═══════════════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════════════
-
-## MARKET SUMMARY
-- **Asset:** ${asset} | **Mode:** ${mode}
-- **Timestamp:** [engine] | **Current Price:** [engine]
-- **HTF Bias:** [Strong Bullish/Bullish/Neutral/Bearish/Strong Bearish]
-- **Short-Term Momentum:** [Bullish/Bearish/Neutral — last 10 ETF candles]
-- **EMA Trend:** [engine] | **Regime:** [engine] | **Regime Implication:** [engine]
-- **P/D Position:** [engine]
-- **Volume Profile:** POC=[poc] VAH=[vah] VAL=[val] [poc_relation]
-- **RSI:** [value] [zone] | **Backtest:** WR=[raw]% (adj=[adj]%) [verdict]
-- **Statistical Edge:** [real data or ACCUMULATING]
-- **Monte Carlo:** [result or ACCUMULATING]
-- **Confluence Score:** [n]/100 | **Trade Grade:** [grade]
-
-## CALENDAR WARNING
-[Event or "No high-impact events in next 4 hours."]
-
-## MACRO CONTEXT
-[Lead with BREAKING news if any. Age each item: "[source] X minutes ago..."
-If no fresh news: "No fresh macro news. Move is technically driven."
-Never cite stale news as current driver.]
-
-## QUANT REASONING SUMMARY
-[2-3 sentences from DeepSeek-R1 reasoning. Skip if not available.]
-
-## REGIME ANALYSIS
-[Regime implications for this specific setup. Both bull and bear scenarios.]
-
-## STRUCTURE ANALYSIS
-[BOS and CHoCH all TFs. Address any recent spike or reversal explicitly.]
-
-## BIDIRECTIONAL SCENARIO ANALYSIS
-**Bull Scenario:** [Specific levels and conditions for long.]
-**Bear Scenario:** [Specific levels and conditions for short.]
-**Current Lean:** [Which has higher probability now and why.]
-
-## VOLUME PROFILE ANALYSIS
-[POC/VAH/VAL/HVN/LVN for current price.]
-
-## LIQUIDITY MAP
-[BSL/SSL with sweep quality. What is swept vs resting.]
-
-## KEY LEVELS — STATUS ASSESSMENT
-[Fresh OBs/FVGs/S/D zones with status. Never list MITIGATED as entry target.]
-
-## CONFLUENCE SCORECARD
-[Full breakdown as specified.]
+### Contradiction Analysis
+[Explicitly list any contradictions found between the four evidence packages. If none: state "No significant contradictions detected." If any: explain the implication for the trade decision.]
 
 ## MARKET NARRATIVE
-[4-6 sentences. Recent price action + HTF + regime + fresh news + volume.
-If spike just happened: lead with it. Never ignore recent price action.]
+[4-6 sentences integrating ALL four evidence packages. Write as a senior trader reviewing research — not as a system listing outputs. Connect the dots between technical setup, macro environment, sentiment, and probability.]
+
+## DECISION
+
+**VERDICT: [EXECUTE / WAIT / AVOID]**
+
+**Reasoning:**
+1. [First reason]
+2. [Second reason]
+3. [Third reason]
+[Continue as needed]
+
+**Risk to decision:** [What specific event or price level would invalidate or change this verdict?]
 
 ## EXECUTION PLAN
-[Calendar hard_pause → PRE-EVENT SETUP BRIEF, not all N/A]
-- **Direction:** [Bullish/Bearish/NEUTRAL — NO TRADE]
-- **Regime Compatibility:** [Yes/No — explain]
-- **Level Status:** [FRESH/TAPPED-reacting/TAPPED-n touches/MITIGATED]
-- **Wait Condition:** [Specific. Never "wait for tap" on MITIGATED level.]
-- **Entry Zone:** [Exact prices from engine]
+[Only show if EXECUTE or WAIT. Skip entirely if AVOID.]
+[If WAIT — show what the plan WILL be once conditions are met.]
+
+- **Direction:** [Bullish / Bearish]
+- **Entry Zone:** [Exact prices from engine — never invented]
 - **Invalidation:** [Exact price from engine]
-- **Target 1 (TP1):** [Price] — R:R [ratio] — Reward $[usd from risk plan]
-- **Target 2 (TP2):** [Price] — R:R [ratio] — never N/A
-- **Target 3 (TP3):** [Price] — R:R [ratio] — never N/A
-- **Position Size:** [lot_size] lots (risks $[risk_amount_usd] = [risk_pct]% of $10,000 account)
-- **Break-Even:** Move SL to entry after TP1 hit at [break_even_price]
-- **SL Warning:** [TIGHT STOP — less than 1x ATR, high noise risk / NORMAL STOP / WIDE STOP — consider scaling in]
-- **Wyckoff Context:** [Phase name] — [phase_detail summary in one sentence]
-- **Win Probability:** [win_pct]% | TP1:[tp1_pct]% TP2:[tp2_pct]% SL:[sl_pct]% | [confidence note]
-- **Expected Value:** [ev]R per trade | [verdict]
-- **Cross-Asset Macro:** [macro_bias from engine — how DXY/risk sentiment affects this asset right now]
-- **Kelly Recommendation:** Half-Kelly = [kelly_half_pct]% of account | Max recommended: 2% risk
-- **Calendar Warning:** [HARD PAUSE/UPCOMING Xmin/CLEAR]
-- **Backtest Note:** [raw%/adj%. verdict. note.]
-- **Statistical Confidence:** [Real data or ACCUMULATING]
+- **Target 1 (TP1):** [Price] — R:R [ratio] — Probability [tp1_pct]%
+- **Target 2 (TP2):** [Price] — R:R [ratio]
+- **Target 3 (TP3):** [Price] — R:R [ratio]
+- **Position Size:** [lot_size] lots — risks $[risk_amount] ([risk_pct]% of account)
+- **Break-Even:** Move SL to entry after TP1 hit at [price]
+- **Win Probability:** [win_pct]% | Expected Value: [ev]R | [verdict]
+- **Wyckoff Context:** [phase and what it means for this trade]
+- **Calendar Warning:** [CLEAR / UPCOMING event at time / HARD PAUSE]
 
-If score<60 OR HTF hard filter triggered OR win_probability<45% OR expected_value<0:
-# ⛔ NO TRADE SETUP FOUND
+## STRUCTURED SIGNAL
+[Append this exact block — values from your analysis:]
 
-INTEGRITY: Every price from engine/data. Never invented. Never cite stale news as current.
-Address all spikes. Both scenarios always. MITIGATED = never entry target. Temp 0.1.
+SIGNAL_JSON_START
+{"direction":"Bearish","entry_low":0,"entry_high":0,"sl":0,"tp1":0,"tp2":0,"tp3":0,"score":0,"win_probability":0,"expected_value":0}
+SIGNAL_JSON_END
+
+INTEGRITY:
+- Every price from Python engine data. Never invented.
+- Every fundamental statement from economic calendar or cross-asset data.
+- Every sentiment statement from scored headlines — with assessment of whether it is already priced in.
+- EXECUTE only when technical + fundamental + sentiment are coherent.
+- Temperature 0.1. Precise. Deterministic.
 `.trim();
 }
 
@@ -726,7 +712,9 @@ async function startServer() {
 
   app.post('/api/analyze', async(req,res)=>{
     try {
-      const {asset,mode,image} = req.body;
+      const {asset, mode, image, accountSize, riskPct} = req.body;
+      const userAccountSize = parseFloat(accountSize) || 10000;
+      const userRiskPct     = parseFloat(riskPct) || 1.0;
       if(!process.env.GEMINI_API_KEY) return res.status(500).json({error:'GEMINI_API_KEY not configured.'});
       const derivSymbol = DERIV_SYMBOLS[asset];
       if(!derivSymbol) return res.status(400).json({error:`No Deriv symbol: ${asset}`});
@@ -760,7 +748,7 @@ async function startServer() {
       };
 
       const [engineResult, newsResult, reasoningResult] = await Promise.allSettled([
-        runPythonEngine(candlesByTF, asset),
+        runPythonEngine(candlesByTF, asset, userAccountSize, userRiskPct),
         fetchRSSNews(asset),
         fetchOpenRouterReasoning(asset, earlyContext, etfCandles, ''),
       ]);
@@ -768,6 +756,20 @@ async function startServer() {
       const engineData = engineResult.status === 'fulfilled' ? engineResult.value : {error:'Engine failed'};
       const newsData   = newsResult.status  === 'fulfilled' ? newsResult.value  : {items:[], hasHighImpact:false, highImpactEvents:[], freshCount:0, staleCount:0};
       const openRouterReasoning = reasoningResult.status === 'fulfilled' ? reasoningResult.value : '';
+
+      // Pass news items to Python for sentiment scoring
+      // Python scores keywords, AI interprets meaning and context
+      const sentimentResult = await runPythonOperation({
+        operation:  'score_sentiment',
+        news_items: (newsData as any).items || [],
+        asset,
+      });
+      const sentimentIntel = sentimentResult?.error ? null : sentimentResult;
+
+      // Merge sentiment intelligence into engine summary
+      if(engineData?._summary && sentimentIntel) {
+        engineData._summary.sentiment_intel = sentimentIntel;
+      }
 
       const engineBlock    = formatEngineResults(engineData);
       const newsBlock      = formatNewsBlock(newsData as any, asset);
@@ -805,7 +807,7 @@ async function startServer() {
       let responseText = ''; let aiUsed = 'none';
 
       // ── ANALYSIS LAYER ────────────────────────────────────────────────────
-      // Step 1: Gemini 1.5 Flash (3 retries with exponential backoff)
+      // Step 1: Gemini 2.5 Flash (3 retries with exponential backoff)
       const ai = new GoogleGenAI({apiKey:process.env.GEMINI_API_KEY});
       try {
         let response:any; let attempt=0;
@@ -813,7 +815,7 @@ async function startServer() {
         while(attempt<3){
           try {
             response=await ai.models.generateContent({
-              model:'gemini-1.5-flash', contents:promptParts,
+              model:'gemini-2.5-flash', contents:promptParts,
               config:{
                 systemInstruction: buildSystemPrompt(asset,mode),
                 temperature: 0.1,
@@ -873,33 +875,68 @@ async function startServer() {
         }
       }
 
-      // 7. Auto-save signal
+      // 7. Auto-save signal — uses structured JSON block from Gemini (reliable)
+      // Falls back to regex if JSON block is missing
       try {
-        const summary=engineData?._summary||{};
-        const etfData=engineData?.[summary.etf]||{}; const htfData=engineData?.[summary.htf]||{};
-        const dirMatch=responseText.match(/\*\*Direction:\*\*\s*(Bullish|Bearish|NEUTRAL)/i);
-        const direction=dirMatch?.[1]||'NEUTRAL';
-        const entryMatch=responseText.match(/\*\*Entry Zone:\*\*\s*([\d.]+)\s*[-–]\s*([\d.]+)/i);
-        const entryLow=entryMatch?parseFloat(entryMatch[1]):null;
-        const entryHigh=entryMatch?parseFloat(entryMatch[2]):null;
-        const slMatch=responseText.match(/\*\*Invalidation:\*\*\s*[A-Za-z ]*?([\d.]+)/i);
-        const sl=slMatch?parseFloat(slMatch[1]):null;
-        const tp1Match=responseText.match(/\*\*Target 1[^:]*:\*\*[^$\d]*([\d.]+)/i);
-        const tp1=tp1Match?parseFloat(tp1Match[1]):null;
-        const tp2Match=responseText.match(/\*\*Target 2[^:]*:\*\*[^$\d]*([\d.]+)/i);
-        const tp2=tp2Match?parseFloat(tp2Match[1]):null;
-        const tp3Match=responseText.match(/\*\*Target 3[^:]*:\*\*[^$\d]*([\d.]+)/i);
-        const tp3=tp3Match?parseFloat(tp3Match[1]):null;
-        if(direction!=='NEUTRAL'&&entryLow&&sl&&tp1){
-          const sr=await runPythonOperation({operation:'save_signal',signal:{
-            asset,mode,direction,entry_low:entryLow,entry_high:entryHigh||entryLow,
-            tp1,tp2:tp2||null,tp3:tp3||null,sl,
-            score:summary.ml_score?.score||null,
-            htf_trend:summary.htf_trend||'',etf_trend:etfData.trend||'',
-            rsi_htf:htfData.indicators?.rsi?.value||null,
-            atr:etfData.atr||null,regime:etfData.regime?.regime||'',session:summary.session?.session||'',
+        const summary    = engineData?._summary || {};
+        const etfData    = engineData?.[summary.etf] || {};
+        const htfData    = engineData?.[summary.htf] || {};
+
+        let signalData: any = null;
+
+        // Primary: parse structured JSON block appended by Gemini
+        const jsonBlockMatch = responseText.match(/SIGNAL_JSON_START\s*(\{[\s\S]*?\})\s*SIGNAL_JSON_END/);
+        if(jsonBlockMatch) {
+          try {
+            const parsed = JSON.parse(jsonBlockMatch[1]);
+            if(parsed.direction && parsed.direction !== 'NEUTRAL' &&
+               parsed.entry_low && parsed.sl && parsed.tp1) {
+              signalData = parsed;
+            }
+          } catch { /* fall through to regex */ }
+        }
+
+        // Fallback: regex parsing (handles cases where AI skips the JSON block)
+        if(!signalData) {
+          const dirMatch   = responseText.match(/\*\*Direction:\*\*\s*(Bullish|Bearish|NEUTRAL)/i);
+          const direction  = dirMatch?.[1] || 'NEUTRAL';
+          const entryMatch = responseText.match(/\*\*Entry Zone:\*\*\s*[\$]?([\d,]+\.?\d*)\s*[-–]\s*[\$]?([\d,]+\.?\d*)/i);
+          const entryLow   = entryMatch ? parseFloat(entryMatch[1].replace(/,/g,'')) : null;
+          const entryHigh  = entryMatch ? parseFloat(entryMatch[2].replace(/,/g,'')) : null;
+          const slMatch    = responseText.match(/\*\*Invalidation:\*\*[^\d]*([\d,]+\.?\d*)/i);
+          const sl         = slMatch ? parseFloat(slMatch[1].replace(/,/g,'')) : null;
+          const tp1Match   = responseText.match(/\*\*Target 1[^:]*:\*\*[^\d]*([\d,]+\.?\d*)/i);
+          const tp1        = tp1Match ? parseFloat(tp1Match[1].replace(/,/g,'')) : null;
+          const tp2Match   = responseText.match(/\*\*Target 2[^:]*:\*\*[^\d]*([\d,]+\.?\d*)/i);
+          const tp2        = tp2Match ? parseFloat(tp2Match[1].replace(/,/g,'')) : null;
+          const tp3Match   = responseText.match(/\*\*Target 3[^:]*:\*\*[^\d]*([\d,]+\.?\d*)/i);
+          const tp3        = tp3Match ? parseFloat(tp3Match[1].replace(/,/g,'')) : null;
+          if(direction !== 'NEUTRAL' && entryLow && sl && tp1) {
+            signalData = {direction, entry_low:entryLow, entry_high:entryHigh||entryLow,
+                          sl, tp1, tp2:tp2||null, tp3:tp3||null,
+                          score: summary.ml_score?.score || null};
+          }
+        }
+
+        if(signalData) {
+          const sr = await runPythonOperation({operation:'save_signal', signal:{
+            ...signalData,
+            asset, mode,
+            htf_trend:  summary.htf_trend || '',
+            etf_trend:  etfData.trend || '',
+            rsi_htf:    htfData.indicators?.rsi?.value || null,
+            atr:        etfData.atr || null,
+            regime:     etfData.regime?.regime || '',
+            session:    summary.session?.session || '',
           }});
-          if(sr?.signal_id){ responseText+=`\n\n---\n> 📊 **Signal #${sr.signal_id} recorded** — outcome tracked automatically.`; }
+          if(sr?.signal_id) {
+            // Remove the JSON block from the displayed response
+            responseText = responseText.replace(/SIGNAL_JSON_START[\s\S]*?SIGNAL_JSON_END/g, '').trim();
+            responseText += `\n\n---\n> 📊 **Signal #${sr.signal_id} recorded** — outcome tracked automatically.`;
+          }
+        } else {
+          // Clean up JSON block even if not saved
+          responseText = responseText.replace(/SIGNAL_JSON_START[\s\S]*?SIGNAL_JSON_END/g, '').trim();
         }
       } catch(saveErr:any){ console.log('Signal save:',saveErr.message); }
 
@@ -920,7 +957,7 @@ async function startServer() {
 
   app.listen(PORT,'0.0.0.0',()=>{
     console.log(`QUANT-X on http://localhost:${PORT}`);
-    console.log(`AI Chain: Gemini 1.5 Flash → GPT-4o (GITHUB_TOKEN) → GPT-4.1-mini (GITHUB_TOKEN2) → Rule-based`);
+    console.log(`AI Chain: Gemini 2.5 Flash → GPT-4o (GITHUB_TOKEN) → GPT-4.1-mini (GITHUB_TOKEN2) → Rule-based`);
     console.log(`Reasoning: Qwen-72B (OpenRouter free tier - optimized for speed)`);
     console.log(`OpenRouter: ${process.env.OPENROUTER_API_KEY?'✅ CONFIGURED':'❌ NOT SET'}`);
     console.log(`GPT-4o token: ${process.env.GITHUB_TOKEN?'✅ CONFIGURED':'❌ NOT SET'}`);

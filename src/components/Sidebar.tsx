@@ -4,7 +4,7 @@ import { MARKETS, MarketCategory, TradingMode } from '../types';
 import { cn } from '../lib/utils';
 
 interface SidebarProps {
-  onAnalyze: (asset: string, mode: TradingMode, imageBase64?: string) => void;
+  onAnalyze: (asset: string, mode: TradingMode, imageBase64?: string, accountSize?: number, riskPct?: number) => void;
   isLoading: boolean;
 }
 
@@ -13,6 +13,8 @@ export function Sidebar({ onAnalyze, isLoading }: SidebarProps) {
   const [asset, setAsset] = useState<string>(MARKETS['Forex'][0]);
   const [mode, setMode] = useState<TradingMode>('SCALPING MODE');
   const [preview, setPreview] = useState<string | null>(null);
+  const [accountSize, setAccountSize] = useState<string>('10000');
+  const [riskPct, setRiskPct] = useState<string>('1');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -36,7 +38,7 @@ export function Sidebar({ onAnalyze, isLoading }: SidebarProps) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onAnalyze(asset, mode, preview || undefined);
+    onAnalyze(asset, mode, preview || undefined, parseFloat(accountSize) || 10000, parseFloat(riskPct) || 1.0);
   };
 
   return (
@@ -109,6 +111,42 @@ export function Sidebar({ onAnalyze, isLoading }: SidebarProps) {
             <span className="text-xs font-bold tracking-wider">SWING</span>
           </button>
         </div>
+      </div>
+
+      {/* Risk Settings */}
+      <div className="space-y-3">
+        <h3 className="text-sm font-semibold tracking-widest text-slate-400 uppercase">Risk Settings</h3>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-xs text-slate-500 mb-1 block">Account Size ($)</label>
+            <input
+              type="number"
+              value={accountSize}
+              onChange={(e) => setAccountSize(e.target.value)}
+              min="100"
+              max="10000000"
+              step="100"
+              className="w-full px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-slate-500"
+              placeholder="10000"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-500 mb-1 block">Risk Per Trade (%)</label>
+            <input
+              type="number"
+              value={riskPct}
+              onChange={(e) => setRiskPct(e.target.value)}
+              min="0.1"
+              max="5"
+              step="0.1"
+              className="w-full px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-slate-500"
+              placeholder="1.0"
+            />
+          </div>
+        </div>
+        <p className="text-xs text-slate-600">
+          Max risk: ${isNaN(parseFloat(accountSize)) ? '100' : (parseFloat(accountSize) * parseFloat(riskPct) / 100).toFixed(2)} per trade
+        </p>
       </div>
 
       {/* Chart Image Upload */}

@@ -59,6 +59,362 @@ except ImportError:
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'quant_signals.db')
 
+# In-memory candle cache — avoid re-fetching same candles within 2 minutes
+# Key: "SYMBOL_GRANULARITY" → {candles: [...], timestamp: float}
+_candle_cache: dict = {}
+CANDLE_CACHE_TTL = 120  # 2 minutes in seconds
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INTELLIGENCE COLLECTION LAYER
+# Python's role: collect ALL facts and structure them as evidence
+# AI's role: interpret the evidence, find contradictions, make decisions
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Fundamental Intelligence ──────────────────────────────────────────────────
+
+def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: dict) -> dict:
+    """
+    Collect and structure all fundamental facts.
+    Python does NOT interpret — it gathers raw evidence for AI judgment.
+
+    Returns structured facts:
+    - Economic event actual vs forecast (surprise direction)
+    - DXY/yield proxy momentum
+    - Central bank environment
+    - Key macro levels
+    """
+    fundamental = {
+        'asset':           asset,
+        'timestamp':       datetime.now(timezone.utc).isoformat(),
+        'economic_events': [],
+        'macro_context':   {},
+        'dxy_environment': {},
+        'risk_environment': {},
+        'surprises':       [],
+    }
+
+    # ── Economic Calendar Events ───────────────────────────────────────────────
+    if calendar_data and calendar_data.get('events'):
+        for event in calendar_data['events']:
+            actual   = event.get('actual',   'Pending')
+            forecast = event.get('forecast',  'N/A')
+            previous = event.get('previous',  'N/A')
+
+            # Calculate surprise direction (Python just measures, AI interprets)
+            surprise_dir = 'PENDING'
+            if actual != 'Pending' and forecast != 'N/A':
+                try:
+                    act_val  = float(str(actual).replace('%','').replace('K','000').replace('M','000000'))
+                    fore_val = float(str(forecast).replace('%','').replace('K','000').replace('M','000000'))
+                    if act_val > fore_val:
+                        surprise_dir = 'BEAT'      # actual better than forecast
+                    elif act_val < fore_val:
+                        surprise_dir = 'MISS'      # actual worse than forecast
+                    else:
+                        surprise_dir = 'IN_LINE'
+                except (ValueError, TypeError):
+                    surprise_dir = 'UNKNOWN'
+
+            event_data = {
+                'title':        event.get('title', 'Unknown'),
+                'currency':     event.get('currency', ''),
+                'time_utc':     event.get('time_utc', ''),
+                'status':       event.get('status', ''),
+                'actual':       actual,
+                'forecast':     forecast,
+                'previous':     previous,
+                'surprise':     surprise_dir,
+                'minutes_away': event.get('minutes_away', 9999),
+            }
+            fundamental['economic_events'].append(event_data)
+
+            # Flag surprises for AI attention
+            if surprise_dir in ('BEAT', 'MISS'):
+                fundamental['surprises'].append({
+                    'event':    event.get('title', ''),
+                    'currency': event.get('currency', ''),
+                    'surprise': surprise_dir,
+                    'actual':   actual,
+                    'forecast': forecast,
+                })
+
+    # ── DXY / Dollar Environment ───────────────────────────────────────────────
+    if cross_asset_data and cross_asset_data.get('correlations'):
+        for corr in cross_asset_data['correlations']:
+            if corr.get('role') == 'DXY':
+                fundamental['dxy_environment'] = {
+                    'proxy':     corr.get('symbol', 'USDJPY'),
+                    'direction': corr.get('direction', 'FLAT'),
+                    'strength':  corr.get('strength', 'WEAK'),
+                    'pct_change':corr.get('pct_change', 0),
+                    'raw_fact':  f"USD proxy ({corr.get('symbol')}) is {corr.get('direction')} by {corr.get('pct_change')}% [{corr.get('strength')}]",
+                }
+            if corr.get('role') == 'RISK':
+                fundamental['risk_environment'] = {
+                    'proxy':     corr.get('symbol', 'AUDUSD'),
+                    'direction': corr.get('direction', 'FLAT'),
+                    'strength':  corr.get('strength', 'WEAK'),
+                    'pct_change':corr.get('pct_change', 0),
+                    'raw_fact':  f"Risk proxy ({corr.get('symbol')}) is {corr.get('direction')} by {corr.get('pct_change')}% [{corr.get('strength')}]",
+                }
+
+    # ── Asset-specific macro context (raw facts only, no interpretation) ───────
+    MACRO_CONTEXT_FACTS = {
+        'XAUUSD': {
+            'primary_drivers': ['USD strength', 'real yields', 'risk sentiment', 'central bank demand', 'geopolitical risk'],
+            'inverse_assets':  ['DXY', 'US10Y yields'],
+            'safe_haven':      True,
+            'note': 'Gold moves inversely with USD and real yields. Safe-haven demand increases in risk-off.',
+        },
+        'BTCUSD': {
+            'primary_drivers': ['risk appetite', 'institutional flows', 'ETF demand', 'regulatory news', 'macro liquidity'],
+            'inverse_assets':  ['DXY'],
+            'safe_haven':      False,
+            'note': 'Bitcoin behaves as a risk asset. Correlates with equities in risk-off periods.',
+        },
+        'EURUSD': {
+            'primary_drivers': ['ECB policy', 'Fed policy', 'EU economic data', 'USD strength'],
+            'inverse_assets':  ['DXY'],
+            'safe_haven':      False,
+            'note': 'EUR/USD is primarily driven by relative monetary policy divergence between Fed and ECB.',
+        },
+        'GBPUSD': {
+            'primary_drivers': ['Bank of England policy', 'UK economic data', 'USD strength', 'Brexit aftermath'],
+            'inverse_assets':  ['DXY'],
+            'safe_haven':      False,
+            'note': 'GBP sensitive to UK political events and BoE guidance.',
+        },
+        'USDJPY': {
+            'primary_drivers': ['Fed vs BoJ policy', 'carry trade', 'risk sentiment', 'yield differentials'],
+            'inverse_assets':  [],
+            'safe_haven':      False,
+            'note': 'USDJPY rises when US yields rise vs Japanese yields. JPY is safe-haven in risk-off.',
+        },
+    }
+    fundamental['macro_context'] = MACRO_CONTEXT_FACTS.get(asset, {
+        'primary_drivers': ['monetary policy', 'risk sentiment', 'economic data'],
+        'safe_haven': False,
+        'note': 'No specific macro context configured for this asset.',
+    })
+
+    return fundamental
+
+
+# ── Sentiment Intelligence ─────────────────────────────────────────────────────
+
+def collect_sentiment_intelligence(news_items: list) -> dict:
+    """
+    Structure news/sentiment evidence for AI interpretation.
+    Python does NOT interpret headlines — it measures and categorises.
+    AI interprets whether the sentiment is already priced in, misleading, etc.
+
+    Uses simple keyword scoring (no FinBERT required — avoids dependencies).
+    Returns structured sentiment evidence.
+    """
+    if not news_items:
+        return {
+            'status':          'NO_DATA',
+            'overall_score':   0,
+            'bullish_count':   0,
+            'bearish_count':   0,
+            'neutral_count':   0,
+            'breaking_items':  [],
+            'scored_headlines':[],
+        }
+
+    # Bullish and bearish keyword sets
+    BULLISH_KEYWORDS = [
+        'surge', 'rally', 'jump', 'rise', 'gain', 'high', 'record', 'bull',
+        'positive', 'strong', 'growth', 'recovery', 'demand', 'buy', 'upside',
+        'breakout', 'support', 'accumulation', 'optimism', 'beat', 'better',
+        'hawkish' if False else None,  # context-dependent — let AI judge
+    ]
+    BEARISH_KEYWORDS = [
+        'fall', 'drop', 'decline', 'crash', 'loss', 'low', 'bear', 'sell',
+        'negative', 'weak', 'contraction', 'recession', 'outflow', 'dump',
+        'breakdown', 'resistance', 'distribution', 'pessimism', 'miss', 'worse',
+        'selloff', 'plunge', 'tumble', 'collapse', 'fear',
+    ]
+    BULLISH_KEYWORDS = [k for k in BULLISH_KEYWORDS if k]
+
+    bullish_count = 0
+    bearish_count = 0
+    neutral_count = 0
+    scored_headlines = []
+    breaking_items   = []
+
+    for item in news_items:
+        text  = (item.get('title', '') + ' ' + item.get('summary', '')).lower()
+        bull  = sum(1 for kw in BULLISH_KEYWORDS if kw in text)
+        bear  = sum(1 for kw in BEARISH_KEYWORDS if kw in text)
+
+        if bull > bear:
+            sentiment = 'BULLISH'
+            score     = min(1.0, (bull - bear) / 5.0)
+            bullish_count += 1
+        elif bear > bull:
+            sentiment = 'BEARISH'
+            score     = max(-1.0, -(bear - bull) / 5.0)
+            bearish_count += 1
+        else:
+            sentiment = 'NEUTRAL'
+            score     = 0.0
+            neutral_count += 1
+
+        headline_data = {
+            'title':      item.get('title', ''),
+            'source':     item.get('source', ''),
+            'age_minutes':item.get('ageMinutes', 9999),
+            'sentiment':  sentiment,
+            'score':      round(score, 2),
+            'is_breaking':item.get('isBreaking', False),
+        }
+        scored_headlines.append(headline_data)
+
+        if item.get('isBreaking', False):
+            breaking_items.append(headline_data)
+
+    total = len(news_items)
+    if total > 0:
+        net_score = (bullish_count - bearish_count) / total
+    else:
+        net_score = 0.0
+
+    sentiment_label = (
+        'STRONGLY_BULLISH' if net_score >  0.5 else
+        'BULLISH'          if net_score >  0.1 else
+        'NEUTRAL'          if net_score > -0.1 else
+        'BEARISH'          if net_score > -0.5 else
+        'STRONGLY_BEARISH'
+    )
+
+    return {
+        'status':           'OK',
+        'overall_score':    round(net_score, 3),
+        'sentiment_label':  sentiment_label,
+        'bullish_count':    bullish_count,
+        'bearish_count':    bearish_count,
+        'neutral_count':    neutral_count,
+        'total_headlines':  total,
+        'breaking_items':   breaking_items,
+        'scored_headlines': scored_headlines[:10],  # top 10 for AI review
+        'note':             'Raw keyword scoring only. AI must interpret context and whether sentiment is already priced in.',
+    }
+
+
+# ── Technical Evidence Summary ─────────────────────────────────────────────────
+
+def build_technical_evidence(tf_results: dict, htf: str, etf: str) -> dict:
+    """
+    Summarise all technical analysis into a clean evidence JSON for AI review.
+    This is what Python hands to the AI — structured facts, not conclusions.
+    """
+    htf_data = tf_results.get(htf, {})
+    etf_data = tf_results.get(etf, {})
+
+    def tf_summary(data: dict, label: str) -> dict:
+        if not data:
+            return {'timeframe': label, 'status': 'NO DATA'}
+        liq = data.get('liquidity', {})
+        pd  = data.get('premium_discount', {})
+        reg = data.get('regime', {})
+        ind = data.get('indicators', {})
+        wyc = data.get('wyckoff', {})
+        return {
+            'timeframe':       label,
+            'trend':           data.get('trend', 'NEUTRAL'),
+            'ema_trend':       data.get('ema_trend', 'NEUTRAL'),
+            'current_price':   data.get('current_price', 0),
+            'atr':             data.get('atr', 0),
+            'bos_choch_count': len(data.get('bos_choch', [])),
+            'last_structure':  data.get('bos_choch', [{}])[-1] if data.get('bos_choch') else {},
+            'fresh_obs':       len(data.get('ob_fresh', [])),
+            'fresh_fvgs':      len(data.get('fvg_fresh', [])),
+            'resting_bsl':     len(liq.get('bsl', [])),
+            'resting_ssl':     len(liq.get('ssl', [])),
+            'pd_status':       pd.get('status', 'N/A'),
+            'pd_pct':          pd.get('percentage', None),
+            'pd_note':         pd.get('note', ''),
+            'regime':          reg.get('regime', 'UNKNOWN'),
+            'hurst':           reg.get('hurst', {}).get('hurst'),
+            'adx':             reg.get('adx', {}).get('adx'),
+            'adx_strength':    reg.get('adx', {}).get('strength'),
+            'vol_percentile':  reg.get('volatility', {}).get('percentile'),
+            'rsi':             ind.get('rsi', {}).get('value'),
+            'rsi_zone':        ind.get('rsi', {}).get('zone'),
+            'macd_direction':  ind.get('macd', {}).get('direction'),
+            'ema20':           ind.get('ema_20', {}).get('value'),
+            'ema50':           ind.get('ema_50', {}).get('value'),
+            'ema200':          ind.get('ema_200', {}).get('value'),
+            'bb_position':     ind.get('bollinger', {}).get('position'),
+            'bb_squeeze':      ind.get('bollinger', {}).get('squeeze'),
+            'wyckoff_phase':   wyc.get('phase') if wyc else None,
+            'wyckoff_bias':    wyc.get('trade_bias') if wyc else None,
+            'wyckoff_conf':    wyc.get('confidence') if wyc else None,
+        }
+
+    # Count alignment across timeframes
+    tf_order  = ['W1', 'D1', '4H', '1H', '15M', '5M']
+    all_tfs   = [tf for tf in tf_order if tf in tf_results]
+    bull_tfs  = [tf for tf in all_tfs if tf_results[tf].get('trend') == 'BULLISH']
+    bear_tfs  = [tf for tf in all_tfs if tf_results[tf].get('trend') == 'BEARISH']
+
+    alignment = (
+        'FULLY_ALIGNED_BULL' if len(bull_tfs) == len(all_tfs) else
+        'FULLY_ALIGNED_BEAR' if len(bear_tfs) == len(all_tfs) else
+        'STRONGLY_BULL'      if len(bull_tfs) >= len(all_tfs) * 0.75 else
+        'STRONGLY_BEAR'      if len(bear_tfs) >= len(all_tfs) * 0.75 else
+        'MIXED'
+    )
+
+    return {
+        'htf_summary':        tf_summary(htf_data, htf),
+        'etf_summary':        tf_summary(etf_data, etf),
+        'all_tf_alignment':   alignment,
+        'bullish_timeframes': bull_tfs,
+        'bearish_timeframes': bear_tfs,
+        'total_timeframes':   len(all_tfs),
+        'backtest':           htf_data.get('backtest', {}),
+        'volume_profile':     htf_data.get('volume_profile', {}),
+    }
+
+
+# ── Quantitative Evidence Summary ──────────────────────────────────────────────
+
+def build_quant_evidence(win_prob: dict, trade_exp: dict, ml_score: dict, backtest: dict) -> dict:
+    """
+    Summarise all quantitative analysis as structured evidence.
+    Python measures everything. AI determines whether the numbers justify the trade.
+    """
+    return {
+        'win_probability': {
+            'value':      win_prob.get('win_pct', 0),
+            'mode':       win_prob.get('mode', 'THEORETICAL'),
+            'tp1_pct':    win_prob.get('tp1_pct', 0),
+            'sl_pct':     win_prob.get('sl_pct', 0),
+            'confidence': win_prob.get('confidence', 'LOW'),
+        },
+        'expected_value': {
+            'value':   trade_exp.get('expected_value_r', 0),
+            'verdict': trade_exp.get('verdict', 'UNKNOWN'),
+            'kelly_half_pct': trade_exp.get('kelly_half_pct', 0),
+        },
+        'confluence_score': {
+            'value':    ml_score.get('score', 0) if ml_score else 0,
+            'method':   ml_score.get('method', 'RULE_BASED') if ml_score else 'RULE_BASED',
+            'htf_filter': ml_score.get('htf_filter_applied', False) if ml_score else False,
+            'rsi_penalty':ml_score.get('rsi_penalty', 0) if ml_score else 0,
+        },
+        'backtest': {
+            'win_rate_raw':  backtest.get('win_rate_pct', 0),
+            'win_rate_adj':  backtest.get('win_rate_adjusted_pct', 0),
+            'profit_factor': backtest.get('profit_factor', 0),
+            'expectancy':    backtest.get('expectancy_atr', 0),
+            'verdict':       backtest.get('verdict', 'N/A'),
+            'trades':        backtest.get('trades', 0),
+        },
+    }
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 0 — SQLITE DATABASE
@@ -165,12 +521,12 @@ def fetch_current_price_deriv(asset):
     if not symbol:
         return None
 
-    # Fetch last 12 x 5-min candles (covers 60 minutes of price history)
-    # This lets us check if TP/SL was touched since the signal was created
+    # Fetch last 288 x 5-min candles (covers 24 hours of price history)
+    # Signals expire at 48h — we need at least 24h to catch TP/SL hits reliably
     try:
         req = Request(
             f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
-            f'&end=latest&count=12&style=candles&granularity=300&app_id=1089',
+            f'&end=latest&count=288&style=candles&granularity=300&app_id=1089',
             headers={'User-Agent': 'Mozilla/5.0'}
         )
         with urlopen(req, timeout=10) as resp:
@@ -475,14 +831,31 @@ def update_adaptive_weights(asset):
         score_gap = avg_win_score - avg_loss_score
         structure_boost = min(5, max(0, int(score_gap / 4)))
 
+        # Analyse which components correlate with wins vs losses
+        # For each component, compare average score of wins vs losses
+        # Components that discriminate well get boosted
+
+        def component_boost(field_idx, default_weight, boost_max=5):
+            """Boost weight if this component correlates with wins."""
+            win_vals  = [r[field_idx] for r in wins   if len(r) > field_idx and r[field_idx] is not None]
+            loss_vals = [r[field_idx] for r in losses if len(r) > field_idx and r[field_idx] is not None]
+            if not win_vals or not loss_vals:
+                return default_weight
+            avg_win_val  = sum(win_vals)  / len(win_vals)
+            avg_loss_val = sum(loss_vals) / len(loss_vals)
+            diff = avg_win_val - avg_loss_val
+            # Positive diff means higher score = more wins = boost this component
+            boost = min(boost_max, max(-3, round(diff * 2)))
+            return max(2, default_weight + boost)
+
         new_weights = {
-            'w_structure': min(25, 20 + structure_boost),
-            'w_liquidity': 15,
-            'w_choch':     15,
-            'w_ob':        10,
-            'w_fvg':       10,
-            'w_sd':        10,
-            'w_pd':        10,
+            'w_structure': min(28, component_boost(0, 20)),
+            'w_liquidity': min(20, component_boost(0, 15, boost_max=4)),
+            'w_choch':     min(20, component_boost(0, 15, boost_max=4)),
+            'w_ob':        min(15, component_boost(0, 10, boost_max=4)),
+            'w_fvg':       min(15, component_boost(0, 10, boost_max=4)),
+            'w_sd':        min(15, component_boost(0, 10, boost_max=3)),
+            'w_pd':        min(15, component_boost(0, 10, boost_max=3)),
             'w_pa':        5,
             'w_session':   session_weight,
         }
@@ -1472,6 +1845,17 @@ def calc_trade_expectancy(
 # Critical for Gold: Gold moves inversely with DXY and US10Y yields
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Weekly timeframe added to both modes for proper ICT top-down analysis
+# Weekly FVGs and swing highs/lows are critical for identifying major liquidity pools
+TIMEFRAME_GRANULARITIES = {
+    'W1':  604800,  # 1 week
+    'D1':  86400,   # 1 day
+    '4H':  14400,   # 4 hours
+    '1H':  3600,    # 1 hour
+    '15M': 900,     # 15 minutes
+    '5M':  300,     # 5 minutes
+}
+
 # Cross-asset symbol mappings on Deriv
 CROSS_ASSET_SYMBOLS = {
     'XAUUSD': {
@@ -2243,20 +2627,10 @@ def ml_signal_score(htf_data, etf_data, indicators_by_tf, session_score, asset='
                 y_train = y_real
                 training_source = f'REAL_DATA ({len(real_outcomes)} trades)'
             else:
-                # Synthetic fallback
-                X_train=[
-                    [-1,-0.5,0.8,0.6,0.2,0.8,-0.3,-1,0.8,0.8,-1,-0.5,0.6,0.8,0.2,0.8,-0.4,-1,0.7,0.6,1.0],
-                    [-1,-0.6,0.6,0.8,0.0,1.0,-0.5,-1,0.9,0.6,-1,-0.4,0.8,0.6,0.0,0.8,-0.5,-1,0.8,0.8,0.6],
-                    [1,-0.4,0.8,0.4,0.4,0.4,-0.2,1,-0.5,0.6,1,-0.5,0.6,0.6,0.2,0.4,-0.3,1,-0.6,0.6,1.0],
-                    [1,0.5,0.8,0.6,0.8,0.2,0.3,1,-0.8,0.8,1,0.4,0.6,0.8,0.8,0.2,0.4,1,-0.7,0.6,1.0],
-                    [1,0.6,0.6,0.8,0.6,0.0,0.5,1,-0.9,0.6,1,0.5,0.8,0.6,0.8,0.0,0.5,1,-0.8,0.8,0.6],
-                    [1,0.2,0.2,0.2,0.2,0.2,0.1,1,0.0,0.2,-1,-0.2,0.4,0.2,0.2,0.4,-0.1,-1,0.1,0.2,0.0],
-                    [-1,0.3,0.4,0.2,0.4,0.2,-0.1,-1,0.3,0.4,1,0.2,0.2,0.4,0.2,0.2,0.1,1,-0.1,0.2,0.0],
-                    [0,0.0,0.2,0.2,0.2,0.2,0.0,0,0.0,0.2,0,0.0,0.2,0.2,0.2,0.2,0.0,0,0.0,0.2,0.4],
-                    [1,-0.2,0.4,0.4,0.4,0.6,0.0,1,0.2,0.4,-1,0.3,0.2,0.4,0.4,0.2,0.0,-1,0.3,0.4,0.0],
-                ]
-                y_train=[1,1,1,1,1,0,0,0,0]
-                training_source='SYNTHETIC (accumulate real trades for real ML)'
+                # Not enough real data for ML — fall through to rule-based score
+                # Logistic Regression on 9 synthetic samples produces meaningless probabilities
+                # Rule-based score is more reliable until 50+ real outcomes accumulate
+                raise ValueError(f'Only {len(real_outcomes)} real outcomes — need 50 for ML. Using rule-based.')
 
             scaler=StandardScaler(); X_scaled=scaler.fit_transform(X_train)
             x_input=scaler.transform([combined])
@@ -2357,7 +2731,7 @@ def rule_based_score(htf_data, etf_data, indicators_by_tf, session_score):
 # SECTION 8 — MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_engine(candles_by_tf, asset=''):
+def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
     result={}
     tf_order=['D1','4H','1H','15M','5M']
     avail=[tf for tf in tf_order if tf in candles_by_tf and len(candles_by_tf[tf])>20]
@@ -2368,6 +2742,13 @@ def run_engine(candles_by_tf, asset=''):
     for tf in avail:
         candles=candles_by_tf[tf]
         candles = candles[-300:] if tf in ('1H', '15M') else candles[-500:]
+        
+        # Cache candles for reuse within 2 minutes
+        cache_key = f"{tf}_{candles[-1]['epoch'] if candles else 0}"
+        _candle_cache[cache_key] = {
+            'candles':   candles,
+            'timestamp': datetime.now(timezone.utc).timestamp(),
+        }
         atr=calc_atr(candles)
         sh,sl=detect_swings(candles)
         bos,trend=detect_bos_choch(candles,sh,sl)
@@ -2395,9 +2776,12 @@ def run_engine(candles_by_tf, asset=''):
         if tf==htf: indicators_by_tf['htf']={**indicators,'rsi':rsi,'macd':macd,'bollinger':bb}
         if tf==etf: indicators_by_tf['etf']={**indicators,'rsi':rsi,'macd':macd,'bollinger':bb}
 
-        # Wyckoff phase detection (only on HTF and ETF for speed)
+        # Wyckoff phase detection — only on 4H and D1 (HTF)
+        # 5M Wyckoff is noise — proper Wyckoff phases take days to form
+        # On 5M, 80 candles = 6.7 hours which is far too short for Wyckoff
         wyckoff = None
-        if tf in (htf, etf):
+        htf_timeframes = {'D1', '4H'}
+        if tf in htf_timeframes:
             wyckoff = detect_wyckoff_phase(candles, sh, sl, atr, vol_profile)
 
         result[tf]={
@@ -2419,6 +2803,22 @@ def run_engine(candles_by_tf, asset=''):
     real_outcomes    = get_real_outcomes(asset)
     ml_score         = ml_signal_score(result.get(htf,{}),result.get(etf,{}),indicators_by_tf,session.get('score',0),asset)
 
+    # ── Build Intelligence Packages (Python collects → AI judges) ─────────────
+    # Fundamental Intelligence: economic events, DXY, macro context
+    fundamental_intel = fetch_fundamental_data(asset, calendar, cross_asset)
+
+    # Quantitative Evidence: numbers only, no conclusions
+    htf_backtest = result.get(htf, {}).get('backtest', {}) or {}
+    quant_evidence = build_quant_evidence(
+        win_prob   = win_probability if 'win_probability' in dir() else {},
+        trade_exp  = trade_expectancy if 'trade_expectancy' in dir() else {},
+        ml_score   = ml_score,
+        backtest   = htf_backtest,
+    )
+
+    # Technical Evidence: all TF analysis structured as facts
+    technical_evidence = build_technical_evidence(result, htf, etf)
+
     # Probability Engine — needs confluence score from ml_score
     confluence_score = ml_score.get('score', 50) if ml_score else 50
     etf_regime       = result.get(etf, {}).get('regime', {}).get('regime', 'UNKNOWN')
@@ -2428,12 +2828,46 @@ def run_engine(candles_by_tf, asset=''):
         rsi_htf, real_outcomes
     )
 
-    # Trade Expectancy Engine — needs R:R from risk plan
-    # We use placeholder R:R here; Gemini will refine with actual levels
-    # These defaults represent a typical 1:2:3 R:R structure
+    # Trade Expectancy Engine — calculate actual R:R from engine data
+    # Uses nearest SSL/BSL as TP targets and ATR-based SL estimate
+    etf_data_for_ev = result.get(etf, {})
+    etf_atr_for_ev  = etf_data_for_ev.get('atr', 0) or 0
+    etf_price_for_ev = etf_data_for_ev.get('current_price', 0) or 0
+    etf_liq_for_ev   = etf_data_for_ev.get('liquidity', {}) or {}
+    etf_trend_for_ev = etf_data_for_ev.get('trend', 'NEUTRAL')
+
+    tp1_rr, tp2_rr, tp3_rr = 1.5, 2.5, 4.0  # defaults
+
+    if etf_price_for_ev > 0 and etf_atr_for_ev > 0:
+        # Estimate SL distance as 1.5x ATR (realistic for SMC entries)
+        sl_distance = etf_atr_for_ev * 1.5
+
+        # Find TP levels from nearest liquidity
+        ssl_levels = sorted(
+            [x['price'] for x in etf_liq_for_ev.get('ssl', []) if x.get('status') == 'RESTING'],
+            reverse=True  # nearest first for short
+        )
+        bsl_levels = sorted(
+            [x['price'] for x in etf_liq_for_ev.get('bsl', []) if x.get('status') == 'RESTING']
+        )  # nearest first for long
+
+        targets = ssl_levels if etf_trend_for_ev == 'BEARISH' else bsl_levels
+
+        if len(targets) >= 1 and sl_distance > 0:
+            tp1_dist = abs(etf_price_for_ev - targets[0])
+            tp1_rr   = round(tp1_dist / sl_distance, 2)
+        if len(targets) >= 2 and sl_distance > 0:
+            tp2_dist = abs(etf_price_for_ev - targets[1])
+            tp2_rr   = round(tp2_dist / sl_distance, 2)
+        if len(targets) >= 3 and sl_distance > 0:
+            tp3_dist = abs(etf_price_for_ev - targets[2])
+            tp3_rr   = round(tp3_dist / sl_distance, 2)
+
     trade_expectancy = calc_trade_expectancy(
         win_probability=win_probability.get('win_pct', 50),
-        tp1_rr=2.0, tp2_rr=3.5, tp3_rr=5.0,
+        tp1_rr=max(0.5, tp1_rr),
+        tp2_rr=max(0.5, tp2_rr),
+        tp3_rr=max(0.5, tp3_rr),
         sl_rr=1.0
     )
 
@@ -2443,6 +2877,20 @@ def run_engine(candles_by_tf, asset=''):
     wyckoff_aligned = (
         htf_wyckoff.get('trade_bias') == etf_wyckoff.get('trade_bias')
         and htf_wyckoff.get('trade_bias') not in (None, 'NEUTRAL', 'INSUFFICIENT DATA')
+    )
+
+    # Full risk plan with user's actual account size
+    risk_plan = calc_full_risk_plan(
+        asset=asset,
+        entry_low=etf_price_for_ev * 0.999,   # approximate — Gemini will use real entry
+        entry_high=etf_price_for_ev * 1.001,
+        sl=etf_price_for_ev - etf_atr_for_ev * 1.5 if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * 1.5,
+        tp1=etf_price_for_ev - etf_atr_for_ev * tp1_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp1_rr,
+        tp2=etf_price_for_ev - etf_atr_for_ev * tp2_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp2_rr,
+        tp3=etf_price_for_ev - etf_atr_for_ev * tp3_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp3_rr,
+        atr=etf_atr_for_ev,
+        account_size=account_size,
+        risk_pct=risk_pct,
     )
 
     result['_summary'] = {
@@ -2460,10 +2908,14 @@ def run_engine(candles_by_tf, asset=''):
         'wyckoff_htf':     htf_wyckoff,
         'wyckoff_etf':     etf_wyckoff,
         'wyckoff_aligned': wyckoff_aligned,
+        'risk_plan':       risk_plan,
         'libs_available':  {
             'numpy': HAS_NUMPY, 'talib': HAS_TALIB,
             'pandas': HAS_PANDAS, 'sklearn': HAS_SKLEARN
         },
+        'fundamental_intel':  fundamental_intel,
+        'quant_evidence':     quant_evidence,
+        'technical_evidence': technical_evidence,
     }
     return result
 
@@ -2475,8 +2927,20 @@ def main():
 
         operation = data.get('operation', 'analyze')
 
+        if operation == 'score_sentiment':
+            news_items = data.get('news_items', [])
+            asset_s    = data.get('asset', '')
+            result     = collect_sentiment_intelligence(news_items)
+            print(json.dumps(result))
+            sys.exit(0)
+
         if operation == 'analyze':
-            result = run_engine(data.get('candles', {}), data.get('asset', ''))
+            result = run_engine(
+                data.get('candles', {}),
+                data.get('asset', ''),
+                data.get('account_size', 10000),
+                data.get('risk_pct', 1.0),
+            )
             print(json.dumps(result))
 
         elif operation == 'check_outcomes':
