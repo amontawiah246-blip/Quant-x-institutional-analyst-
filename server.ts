@@ -570,30 +570,73 @@ WYCKOFF vs PRICE ACTION:
   (High-probability long setup if confirmed)
 
 ═══════════════════════════════════════════════════════
-FINAL DECISION — THREE OUTCOMES ONLY
+PROBABILITY RULES FOR EXECUTION PLAN
 ═══════════════════════════════════════════════════════
 
-EXECUTE:
-- Evidence is aligned across technical, fundamental, sentiment
+IMPORTANT: The probability engine is in THEORETICAL mode until 50+ real outcomes accumulate.
+In THEORETICAL mode, treat the probability as a directional guide only — not a hard block.
+
+When mode=THEORETICAL:
+- Win probability 0-30%: Use as warning signal — check if confluence score contradicts this
+- Win probability 30-50%: Proceed with caution — check confluence score and EV together
+- Win probability > 50%: Normal — proceed if other factors align
+- If confluence score ≥ 70 but theoretical win probability is very low: trust confluence more
+  (The theoretical model is miscalibrated at low scores — real edge is in the confluence)
+
+When mode=REAL_DATA (after 50+ real trades):
+- Win probability < 40%: AVOID regardless of other factors
+- Win probability 40-50%: WAIT — check EV
+- Win probability > 50%: Proceed if confluence ≥ 60
+- Win probability > 65%: Strong setup
+
+EV RULES:
+- EV mode=THEORETICAL with confluence ≥ 70: proceed (EV will improve with real data)
+- EV mode=REAL_DATA negative: AVOID
+- Never use EV alone as a block when in THEORETICAL mode and confluence is high
+
+═══════════════════════════════════════════════════════
+FINAL DECISION — THREE OUTCOMES
+═══════════════════════════════════════════════════════
+
+EXECUTE — Enter the trade now:
+- Evidence aligned across technical, fundamental, sentiment
 - No imminent high-impact events
 - Win probability ≥ 50%
 - Expected Value > 0.3R
 - Confluence score ≥ 70
+- Price at or near the entry zone
 
-WAIT:
-- Setup exists but confirmation incomplete
-- Imminent economic event (within 2 hours)
-- Mixed signals across evidence packages
-- Win probability 40-50%
-- Valid setup likely to improve with more evidence
+WAIT — Setup is valid but entry conditions not met yet:
+- Correct directional bias but price not yet at entry level
+- Imminent economic event (enter after it resolves)
+- Mixed LTF signals but clear HTF direction
+- Win probability 40-55%
+- A specific price event must happen before entering
 
-AVOID:
+AVOID — No valid setup in current conditions:
 - Significant contradictions between evidence packages
 - Win probability < 40%
-- Negative Expected Value
-- High-impact event JUST released (volatility settling)
-- Setup is against strong HTF trend with no confluence
-- Price at no significant level
+- Negative Expected Value AND confluence < 50
+- No clear directional bias on any timeframe
+- Price at no significant level with no reason to enter
+
+CRITICAL RULE — ALWAYS SHOW THE TRADE PLAN:
+Regardless of whether the verdict is EXECUTE, WAIT, or AVOID:
+You MUST always show the full execution plan with specific levels.
+
+The difference is in the ENTRY TRIGGER section:
+- EXECUTE: "Price is already at [level]. Enter on next [candle type] confirmation."
+- WAIT: "Do not enter yet. Wait for [specific event] at [specific price] before entering."
+- AVOID: "No current setup. If conditions improve, watch for [specific event] at [specific price range]. Re-run analysis when price reaches [level]."
+
+A trader reading AVOID must still know:
+1. What the best potential setup would look like IF it forms
+2. What specific price level to watch
+3. What confirmation candle or event to wait for
+4. Where SL and TPs would be when/if that happens
+5. How much to risk
+
+Never leave the trader with only analysis and no levels.
 
 ═══════════════════════════════════════════════════════
 OUTPUT FORMAT — MANDATORY
@@ -632,20 +675,32 @@ OUTPUT FORMAT — MANDATORY
 **Risk to decision:** [What specific event or price level would invalidate or change this verdict?]
 
 ## EXECUTION PLAN
-[Only show if EXECUTE or WAIT. Skip entirely if AVOID.]
-[If WAIT — show what the plan WILL be once conditions are met.]
+[ALWAYS show this section — for EXECUTE, WAIT, and AVOID]
 
-- **Direction:** [Bullish / Bearish]
-- **Entry Zone:** [Exact prices from engine — never invented]
-- **Invalidation:** [Exact price from engine]
-- **Target 1 (TP1):** [Price] — R:R [ratio] — Probability [tp1_pct]%
-- **Target 2 (TP2):** [Price] — R:R [ratio]
-- **Target 3 (TP3):** [Price] — R:R [ratio]
+- **Verdict:** [EXECUTE NOW / WAIT FOR CONFIRMATION / AVOID — WATCH ONLY]
+- **Directional Bias:** [Bullish / Bearish / No bias — explain why]
+
+**ENTRY TRIGGER** — [What must happen before entering]:
+[EXECUTE]: "Price is already at [level]. Enter on next [candle type] confirmation."
+[WAIT]: "Wait for price to [tap/break/close above/below] [specific level at specific price]. Do not enter before this happens."
+[AVOID]: "No current setup. If conditions improve, watch for [specific event] at [specific price range]. Re-run analysis when price reaches [level]."
+
+- **Entry Zone:** [Exact price range from engine — the level to enter when trigger fires]
+- **Invalidation:** [Exact price — if this is hit, the setup is cancelled]
+- **Target 1 (TP1):** [Price from engine] — R:R [ratio] — Prob [tp1_pct]%
+- **Target 2 (TP2):** [Price from engine] — R:R [ratio]
+- **Target 3 (TP3):** [Price from engine] — R:R [ratio]
 - **Position Size:** [lot_size] lots — risks $[risk_amount] ([risk_pct]% of account)
-- **Break-Even:** Move SL to entry after TP1 hit at [price]
+- **Break-Even:** Move SL to entry after TP1 hit
 - **Win Probability:** [win_pct]% | Expected Value: [ev]R | [verdict]
-- **Wyckoff Context:** [phase and what it means for this trade]
-- **Calendar Warning:** [CLEAR / UPCOMING event at time / HARD PAUSE]
+- **Wyckoff Context:** [phase — one sentence on what it means]
+- **Calendar Warning:** [CLEAR / UPCOMING — event and time / HARD PAUSE]
+
+**WHAT CHANGES THIS VERDICT:**
+[2-3 specific conditions that would change AVOID → WAIT → EXECUTE.
+Example: "If price sweeps SSL at [price] and closes back above it with a bullish candle on 5M, and 15M RSI is not overbought — re-run analysis for potential long entry."
+Example: "If CPI releases and USD weakens (USDJPY drops), and 4H structure confirms BOS BULL — gold long setup activates."
+Always give the trader a specific scenario to watch for, not vague advice.]
 
 ## STRUCTURED SIGNAL
 [Append this exact block — values from your analysis:]
