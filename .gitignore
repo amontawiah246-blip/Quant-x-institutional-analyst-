@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+
+*.db
+quant_signals.db
+replace.cjs

@@ -6,9 +6,10 @@ import { ShieldAlert, BarChart2, TrendingUp, AlertTriangle } from 'lucide-react'
 interface AnalysisResultProps {
   result: string | null;
   isLoading: boolean;
+  statusMsg?: string;
 }
 
-export function AnalysisResult({ result, isLoading }: AnalysisResultProps) {
+export function AnalysisResult({ result, isLoading, statusMsg }: AnalysisResultProps) {
   if (isLoading) {
     return (
       <div className="flex flex-col items-center justify-center h-full min-h-[400px] text-slate-400 space-y-6">
@@ -17,8 +18,8 @@ export function AnalysisResult({ result, isLoading }: AnalysisResultProps) {
           <div className="w-16 h-16 border-2 border-slate-900 border-t-transparent rounded-full animate-spin absolute inset-0"></div>
         </div>
         <div className="flex flex-col items-center space-y-2 text-sm tracking-widest uppercase font-medium">
-          <span className="animate-pulse">Fetching live market data from Deriv...</span>
-          <span className="text-xs text-slate-300">Running structure & confluence engines</span>
+          <span className="animate-pulse">{statusMsg || "Fetching live market data from Deriv..."}</span>
+          
         </div>
       </div>
     );
@@ -37,7 +38,15 @@ export function AnalysisResult({ result, isLoading }: AnalysisResultProps) {
   }
 
   // Pre-process markdown if we see a complete rejection
-  const isRejected = result.includes('NO TRADE SETUP FOUND');
+  const isRejected = result.includes('VERDICT: AVOID') ||
+                     result.includes('**AVOID**') ||
+                     result.includes('NO TRADE SETUP FOUND');
+
+  const isExecute = result.includes('VERDICT: EXECUTE') ||
+                    result.includes('**EXECUTE**');
+
+  const isWait = result.includes('VERDICT: WAIT') ||
+                 result.includes('**WAIT**');
 
   return (
     <div className="w-full text-slate-800 pb-20">

@@ -14,17 +14,46 @@ const DERIV_SYMBOLS: Record<string, string> = {
   BOOM1000:'BOOM1000', CRASH1000:'CRASH1000', VOL75:'R_75', VOL100:'R_100',
 };
 
+// In-memory candle cache — prevents re-fetching same candles within 2 minutes
+const candleCache = new Map<string, { candles: Candle[], timestamp: number }>();
+const CACHE_TTL_MS = 120_000;
+
+async function fetchCachedCandles(symbol: string, granularity: number, count: number): Promise<Candle[]> {
+  const key    = `${symbol}_${granularity}`;
+  const cached = candleCache.get(key);
+  if(cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    console.log(`Cache hit: ${key}`);
+    return cached.candles;
+  }
+  const candles = await fetchDerivCandles(symbol, granularity, count);
+  if(candles.length > 0) candleCache.set(key, { candles, timestamp: Date.now() });
+  return candles;
+}
+
+const SYNTHETICS = new Set(['BOOM1000','CRASH1000','VOL75','VOL100','R_75','R_100']);
+
 const TIMEFRAMES: Record<string, { granularity: number; label: string }[]> = {
   'SCALPING MODE': [
-    {granularity:604800,label:'W1'},   // Weekly — major institutional levels
+    {granularity:604800,label:'W1'},
     {granularity:14400, label:'4H'},
     {granularity:3600,  label:'1H'},
     {granularity:900,   label:'15M'},
     {granularity:300,   label:'5M'},
   ],
   'SWING MODE': [
-    {granularity:604800,label:'W1'},   // Weekly — major institutional levels
+    {granularity:604800,label:'W1'},
     {granularity:86400, label:'D1'},
+    {granularity:14400, label:'4H'},
+    {granularity:3600,  label:'1H'},
+    {granularity:900,   label:'15M'},
+  ],
+  'SYNTHETIC SCALP': [
+    {granularity:14400, label:'4H'},
+    {granularity:3600,  label:'1H'},
+    {granularity:900,   label:'15M'},
+    {granularity:300,   label:'5M'},
+  ],
+  'SYNTHETIC SWING': [
     {granularity:14400, label:'4H'},
     {granularity:3600,  label:'1H'},
     {granularity:900,   label:'15M'},
@@ -83,26 +112,31 @@ function runPythonEngine(candlesByTF:Record<string,Candle[]>, asset:string, acco
 // ─── RSS NEWS FETCHER ─────────────────────────────────────────────────────────
 const RSS_SOURCES: Record<string, {url:string; name:string}[]> = {
   XAUUSD: [
-    {url:'https://feeds.kitco.com/MarketNuggets', name:'Kitco Gold'},
-    {url:'https://www.mining.com/feed/', name:'Mining.com'},
-    {url:'https://feeds.reuters.com/reuters/businessNews', name:'Reuters Business'},
+    {url:'https://www.forexlive.com/feed/news',         name:'ForexLive'},
+    {url:'https://www.dailyfx.com/feeds/market-news',   name:'DailyFX'},
+    {url:'https://www.fxstreet.com/rss/news',           name:'FXStreet'},
   ],
   XAGUSD: [
-    {url:'https://feeds.kitco.com/MarketNuggets', name:'Kitco Silver'},
-    {url:'https://feeds.reuters.com/reuters/businessNews', name:'Reuters Business'},
+    {url:'https://www.forexlive.com/feed/news',         name:'ForexLive'},
+    {url:'https://www.fxstreet.com/rss/news',           name:'FXStreet'},
   ],
   BTCUSD: [
-    {url:'https://cointelegraph.com/rss', name:'CoinTelegraph'},
+    {url:'https://cointelegraph.com/rss',               name:'CoinTelegraph'},
     {url:'https://coindesk.com/arc/outboundfeeds/rss/', name:'CoinDesk'},
+    {url:'https://decrypt.co/feed',                     name:'Decrypt'},
   ],
   ETHUSD: [
-    {url:'https://cointelegraph.com/rss/tag/ethereum', name:'CoinTelegraph ETH'},
+    {url:'https://cointelegraph.com/rss/tag/ethereum',  name:'CoinTelegraph ETH'},
+    {url:'https://coindesk.com/arc/outboundfeeds/rss/', name:'CoinDesk'},
+  ],
+  SOLUSD: [
+    {url:'https://cointelegraph.com/rss',               name:'CoinTelegraph'},
     {url:'https://coindesk.com/arc/outboundfeeds/rss/', name:'CoinDesk'},
   ],
   DEFAULT: [
-    {url:'https://feeds.reuters.com/reuters/businessNews', name:'Reuters Business'},
-    {url:'https://www.forexlive.com/feed/news', name:'ForexLive'},
-    {url:'https://www.dailyfx.com/feeds/all', name:'DailyFX'},
+    {url:'https://www.forexlive.com/feed/news',         name:'ForexLive'},
+    {url:'https://www.dailyfx.com/feeds/market-news',   name:'DailyFX'},
+    {url:'https://www.fxstreet.com/rss/news',           name:'FXStreet'},
   ],
 };
 
@@ -476,9 +510,23 @@ function formatEngineResults(engineData:any): string {
     if(d.wyckoff && d.wyckoff.phase !== 'INSUFFICIENT DATA'){
       const w=d.wyckoff;
       block+=`WYCKOFF: ${w.phase} | Bias:${w.trade_bias} | Confidence:${w.confidence}% | Range:${w.range_low}-${w.range_high}\n`;
-      block+=`  ${w.phase_detail}\n`;
-      block+=`  Next: ${w.next_move}\n`;
+      if(w.phase_detail) block+=`  ${w.phase_detail}\n`;
+      if(w.next_move)    block+=`  Next: ${w.next_move}\n`;
       if(w.events?.length) w.events.forEach((e:any)=>block+=`  ${e.type}@${e.price} ${e.date} — ${e.note||''}\n`);
+    }
+    if(d.elliott && d.elliott.status === 'OK'){
+      const e=d.elliott;
+      block+=`ELLIOTT: ${e.structure} | Bias:${e.bias} | Extension:${e.wave_extension?'YES':'NO'}\n`;
+      block+=`  ${e.description}\n`;
+      if(e.wave_extension && e.fib_targets) {
+        block+=`  Fib Targets: 1.618=${e.fib_targets['1.618']} 2.0=${e.fib_targets['2.0']}\n`;
+      }
+    }
+    if(d.fibonacci && !d.fibonacci.error){
+      const f=d.fibonacci;
+      block+=`FIBONACCI (${f.direction}): Swing ${f.swing_low}-${f.swing_high} Range:${f.range}\n`;
+      block+=`  Retracements: 0.382=${f.retracements['0.382']} 0.5=${f.retracements['0.500']} GP=${f.golden_pocket[0]}-${f.golden_pocket[1]}\n`;
+      block+=`  Extensions: 1.272=${f.extensions['1.272']} 1.618=${f.extensions['1.618']} 2.618=${f.extensions['2.618']}\n`;
     }
     block+='\n';
   }
@@ -518,6 +566,9 @@ TECHNICAL REVIEW:
 - Does the regime support this type of entry? (Trending regime → BOS+OB entries. Ranging → mean reversion.)
 - Has a liquidity sweep occurred? Is it genuine displacement or a trap?
 - Are multiple timeframes confirming or conflicting?
+- Do Fibonacci retracement levels (especially golden pocket 0.618-0.65) align with OB/FVG entry zones?
+- Does the Elliott wave structure confirm the entry type? (Impulse → trend entries. Corrective → fade extremes.)
+- Is there a wave extension? If yes, the trend is stretched and entries carry higher reversal risk.
 
 FUNDAMENTAL REVIEW:
 - Are any economic events imminent? If within 30 minutes: WAIT or AVOID.
@@ -706,7 +757,20 @@ Always give the trader a specific scenario to watch for, not vague advice.]
 [Append this exact block — values from your analysis:]
 
 SIGNAL_JSON_START
-{"direction":"Bearish","entry_low":0,"entry_high":0,"sl":0,"tp1":0,"tp2":0,"tp3":0,"score":0,"win_probability":0,"expected_value":0}
+{"direction":"DIRECTION_HERE","entry_low":ENTRY_LOW_HERE,"entry_high":ENTRY_HIGH_HERE,"sl":SL_HERE,"tp1":TP1_HERE,"tp2":TP2_HERE,"tp3":TP3_HERE,"score":SCORE_HERE,"win_probability":WIN_PCT_HERE,"expected_value":EV_HERE}
+SIGNAL_JSON_END
+
+Replace all placeholder words with actual numbers from your analysis.
+For AVOID with no setup: set entry/sl/tp fields to null (not 0).
+
+Example for a real bearish trade:
+SIGNAL_JSON_START
+{"direction":"Bearish","entry_low":4228.22,"entry_high":4232.57,"sl":4237.12,"tp1":4205.58,"tp2":4177.61,"tp3":4170.41,"score":82,"win_probability":61.4,"expected_value":1.16}
+SIGNAL_JSON_END
+
+Example for AVOID:
+SIGNAL_JSON_START
+{"direction":"NEUTRAL","entry_low":null,"entry_high":null,"sl":null,"tp1":null,"tp2":null,"tp3":null,"score":27,"win_probability":35.0,"expected_value":-0.51}
 SIGNAL_JSON_END
 
 INTEGRITY:
@@ -750,6 +814,33 @@ async function startServer() {
   app.use(express.json({limit:'50mb'}));
   app.use(express.urlencoded({extended:true,limit:'50mb'}));
 
+  // Health check endpoint
+  app.get('/api/health', (req, res) => {
+    res.json({
+      status:   'OK',
+      version:  'QUANT-X v9',
+      uptime:   Math.floor(process.uptime()),
+      memory:   process.memoryUsage().heapUsed,
+      cache:    candleCache.size,
+      gemini:   !!process.env.GEMINI_API_KEY,
+      openrouter: !!process.env.OPENROUTER_API_KEY,
+    });
+  });
+
+  // Signal performance summary endpoint
+  app.get('/api/performance', async(req,res) => {
+    try {
+      const asset  = req.query.asset as string | undefined;
+      const limit  = parseInt(req.query.limit as string || '100');
+      const result = await runPythonOperation({
+        operation: 'get_dashboard',
+        asset:     asset || null,
+        limit,
+      });
+      res.json(result);
+    } catch(e:any){ res.status(500).json({error:e.message}); }
+  });
+
   app.post('/api/check-outcomes', async(req,res)=>{
     try { res.json(await runPythonOperation({operation:'check_outcomes',asset:req.body.asset||null})); }
     catch(e:any){ res.status(500).json({error:e.message}); }
@@ -765,7 +856,16 @@ async function startServer() {
     catch(e:any){ res.status(500).json({error:e.message}); }
   });
 
+  let analysisInProgress = false;
+
   app.post('/api/analyze', async(req,res)=>{
+    if(analysisInProgress) {
+      return res.status(429).json({
+        error: 'Analysis already in progress. Please wait for it to complete.',
+        retry_after: 30,
+      });
+    }
+    analysisInProgress = true;
     try {
       const {asset, mode, image, accountSize, riskPct} = req.body;
       const userAccountSize = parseFloat(accountSize) || 10000;
@@ -775,10 +875,14 @@ async function startServer() {
       if(!derivSymbol) return res.status(400).json({error:`No Deriv symbol: ${asset}`});
 
       // 1. Fetch candles
-      const timeframes = TIMEFRAMES[mode]||TIMEFRAMES['SCALPING MODE'];
+      const isSynthetic = SYNTHETICS.has(derivSymbol);
+      const modeKey = isSynthetic
+        ? (mode === 'SWING MODE' ? 'SYNTHETIC SWING' : 'SYNTHETIC SCALP')
+        : mode;
+      const timeframes = TIMEFRAMES[modeKey] || TIMEFRAMES['SCALPING MODE'];
       const candlesByTF: Record<string,Candle[]> = {};
       let rawBlock = `# LIVE OHLCV — ${asset}\nFetched:${new Date().toISOString()}\n`;
-      const candleResults = await Promise.allSettled(timeframes.map(tf=>fetchDerivCandles(derivSymbol,tf.granularity,500)));
+      const candleResults = await Promise.allSettled(timeframes.map(tf=>fetchCachedCandles(derivSymbol,tf.granularity,500)));
       for(let i=0;i<timeframes.length;i++){
         const tf=timeframes[i]; const r=candleResults[i];
         if(r.status==='fulfilled'&&r.value.length>0){
@@ -802,15 +906,18 @@ async function startServer() {
         htfTrend: 'CALCULATING', // engine not done yet — OpenRouter works from candles directly
       };
 
-      const [engineResult, newsResult, reasoningResult] = await Promise.allSettled([
+      // Engine and news run in parallel — independent of each other
+      const [engineResult, newsResult] = await Promise.allSettled([
         runPythonEngine(candlesByTF, asset, userAccountSize, userRiskPct),
         fetchRSSNews(asset),
-        fetchOpenRouterReasoning(asset, earlyContext, etfCandles, ''),
       ]);
-
       const engineData = engineResult.status === 'fulfilled' ? engineResult.value : {error:'Engine failed'};
       const newsData   = newsResult.status  === 'fulfilled' ? newsResult.value  : {items:[], hasHighImpact:false, highImpactEvents:[], freshCount:0, staleCount:0};
-      const openRouterReasoning = reasoningResult.status === 'fulfilled' ? reasoningResult.value : '';
+
+      // OpenRouter runs AFTER engine — gets full calculated context for better reasoning
+      const engineBlock          = formatEngineResults(engineData);
+      const newsBlock            = formatNewsBlock(newsData as any, asset);
+      const openRouterReasoning  = await fetchOpenRouterReasoning(asset, engineData, etfCandles, newsBlock);
 
       // Pass news items to Python for sentiment scoring
       // Python scores keywords, AI interprets meaning and context
@@ -826,8 +933,6 @@ async function startServer() {
         engineData._summary.sentiment_intel = sentimentIntel;
       }
 
-      const engineBlock    = formatEngineResults(engineData);
-      const newsBlock      = formatNewsBlock(newsData as any, asset);
       const hasHighImpact  = (newsData as any).hasHighImpact || false;
       const reasoningBlock = openRouterReasoning
         ? `\n# QUANT REASONING CONTEXT (Qwen-2.5)\n${openRouterReasoning}\n`
@@ -855,7 +960,10 @@ async function startServer() {
 
       const promptParts:any[] = [{text:userPrompt}];
       if(image){
-        promptParts.push({inlineData:{data:image.split(',')[1]||image.replace(/^data:image\/\w+;base64,/,''),mimeType:'image/jpeg'}});
+        const mimeMatch  = image.match(/^data:(image\/[a-z]+);base64,/);
+        const mimeType   = (mimeMatch?.[1] || 'image/jpeg') as 'image/jpeg'|'image/png'|'image/gif'|'image/webp';
+        const base64Data = image.replace(/^data:image\/[a-z]+;base64,/, '');
+        promptParts.push({inlineData:{data:base64Data, mimeType}});
         promptParts.push({text:'Chart provided. If you see a spike or reversal candle, describe it and incorporate into analysis.'});
       }
 
@@ -995,6 +1103,13 @@ async function startServer() {
         }
       } catch(saveErr:any){ console.log('Signal save:',saveErr.message); }
 
+      const aiFooter = [
+        `Analysis: ${aiUsed}`,
+        openRouterReasoning ? `Reasoning: Qwen-2.5` : `Reasoning: SKIPPED`,
+        `News: ${(newsData as any).freshCount || 0} fresh / ${(newsData as any).staleCount || 0} older`,
+      ].join(' │ ');
+      responseText += `\n\n---\n*${aiFooter}*`;
+
       console.log(`Done. AI:${aiUsed} | News:${newsData.freshCount}fresh/${newsData.staleCount}stale | Reasoning:${openRouterReasoning?'YES':'NO'}`);
       res.json({result:responseText});
 
@@ -1012,6 +1127,14 @@ async function startServer() {
 
   app.listen(PORT,'0.0.0.0',()=>{
     console.log(`QUANT-X on http://localhost:${PORT}`);
+    console.log('');
+    console.log('=== API KEY STATUS ===');
+    console.log(`Gemini:       ${process.env.GEMINI_API_KEY     ? '✅ configured' : '❌ MISSING'}`);
+    console.log(`GPT-4o:       ${process.env.GITHUB_TOKEN       ? '✅ configured' : '⚠️  not set'}`);
+    console.log(`GPT-4.1-mini: ${process.env.GITHUB_TOKEN2      ? '✅ configured' : '⚠️  not set'}`);
+    console.log(`OpenRouter:   ${process.env.OPENROUTER_API_KEY ? '✅ configured' : '⚠️  not set — reasoning disabled'}`);
+    console.log('======================');
+    console.log('');
     console.log(`AI Chain: Gemini 2.5 Flash → GPT-4o (GITHUB_TOKEN) → GPT-4.1-mini (GITHUB_TOKEN2) → Rule-based`);
     console.log(`Reasoning: Qwen-72B (OpenRouter free tier - optimized for speed)`);
     console.log(`OpenRouter: ${process.env.OPENROUTER_API_KEY?'✅ CONFIGURED':'❌ NOT SET'}`);

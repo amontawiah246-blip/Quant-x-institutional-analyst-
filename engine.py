@@ -227,15 +227,22 @@ def collect_sentiment_intelligence(news_items: list) -> dict:
         'surge', 'rally', 'jump', 'rise', 'gain', 'high', 'record', 'bull',
         'positive', 'strong', 'growth', 'recovery', 'demand', 'buy', 'upside',
         'breakout', 'support', 'accumulation', 'optimism', 'beat', 'better',
-        'hawkish' if False else None,  # context-dependent — let AI judge
+        'rate cut', 'dovish', 'easing', 'quantitative easing', 'pivot',
+        'pause', 'safe haven', 'inflation hedge',
     ]
     BEARISH_KEYWORDS = [
         'fall', 'drop', 'decline', 'crash', 'loss', 'low', 'bear', 'sell',
         'negative', 'weak', 'contraction', 'recession', 'outflow', 'dump',
         'breakdown', 'resistance', 'distribution', 'pessimism', 'miss', 'worse',
         'selloff', 'plunge', 'tumble', 'collapse', 'fear',
+        'rate hike', 'hawkish', 'tightening', 'tapering', 'higher for longer',
+        'yield surge', 'dollar strength',
     ]
-    BULLISH_KEYWORDS = [k for k in BULLISH_KEYWORDS if k]
+    MONETARY_KEYWORDS = [
+        'fed', 'fomc', 'ecb', 'central bank', 'interest rate', 'boj',
+        'federal reserve', 'powell', 'lagarde', 'rate decision',
+        'hawkish', 'dovish', 'inflation', 'cpi', 'nfp', 'gdp',
+    ]
 
     bullish_count = 0
     bearish_count = 0
@@ -298,7 +305,8 @@ def collect_sentiment_intelligence(news_items: list) -> dict:
         'total_headlines':  total,
         'breaking_items':   breaking_items,
         'scored_headlines': scored_headlines[:10],  # top 10 for AI review
-        'note':             'Raw keyword scoring only. AI must interpret context and whether sentiment is already priced in.',
+        'note': 'Raw keyword scoring. AI must interpret hawkish/dovish context and whether sentiment is priced in.',
+        'monetary_terms_detected': [kw for kw in MONETARY_KEYWORDS if kw.lower() in ' '.join(i.get('title','') for i in news_items).lower()],
     }
 
 
@@ -348,9 +356,12 @@ def build_technical_evidence(tf_results: dict, htf: str, etf: str) -> dict:
             'ema200':          ind.get('ema_200', {}).get('value'),
             'bb_position':     ind.get('bollinger', {}).get('position'),
             'bb_squeeze':      ind.get('bollinger', {}).get('squeeze'),
-            'wyckoff_phase':   wyc.get('phase') if wyc else None,
-            'wyckoff_bias':    wyc.get('trade_bias') if wyc else None,
-            'wyckoff_conf':    wyc.get('confidence') if wyc else None,
+            'wyckoff_phase':   wyc.get('phase')       if wyc else None,
+            'wyckoff_bias':    wyc.get('trade_bias')  if wyc else None,
+            'wyckoff_conf':    wyc.get('confidence')  if wyc else None,
+            'elliott_structure': data.get('elliott', {}).get('structure')  if data.get('elliott') else None,
+            'elliott_bias':      data.get('elliott', {}).get('bias')       if data.get('elliott') else None,
+            'fib_golden_pocket': data.get('fibonacci', {}).get('golden_pocket') if data.get('fibonacci') else None,
         }
 
     # Count alignment across timeframes
@@ -421,61 +432,52 @@ def build_quant_evidence(win_prob: dict, trade_exp: dict, ml_score: dict, backte
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        asset TEXT NOT NULL,
-        mode TEXT,
-        timestamp TEXT NOT NULL,
-        direction TEXT,
-        entry_low REAL,
-        entry_high REAL,
-        tp1 REAL,
-        tp2 REAL,
-        tp3 REAL,
-        sl REAL,
-        confluence_score REAL,
-        htf_trend TEXT,
-        etf_trend TEXT,
-        rsi_htf REAL,
-        atr REAL,
-        regime TEXT,
-        session TEXT,
-        outcome TEXT DEFAULT NULL,
-        outcome_checked_at TEXT DEFAULT NULL,
-        pnl_atr REAL DEFAULT NULL,
-        exit_price REAL DEFAULT NULL,
-        bars_to_exit INTEGER DEFAULT NULL,
-        notes TEXT DEFAULT NULL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS asset_weights (
-        asset TEXT PRIMARY KEY,
-        w_structure REAL DEFAULT 20,
-        w_liquidity REAL DEFAULT 15,
-        w_choch REAL DEFAULT 15,
-        w_ob REAL DEFAULT 10,
-        w_fvg REAL DEFAULT 10,
-        w_sd REAL DEFAULT 10,
-        w_pd REAL DEFAULT 10,
-        w_pa REAL DEFAULT 5,
-        w_session REAL DEFAULT 5,
-        total_trades INTEGER DEFAULT 0,
-        win_rate REAL DEFAULT NULL,
-        last_updated TEXT DEFAULT NULL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS daily_performance (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        asset TEXT NOT NULL,
-        trades INTEGER DEFAULT 0,
-        wins INTEGER DEFAULT 0,
-        losses INTEGER DEFAULT 0,
-        pnl_atr REAL DEFAULT 0,
-        win_rate REAL DEFAULT NULL
-    )''')
-    conn.commit()
-    conn.close()
+    if os.path.exists(DB_PATH):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute('SELECT 1 FROM sqlite_master LIMIT 1')
+            conn.close()
+        except sqlite3.DatabaseError:
+            try: conn.close()
+            except: pass
+            try:
+                os.remove(DB_PATH)
+                print('WARNING: Corrupt DB removed. Creating fresh.', file=sys.stderr)
+            except OSError as e:
+                print(f'WARNING: Could not remove corrupt DB: {e}', file=sys.stderr)
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset TEXT NOT NULL, mode TEXT, timestamp TEXT NOT NULL,
+            direction TEXT, entry_low REAL, entry_high REAL,
+            tp1 REAL, tp2 REAL, tp3 REAL, sl REAL,
+            confluence_score REAL, htf_trend TEXT, etf_trend TEXT,
+            rsi_htf REAL, atr REAL, regime TEXT, session TEXT,
+            outcome TEXT DEFAULT NULL, outcome_checked_at TEXT DEFAULT NULL,
+            pnl_atr REAL DEFAULT NULL, exit_price REAL DEFAULT NULL,
+            bars_to_exit INTEGER DEFAULT NULL, notes TEXT DEFAULT NULL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS asset_weights (
+            asset TEXT PRIMARY KEY,
+            w_structure REAL DEFAULT 20, w_liquidity REAL DEFAULT 15,
+            w_choch REAL DEFAULT 15, w_ob REAL DEFAULT 10,
+            w_fvg REAL DEFAULT 10, w_sd REAL DEFAULT 10,
+            w_pd REAL DEFAULT 10, w_pa REAL DEFAULT 5, w_session REAL DEFAULT 5,
+            total_trades INTEGER DEFAULT 0, win_rate REAL DEFAULT NULL,
+            last_updated TEXT DEFAULT NULL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS daily_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL,
+            asset TEXT NOT NULL, trades INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
+            pnl_atr REAL DEFAULT 0, win_rate REAL DEFAULT NULL
+        )''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f'ERROR: Could not initialize database: {e}', file=sys.stderr)
 
 
 def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl,
@@ -751,6 +753,31 @@ def check_and_update_outcomes(asset=None):
         for retrain_asset in assets_to_retrain:
             update_adaptive_weights(retrain_asset)
 
+        # Update daily performance table
+        if assets_to_retrain:
+            try:
+                today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+                conn_dp = sqlite3.connect(DB_PATH)
+                c_dp    = conn_dp.cursor()
+                for dp_asset in assets_to_retrain:
+                    c_dp.execute('''SELECT COUNT(*), SUM(CASE WHEN outcome="WIN" THEN 1 ELSE 0 END),
+                                    SUM(CASE WHEN outcome="LOSS" THEN 1 ELSE 0 END), SUM(pnl_atr)
+                                    FROM signals WHERE asset=? AND date(outcome_checked_at)=?''',
+                                 (dp_asset, today))
+                    row = c_dp.fetchone()
+                    if row and row[0] > 0:
+                        total, wins, losses, pnl = row
+                        wr = round(wins/total*100, 1) if total else None
+                        c_dp.execute('''INSERT INTO daily_performance
+                            (date, asset, trades, wins, losses, pnl_atr, win_rate)
+                            VALUES (?,?,?,?,?,?,?)
+                            ON CONFLICT DO NOTHING''',
+                            (today, dp_asset, total, wins or 0, losses or 0, pnl or 0, wr))
+                conn_dp.commit()
+                conn_dp.close()
+            except Exception:
+                pass
+
         return {
             'checked': len(pending),
             'updated': updated,
@@ -960,15 +987,48 @@ def get_signal_dashboard(asset=None, limit=50):
                 'session':    row[15],
             })
 
+        # Fetch daily performance
+        try:
+            conn_dp = sqlite3.connect(DB_PATH)
+            c_dp    = conn_dp.cursor()
+            if asset:
+                c_dp.execute('''SELECT date, trades, wins, losses, pnl_atr, win_rate
+                                FROM daily_performance WHERE asset=?
+                                ORDER BY date DESC LIMIT 30''', (asset,))
+            else:
+                c_dp.execute('''SELECT date, SUM(trades), SUM(wins), SUM(losses), SUM(pnl_atr), NULL
+                                FROM daily_performance GROUP BY date ORDER BY date DESC LIMIT 30''')
+            daily_rows = c_dp.fetchall()
+            conn_dp.close()
+            daily_perf = [{'date':r[0],'trades':r[1],'wins':r[2],'losses':r[3],'pnl_atr':r[4],'win_rate':r[5]} for r in daily_rows]
+        except Exception:
+            daily_perf = []
+
+        # Streak calculation
+        streak       = 0
+        streak_type  = 'NONE'
+        for sig in signals:
+            if sig['outcome'] == 'WIN':
+                if streak_type == 'WIN': streak += 1
+                else: streak = 1; streak_type = 'WIN'
+                break
+            elif sig['outcome'] == 'LOSS':
+                if streak_type == 'LOSS': streak += 1
+                else: streak = 1; streak_type = 'LOSS'
+                break
+
         return {
-            'signals':      signals,
-            'total_closed': total_closed,
-            'total_wins':   total_wins,
-            'total_losses': total_losses,
-            'win_rate_pct': win_rate,
-            'avg_pnl_atr':  avg_pnl,
+            'signals':       signals,
+            'total_closed':  total_closed,
+            'total_wins':    total_wins,
+            'total_losses':  total_losses,
+            'win_rate_pct':  win_rate,
+            'avg_pnl_atr':   avg_pnl,
             'total_pnl_atr': total_pnl,
             'pending_count': sum(1 for s in signals if s['outcome'] == 'OPEN'),
+            'current_streak':streak,
+            'streak_type':   streak_type,
+            'daily_performance': daily_perf,
         }
 
     except Exception as e:
@@ -1662,6 +1722,175 @@ def calc_volume_profile(candles, bins=20):
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — SMC/ICT STRUCTURE ENGINES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIBONACCI ENGINE
+# Calculates retracement and extension levels from swing points
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calc_fibonacci_levels(swing_high: float, swing_low: float, direction: str = 'BEARISH') -> dict:
+    """
+    Calculate Fibonacci retracement and extension levels.
+
+    Retracements: 0.236, 0.382, 0.5, 0.618, 0.786 (golden pocket = 0.618-0.65)
+    Extensions:   1.0, 1.272, 1.414, 1.618, 2.0, 2.618
+
+    For BEARISH moves: measure from swing high down to swing low
+    For BULLISH moves: measure from swing low up to swing high
+    """
+    if swing_high <= swing_low:
+        return {'error': 'Invalid swing — high must be above low'}
+
+    rng = swing_high - swing_low
+
+    if direction == 'BEARISH':
+        # Retracements from high (potential short entry zones)
+        retracements = {
+            '0.236': round(swing_high - rng * 0.236, 6),
+            '0.382': round(swing_high - rng * 0.382, 6),
+            '0.500': round(swing_high - rng * 0.500, 6),
+            '0.618': round(swing_high - rng * 0.618, 6),
+            '0.650': round(swing_high - rng * 0.650, 6),
+            '0.786': round(swing_high - rng * 0.786, 6),
+        }
+        # Extensions below swing low (downside targets)
+        extensions = {
+            '1.000': round(swing_low - rng * 0.000, 6),
+            '1.272': round(swing_low - rng * 0.272, 6),
+            '1.414': round(swing_low - rng * 0.414, 6),
+            '1.618': round(swing_low - rng * 0.618, 6),
+            '2.000': round(swing_low - rng * 1.000, 6),
+            '2.618': round(swing_low - rng * 1.618, 6),
+        }
+        golden_pocket = (retracements['0.618'], retracements['0.650'])
+    else:
+        # BULLISH — retracements from low (potential long entry zones)
+        retracements = {
+            '0.236': round(swing_low + rng * 0.236, 6),
+            '0.382': round(swing_low + rng * 0.382, 6),
+            '0.500': round(swing_low + rng * 0.500, 6),
+            '0.618': round(swing_low + rng * 0.618, 6),
+            '0.650': round(swing_low + rng * 0.650, 6),
+            '0.786': round(swing_low + rng * 0.786, 6),
+        }
+        extensions = {
+            '1.000': round(swing_high + rng * 0.000, 6),
+            '1.272': round(swing_high + rng * 0.272, 6),
+            '1.414': round(swing_high + rng * 0.414, 6),
+            '1.618': round(swing_high + rng * 0.618, 6),
+            '2.000': round(swing_high + rng * 1.000, 6),
+            '2.618': round(swing_high + rng * 1.618, 6),
+        }
+        golden_pocket = (retracements['0.618'], retracements['0.650'])
+
+    return {
+        'direction':     direction,
+        'swing_high':    round(swing_high, 6),
+        'swing_low':     round(swing_low, 6),
+        'range':         round(rng, 6),
+        'retracements':  retracements,
+        'extensions':    extensions,
+        'golden_pocket': golden_pocket,
+        'note':          'Golden pocket (0.618-0.65) is highest probability retracement entry zone.',
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ELLIOTT WAVE ENGINE (simplified — impulse/corrective structure detection)
+# Does NOT attempt full wave counts — that is subjective and unreliable
+# Instead detects: impulse structure, corrective structure, wave extension
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def detect_elliott_structure(candles, swing_highs, swing_lows, atr):
+    """
+    Simplified Elliott Wave structure detection.
+    Identifies whether price is in an IMPULSE or CORRECTIVE phase.
+
+    Rules (simplified):
+    IMPULSE (trending): 3 clear swing highs making HH or 3 swing lows making LL
+    CORRECTIVE (ABC): alternating swings, no new extremes
+    EXTENSION: impulse wave that is >1.618x the average of other waves
+
+    Returns structured evidence for AI interpretation.
+    Python detects structure — AI interprets wave context.
+    """
+    if len(swing_highs) < 3 or len(swing_lows) < 3:
+        return {'status': 'INSUFFICIENT_DATA', 'structure': 'UNKNOWN'}
+
+    recent_sh = sorted(swing_highs[-5:], key=lambda x: x['index'])
+    recent_sl = sorted(swing_lows[-5:],  key=lambda x: x['index'])
+
+    # Check for Higher Highs (bullish impulse)
+    hh_count = sum(1 for i in range(1, len(recent_sh))
+                   if recent_sh[i]['price'] > recent_sh[i-1]['price'])
+    ll_count = sum(1 for i in range(1, len(recent_sl))
+                   if recent_sl[i]['price'] < recent_sl[i-1]['price'])
+
+    # Check for Lower Highs (bearish impulse)
+    lh_count = sum(1 for i in range(1, len(recent_sh))
+                   if recent_sh[i]['price'] < recent_sh[i-1]['price'])
+    hl_count = sum(1 for i in range(1, len(recent_sl))
+                   if recent_sl[i]['price'] > recent_sl[i-1]['price'])
+
+    # Measure wave sizes
+    wave_sizes = []
+    all_swings = sorted(
+        [(s['price'], s['index'], 'H') for s in recent_sh] +
+        [(s['price'], s['index'], 'L') for s in recent_sl],
+        key=lambda x: x[1]
+    )
+    for i in range(1, len(all_swings)):
+        wave_sizes.append(abs(all_swings[i][0] - all_swings[i-1][0]))
+
+    avg_wave  = sum(wave_sizes) / len(wave_sizes) if wave_sizes else 0
+    max_wave  = max(wave_sizes) if wave_sizes else 0
+    extension = max_wave > avg_wave * 1.618 if avg_wave > 0 else False
+
+    # Classify structure
+    if hh_count >= 2 and hl_count >= 2:
+        structure   = 'BULLISH_IMPULSE'
+        description = f'Price making Higher Highs ({hh_count}) and Higher Lows ({hl_count}) — bullish impulse wave in progress.'
+        bias        = 'BULLISH'
+    elif lh_count >= 2 and ll_count >= 2:
+        structure   = 'BEARISH_IMPULSE'
+        description = f'Price making Lower Highs ({lh_count}) and Lower Lows ({ll_count}) — bearish impulse wave in progress.'
+        bias        = 'BEARISH'
+    elif hh_count >= 1 and lh_count >= 1:
+        structure   = 'CORRECTIVE_RANGE'
+        description = 'Mixed swing structure — price in corrective ABC or ranging phase. No clear impulse direction.'
+        bias        = 'NEUTRAL'
+    else:
+        structure   = 'TRANSITIONAL'
+        description = 'Insufficient swing data for Elliott classification. Market may be transitioning.'
+        bias        = 'NEUTRAL'
+
+    # Fibonacci extension targets
+    fib_targets = {}
+    if wave_sizes and len(wave_sizes) >= 2:
+        first_wave  = wave_sizes[0]
+        last_price  = candles[-1]['close']
+        fib_targets = {
+            '1.0':   round(last_price + first_wave * 1.0,   6),
+            '1.272': round(last_price + first_wave * 1.272, 6),
+            '1.618': round(last_price + first_wave * 1.618, 6),
+            '2.0':   round(last_price + first_wave * 2.0,   6),
+        }
+
+    return {
+        'status':          'OK',
+        'structure':       structure,
+        'bias':            bias,
+        'description':     description,
+        'hh_count':        hh_count,
+        'hl_count':        hl_count,
+        'lh_count':        lh_count,
+        'll_count':        ll_count,
+        'wave_extension':  extension,
+        'avg_wave_size':   round(avg_wave, 6),
+        'max_wave_size':   round(max_wave, 6),
+        'fib_targets':     fib_targets,
+        'note':            'Simplified Elliott structure only. AI must apply full wave context and validation.',
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WYCKOFF ENGINE
@@ -2543,9 +2772,34 @@ def run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs):
     trades=[]; tp_ratio=1.5; sl_ratio=1.0
     bos_only=[e for e in bos_events if 'BOS' in e['type']]
     for event in bos_only:
-        idx=event['index']; direction='LONG' if 'BULL' in event['type'] else 'SHORT'
-        entry=candles[idx]['close']; atr_at=calc_atr(candles[:idx+1]) if idx>=14 else atr
-        if atr_at==0: continue
+        idx       = event['index']
+        direction = 'LONG' if 'BULL' in event['type'] else 'SHORT'
+        atr_at    = calc_atr(candles[:idx+1]) if idx >= 14 else atr
+        if atr_at == 0:
+            continue
+
+        # Use nearest fresh OB or FVG as entry (real SMC methodology)
+        entry       = None
+        entry_type  = 'BOS_CLOSE_FALLBACK'
+
+        for ob in reversed(obs):
+            dir_match = ('BULL' if direction == 'LONG' else 'BEAR')
+            if ob['direction'] == dir_match and ob['index'] < idx and ob['status'] == 'FRESH':
+                entry      = (ob['high'] + ob['low']) / 2
+                entry_type = f"OB@{ob['low']}-{ob['high']}"
+                break
+
+        if entry is None:
+            for fvg in reversed(fvgs):
+                dir_match = ('BULL' if direction == 'LONG' else 'BEAR')
+                if fvg['direction'] == dir_match and fvg['index'] < idx and fvg['status'] == 'FRESH':
+                    entry      = (fvg['top'] + fvg['bottom']) / 2
+                    entry_type = f"FVG@{fvg['bottom']}-{fvg['top']}"
+                    break
+
+        if entry is None:
+            entry      = candles[idx]['close']
+            entry_type = 'BOS_CLOSE_FALLBACK'
         tp=entry+atr_at*tp_ratio if direction=='LONG' else entry-atr_at*tp_ratio
         sl=entry-atr_at*sl_ratio if direction=='LONG' else entry+atr_at*sl_ratio
         outcome='OPEN'; exit_price=None; bars=0
@@ -2559,7 +2813,16 @@ def run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs):
                 if c['low']<=tp:   outcome='WIN';  exit_price=tp; break
         if outcome!='OPEN':
             pnl=(exit_price-entry) if direction=='LONG' else (entry-exit_price)
-            trades.append({'direction':direction,'entry':round(entry,6),'exit':round(exit_price,6),'outcome':outcome,'pnl_atr':round(pnl/atr_at,3),'bars':bars,'date':candles[idx].get('date',str(candles[idx]['epoch']))})
+            trades.append({
+            'direction':  direction,
+            'entry':      round(entry, 6),
+            'exit':       round(exit_price, 6),
+            'outcome':    outcome,
+            'pnl_atr':    round(pnl/atr_at, 3),
+            'bars':       bars,
+            'entry_type': entry_type,
+            'date':       candles[idx].get('date', str(candles[idx]['epoch'])),
+        })
     if not trades: return {'status':'NO TRADES FOUND','trades':0}
     wins=[t for t in trades if t['outcome']=='WIN']; losses=[t for t in trades if t['outcome']=='LOSS']
     wr=round(len(wins)/len(trades)*100,1)
@@ -2567,8 +2830,15 @@ def run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs):
     al=round(sum(t['pnl_atr'] for t in losses)/len(losses),3) if losses else 0
     exp=round((wr/100*aw)+((1-wr/100)*al),3)
     pf=round(abs(sum(t['pnl_atr'] for t in wins))/abs(sum(t['pnl_atr'] for t in losses)),3) if losses and wins else 0
+    ob_entries  = sum(1 for t in trades if 'OB@'       in t.get('entry_type',''))
+    fvg_entries = sum(1 for t in trades if 'FVG@'      in t.get('entry_type',''))
+    bos_entries = sum(1 for t in trades if 'BOS_CLOSE' in t.get('entry_type',''))
     return {
-        'status':'COMPLETE','trades':len(trades),'wins':len(wins),'losses':len(losses),
+        'status':          'COMPLETE',
+        'trades':          len(trades),
+        'wins':            len(wins),
+        'losses':          len(losses),
+        'entry_breakdown': {'ob': ob_entries, 'fvg': fvg_entries, 'bos_fallback': bos_entries},
         'win_rate_pct':wr,'win_rate_adjusted_pct':round(wr*0.80,1),
         'avg_win_atr':aw,'avg_loss_atr':al,'expectancy_atr':exp,'profit_factor':pf,
         'recent_trades':trades[-5:],
@@ -2612,8 +2882,10 @@ def ml_signal_score(htf_data, etf_data, indicators_by_tf, session_score, asset='
             etf_features=build_feature_vector(etf_data,indicators_by_tf.get('etf',{}))
             combined=htf_features+etf_features+[session_score/5.0]
 
-            if len(real_outcomes) >= 20:
-                # Train on REAL outcomes from database
+            win_count_check  = sum(1 for o in real_outcomes if o[1] == 'WIN')
+            loss_count_check = len(real_outcomes) - win_count_check
+            if len(real_outcomes) >= 50 and win_count_check >= 10 and loss_count_check >= 10:
+                # Train on REAL outcomes from database (50+ required for reliable ML)
                 X_real=[]; y_real=[]
                 for row in real_outcomes:
                     score_norm = row[0]/100.0 if row[0] else 0.5
@@ -2741,6 +3013,9 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
 
     for tf in avail:
         candles=candles_by_tf[tf]
+        SYNTHETIC_ASSETS = {'BOOM1000', 'CRASH1000', 'VOL75', 'VOL100'}
+        if asset in SYNTHETIC_ASSETS and tf in ('W1', 'D1'):
+            continue
         candles = candles[-300:] if tf in ('1H', '15M') else candles[-500:]
         
         # Cache candles for reuse within 2 minutes
@@ -2780,9 +3055,15 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         # 5M Wyckoff is noise — proper Wyckoff phases take days to form
         # On 5M, 80 candles = 6.7 hours which is far too short for Wyckoff
         wyckoff = None
-        htf_timeframes = {'D1', '4H'}
-        if tf in htf_timeframes:
+        WYCKOFF_TFS = {'W1', 'D1', '4H', '1H'}
+        if tf in WYCKOFF_TFS:
             wyckoff = detect_wyckoff_phase(candles, sh, sl, atr, vol_profile)
+
+        # Elliott Wave structure (only on HTF — 4H and above)
+        elliott = None
+        ELLIOTT_TFS = {'W1', 'D1', '4H'}
+        if tf in ELLIOTT_TFS:
+            elliott = detect_elliott_structure(candles, sh, sl, atr)
 
         result[tf]={
             'atr':atr,'trend':trend,'ema_trend':ema_trend,'current_price':candles[-1]['close'],
@@ -2794,6 +3075,12 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
             'liquidity':liq,'premium_discount':pd,'indicators':indicators,
             'regime':regime,'volume_profile':vol_profile,'backtest':backtest,
             'wyckoff':wyckoff,
+            'elliott':elliott,
+            'fibonacci': calc_fibonacci_levels(
+                swing_high = max((s['price'] for s in sh[-3:]), default=0) if sh else 0,
+                swing_low  = min((s['price'] for s in sl[-3:]), default=0) if sl else 0,
+                direction  = 'BEARISH' if trend == 'BEARISH' else 'BULLISH',
+            ) if sh and sl else None,
         }
 
     etf_candles=candles_by_tf[etf]
@@ -2809,15 +3096,8 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
 
     # Quantitative Evidence: numbers only, no conclusions
     htf_backtest = result.get(htf, {}).get('backtest', {}) or {}
-    quant_evidence = build_quant_evidence(
-        win_prob   = win_probability if 'win_probability' in dir() else {},
-        trade_exp  = trade_expectancy if 'trade_expectancy' in dir() else {},
-        ml_score   = ml_score,
-        backtest   = htf_backtest,
-    )
 
     # Technical Evidence: all TF analysis structured as facts
-    technical_evidence = build_technical_evidence(result, htf, etf)
 
     # Probability Engine — needs confluence score from ml_score
     confluence_score = ml_score.get('score', 50) if ml_score else 50
@@ -2872,11 +3152,21 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
     )
 
     # Cross-timeframe Wyckoff alignment
+    avail_set = set(avail)
+    if '4H' in avail_set and '1H' in avail_set:
+        wyckoff_compare_htf = result.get('4H', {}).get('wyckoff', {}) or {}
+        wyckoff_compare_etf = result.get('1H', {}).get('wyckoff', {}) or {}
+    elif 'D1' in avail_set and '4H' in avail_set:
+        wyckoff_compare_htf = result.get('D1', {}).get('wyckoff', {}) or {}
+        wyckoff_compare_etf = result.get('4H', {}).get('wyckoff', {}) or {}
+    else:
+        wyckoff_compare_htf = result.get(htf, {}).get('wyckoff', {}) or {}
+        wyckoff_compare_etf = {}
     htf_wyckoff = result.get(htf, {}).get('wyckoff', {}) or {}
     etf_wyckoff = result.get(etf, {}).get('wyckoff', {}) or {}
     wyckoff_aligned = (
-        htf_wyckoff.get('trade_bias') == etf_wyckoff.get('trade_bias')
-        and htf_wyckoff.get('trade_bias') not in (None, 'NEUTRAL', 'INSUFFICIENT DATA')
+        wyckoff_compare_htf.get('trade_bias') == wyckoff_compare_etf.get('trade_bias')
+        and wyckoff_compare_htf.get('trade_bias') not in (None, 'NEUTRAL', 'INSUFFICIENT DATA', '')
     )
 
     # Full risk plan with user's actual account size
@@ -2891,6 +3181,16 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         atr=etf_atr_for_ev,
         account_size=account_size,
         risk_pct=risk_pct,
+    )
+
+    technical_evidence = build_technical_evidence(result, htf, etf)
+
+    htf_backtest = result.get(htf, {}).get('backtest', {}) or {}
+    quant_evidence = build_quant_evidence(
+        win_prob  = win_probability,
+        trade_exp = trade_expectancy,
+        ml_score  = ml_score,
+        backtest  = htf_backtest,
     )
 
     result['_summary'] = {

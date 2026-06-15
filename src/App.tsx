@@ -10,6 +10,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'analysis' | 'architecture'>('analysis');
   const [result, setResult] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [statusMsg, setStatusMsg] = useState('');
   const [archDoc, setArchDoc] = useState<string>('');
 
   useEffect(() => {
@@ -25,7 +26,10 @@ export default function App() {
     setActiveTab('analysis');
 
     try {
+      const controller = new AbortController();
+      const timeoutId  = setTimeout(() => controller.abort(), 120000);
       const response = await fetch('/api/analyze', {
+        signal: controller.signal,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -38,11 +42,16 @@ export default function App() {
         throw new Error(errorData.error || 'Failed to analyze');
       }
 
+      clearTimeout(timeoutId);
       const data = await response.json();
       setResult(data.result);
     } catch (error: any) {
       console.error(error);
-      setResult(`**SYSTEM ERROR**\n\nFailed to complete analysis. \n\n\`${error.message}\`\n\nPlease ensure your configuration and API limits are intact.`);
+      if(error.name === 'AbortError') {
+        setResult('**Request timed out** — Analysis took over 2 minutes. Please try again.');
+      } else {
+        setResult(`**SYSTEM ERROR**\n\nFailed to complete analysis. \n\n\`${error.message}\`\n\nPlease ensure your configuration and API limits are intact.`);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -89,7 +98,7 @@ export default function App() {
             </aside>
 
             <section className="lg:col-span-8 bg-white p-5 sm:p-6 md:p-12 rounded-xl border border-slate-100 shadow-sm min-h-[400px] lg:min-h-[600px] mt-4 lg:mt-0">
-              <AnalysisResult result={result} isLoading={isLoading} />
+              <AnalysisResult result={result} isLoading={isLoading} statusMsg={statusMsg} />
             </section>
           </div>
         ) : (
