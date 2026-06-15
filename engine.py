@@ -159,13 +159,50 @@ def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: di
                 }
 
     # ── Asset-specific macro context (raw facts only, no interpretation) ───────
+        # ── Asset-specific macro context (uses LIVE DATA for XAUUSD) ──────────────
+    live_macro = cross_asset_data.get('live_macro', {}) if cross_asset_data else {}
+    dxy_live   = live_macro.get('dxy', {})
+    us10y_live = live_macro.get('us10y', {})
+
+    # NEW: populate yield_environment field
+    if us10y_live.get('status') == 'OK':
+        fundamental['yield_environment'] = {
+            'source':             'stooq_realtime',
+            'us10y_price':        us10y_live.get('price'),
+            'us10y_change':       us10y_live.get('change_pct'),
+            'us10y_direction':    us10y_live.get('direction'),
+            'raw_fact':           us10y_live.get('raw_fact', ''),
+            'gold_implication':   live_macro.get('yield_gold_implication', ''),
+        }
+
+    # Update DXY environment with live data if available
+    if dxy_live.get('status') == 'OK':
+        fundamental['dxy_environment'] = {
+            'source':          'stooq_realtime',
+            'price':           dxy_live.get('price'),
+            'change_pct':      dxy_live.get('change_pct'),
+            'direction':       dxy_live.get('direction'),
+            'strength':        dxy_live.get('strength'),
+            'raw_fact':        dxy_live.get('raw_fact', ''),
+            'interpretation':  dxy_live.get('interpretation', ''),
+        }
+
+    if asset == 'XAUUSD':
+        dxy_fact   = fundamental.get('dxy_environment', {}).get('raw_fact', 'DXY: unavailable')
+        yield_fact = fundamental.get('yield_environment', {}).get('raw_fact', 'US10Y: unavailable')
+        macro_bias = cross_asset_data.get('macro_bias', 'NEUTRAL') if cross_asset_data else 'NEUTRAL'
+        fundamental['macro_context'] = {
+            'asset':           'XAUUSD',
+            'primary_drivers': ['DXY', 'US10Y real yield', 'risk sentiment', 'CB demand', 'geopolitical'],
+            'live_dxy':        dxy_fact,
+            'live_yields':     yield_fact,
+            'live_macro_bias': macro_bias,
+            'note': (
+                f'Gold priced inversely to USD + real yields. '
+                f'{dxy_fact}. {yield_fact}. Bias: {macro_bias}'
+            ),
+        }
     MACRO_CONTEXT_FACTS = {
-        'XAUUSD': {
-            'primary_drivers': ['USD strength', 'real yields', 'risk sentiment', 'central bank demand', 'geopolitical risk'],
-            'inverse_assets':  ['DXY', 'US10Y yields'],
-            'safe_haven':      True,
-            'note': 'Gold moves inversely with USD and real yields. Safe-haven demand increases in risk-off.',
-        },
         'BTCUSD': {
             'primary_drivers': ['risk appetite', 'institutional flows', 'ETF demand', 'regulatory news', 'macro liquidity'],
             'inverse_assets':  ['DXY'],
@@ -191,11 +228,13 @@ def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: di
             'note': 'USDJPY rises when US yields rise vs Japanese yields. JPY is safe-haven in risk-off.',
         },
     }
-    fundamental['macro_context'] = MACRO_CONTEXT_FACTS.get(asset, {
-        'primary_drivers': ['monetary policy', 'risk sentiment', 'economic data'],
-        'safe_haven': False,
-        'note': 'No specific macro context configured for this asset.',
-    })
+
+    if asset != 'XAUUSD':
+        fundamental['macro_context'] = MACRO_CONTEXT_FACTS.get(asset, {
+            'primary_drivers': ['monetary policy', 'risk sentiment', 'economic data'],
+            'safe_haven': False,
+            'note': 'No specific macro context configured for this asset.',
+        })
 
     return fundamental
 
@@ -2085,27 +2124,266 @@ TIMEFRAME_GRANULARITIES = {
     '5M':  300,     # 5 minutes
 }
 
+
+# ── Stooq Free Quotes (no API key required) ───────────────────────────────────
+_stooq_cache: dict = {}
+_stooq_cache_time: dict = {}
+STOOQ_CACHE_TTL = 300  # 5 minutes
+
+def fetch_stooq_price(symbol: str) -> dict:
+    """Fetch price and daily change from stooq.com. Free, no API key."""
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if (symbol in _stooq_cache and
+            (now_ts - _stooq_cache_time.get(symbol, 0)) < STOOQ_CACHE_TTL):
+        return _stooq_cache[symbol]
+
+    result = {
+        'status': 'UNAVAILABLE', 'symbol': symbol,
+        'price': None, 'prev_close': None, 'change_pct': None,
+        'direction': 'UNKNOWN', 'strength': 'UNKNOWN',
+        'raw_fact': f'{symbol}: data unavailable',
+    }
+    try:
+        url = f'https://stooq.com/q/d/l/?s={symbol}&i=d'
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        with urlopen(req, timeout=10) as resp:
+            text = resp.read().decode('utf-8', errors='replace')
+        lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+        if len(lines) < 3:
+            _stooq_cache[symbol] = result
+            _stooq_cache_time[symbol] = now_ts
+            return result
+        def parse_row(row):
+            parts = row.split(',')
+            return float(parts[4]) if len(parts) >= 5 else None
+        current_close  = parse_row(lines[-1])
+        previous_close = parse_row(lines[-2]) if len(lines) >= 3 else None
+        if current_close is None:
+            _stooq_cache[symbol] = result
+            _stooq_cache_time[symbol] = now_ts
+            return result
+        change_pct = None
+        direction = 'FLAT'
+        strength = 'WEAK'
+        if previous_close and previous_close != 0:
+            change_pct = round((current_close - previous_close) / previous_close * 100, 3)
+            if   change_pct >  0.5: direction = 'UP';   strength = 'STRONG'
+            elif change_pct >  0.1: direction = 'UP';   strength = 'MODERATE'
+            elif change_pct < -0.5: direction = 'DOWN'; strength = 'STRONG'
+            elif change_pct < -0.1: direction = 'DOWN'; strength = 'MODERATE'
+            else:                   direction = 'FLAT';  strength = 'WEAK'
+        result.update({
+            'status': 'OK', 'price': round(current_close, 4),
+            'prev_close': round(previous_close, 4) if previous_close else None,
+            'change_pct': change_pct, 'direction': direction, 'strength': strength,
+            'raw_fact': (
+                f'{symbol}: {current_close:.4f} ({change_pct:+.3f}%) [{direction}/{strength}]'
+                if change_pct is not None else f'{symbol}: {current_close:.4f}'
+            ),
+        })
+    except Exception as e:
+        result['error'] = str(e)
+    _stooq_cache[symbol] = result
+    _stooq_cache_time[symbol] = now_ts
+    return result
+
+
+
+def fetch_twelve_data_price(symbol: str) -> dict:
+    api_key = os.environ.get('TWELVEDATA_API_KEY')
+    if not api_key:
+        return fetch_stooq_price('^DXY' if symbol == 'DXY' else symbol)
+
+    cache_key = 'twelve_' + symbol
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if (cache_key in _stooq_cache and
+            (now_ts - _stooq_cache_time.get(cache_key, 0)) < STOOQ_CACHE_TTL):
+        return _stooq_cache[cache_key]
+
+    result = {
+        'status': 'UNAVAILABLE', 'symbol': symbol,
+        'price': None, 'prev_close': None, 'change_pct': None,
+        'direction': 'UNKNOWN', 'strength': 'UNKNOWN',
+        'raw_fact': f'{symbol}: data unavailable',
+    }
+    try:
+        from urllib.parse import quote
+        url = f'https://api.twelvedata.com/quote?symbol={quote(symbol)}&apikey={api_key}'
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        if 'code' in data and data['code'] != 200:
+            raise Exception(data.get('message', 'Twelve Data Error'))
+        if 'close' not in data:
+            raise Exception('Invalid Twelve Data response')
+
+        current_close = float(data['close'])
+        previous_close = float(data.get('previous_close', current_close))
+        change_pct = float(data.get('percent_change', 0))
+
+        direction = 'FLAT'
+        strength = 'WEAK'
+        if change_pct > 0.5: direction = 'UP'; strength = 'STRONG'
+        elif change_pct > 0.1: direction = 'UP'; strength = 'MODERATE'
+        elif change_pct < -0.5: direction = 'DOWN'; strength = 'STRONG'
+        elif change_pct < -0.1: direction = 'DOWN'; strength = 'MODERATE'
+
+        result.update({
+            'status': 'OK', 'price': round(current_close, 4),
+            'prev_close': round(previous_close, 4),
+            'change_pct': round(change_pct, 3), 'direction': direction, 'strength': strength,
+            'raw_fact': f'{symbol}: {current_close:.4f} ({change_pct:+.3f}%) [{direction}/{strength}]'
+        })
+    except Exception as e:
+        result['error'] = str(e)
+
+    _stooq_cache[cache_key] = result
+    _stooq_cache_time[cache_key] = now_ts
+    return result
+
+
+def fetch_fred_data(series_id: str) -> dict:
+    api_key = os.environ.get('FRED_API_KEY')
+    if not api_key:
+        v = '10USY.B' if series_id == 'DGS10' else '2USY.B'
+        return fetch_stooq_price(v)
+
+    cache_key = 'fred_' + series_id
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if (cache_key in _stooq_cache and
+            (now_ts - _stooq_cache_time.get(cache_key, 0)) < STOOQ_CACHE_TTL):
+        return _stooq_cache[cache_key]
+
+    result = {
+        'status': 'UNAVAILABLE', 'symbol': series_id,
+        'price': None, 'prev_close': None, 'change_pct': None,
+        'direction': 'UNKNOWN', 'strength': 'UNKNOWN',
+        'raw_fact': f'{series_id}: data unavailable',
+    }
+
+    try:
+        url = f'https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&sort_order=desc&limit=2'
+        req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        obs = data.get('observations', [])
+        if not obs or len(obs) == 0:
+            raise Exception('No observations array')
+
+        # Find first valid observation
+        valid_obs = [o for o in obs if o['value'] != '.']
+        if len(valid_obs) == 0:
+            raise Exception('No valid data points found in FRED response')
+
+        current_val = float(valid_obs[0]['value'])
+        prev_val = float(valid_obs[1]['value']) if len(valid_obs) > 1 else current_val
+
+        change_pct = 0
+        if prev_val and prev_val != 0:
+            change_pct = (current_val - prev_val) / prev_val * 100
+
+        direction = 'FLAT'
+        strength = 'WEAK'
+        if change_pct > 0.5: direction = 'UP'; strength = 'STRONG'
+        elif change_pct > 0.1: direction = 'UP'; strength = 'MODERATE'
+        elif change_pct < -0.5: direction = 'DOWN'; strength = 'STRONG'
+        elif change_pct < -0.1: direction = 'DOWN'; strength = 'MODERATE'
+
+        result.update({
+            'status': 'OK', 'price': round(current_val, 4),
+            'prev_close': round(prev_val, 4),
+            'change_pct': round(change_pct, 3), 'direction': direction, 'strength': strength,
+            'raw_fact': f'{series_id}: {current_val:.4f} ({change_pct:+.3f}%) [{direction}/{strength}]'
+        })
+    except Exception as e:
+        result['error'] = str(e)
+
+    _stooq_cache[cache_key] = result
+    _stooq_cache_time[cache_key] = now_ts
+    return result
+
+def fetch_dxy_live() -> dict:
+
+    """Real DXY (US Dollar Index) from stooq. DXY UP = Gold bearish pressure."""
+    data = fetch_twelve_data_price('DXY')
+    if data['status'] == 'OK':
+        data['interpretation'] = (
+            f"DXY is {data['direction']} ({data['change_pct']:+.3f}% today). "
+            + ('USD strengthening — headwind for Gold and risk assets.'
+               if data['direction'] == 'UP' else
+               'USD weakening — tailwind for Gold, EUR, GBP.'
+               if data['direction'] == 'DOWN' else
+               'USD stable — neutral macro impact.')
+        )
+    return data
+
+
+def fetch_us_yields_live() -> dict:
+    """Real US10Y and US02Y Treasury yields from stooq. Rising yields = Gold headwind."""
+    us10y = fetch_fred_data('DGS10')
+    us02y = fetch_fred_data('DGS2')
+    result = {
+        'status': 'PARTIAL', 'us10y': us10y, 'us02y': us02y,
+        'spread': None, 'curve': 'UNKNOWN',
+        'raw_fact': 'Yield data unavailable',
+        'gold_implication': 'Unknown yield impact on Gold',
+    }
+    if us10y['status'] == 'OK' and us02y['status'] == 'OK':
+        result['status'] = 'OK'
+        spread = round((us10y['price'] or 0) - (us02y['price'] or 0), 4)
+        result['spread'] = spread
+        result['curve']  = 'NORMAL' if spread > 0 else 'INVERTED'
+        yield_direction  = us10y.get('direction', 'FLAT')
+        result['gold_implication'] = (
+            f"US10Y at {us10y['price']}% ({us10y['change_pct']:+.3f}% today). "
+            + ('RISING yields = higher USD real return = bearish pressure on Gold.'
+               if yield_direction == 'UP' else
+               'FALLING yields = lower USD real return = bullish for Gold.'
+               if yield_direction == 'DOWN' else
+               'STABLE yields = neutral yield impact on Gold.')
+            + f' Curve: {result["curve"]} (spread: {spread:+.4f}%)'
+        )
+        result['raw_fact'] = (
+            f'US10Y: {us10y["price"]}% ({us10y["change_pct"]:+.3f}%) | '
+            f'US02Y: {us02y["price"]}% ({us02y["change_pct"]:+.3f}%) | '
+            f'Curve: {result["curve"]} ({spread:+.4f}%)'
+        )
+    elif us10y['status'] == 'OK':
+        result['status'] = 'PARTIAL'
+        result['raw_fact'] = f'US10Y: {us10y["price"]}% ({us10y["change_pct"]:+.3f}%)'
+        result['gold_implication'] = (
+            'RISING yields = bearish Gold pressure.' if us10y.get('direction') == 'UP' else
+            'FALLING yields = bullish Gold support.'  if us10y.get('direction') == 'DOWN' else
+            'Stable yields — neutral impact.'
+        )
+    return result
+
 # Cross-asset symbol mappings on Deriv
+# DXY and US yields now come from stooq.com (real data) — not Deriv proxies
+# Deriv is still used for supplementary risk proxies
 CROSS_ASSET_SYMBOLS = {
     'XAUUSD': {
-        'DXY':   'frxUSDJPY',   # USD proxy — JPY is inverse of DXY direction
-        'DXY2':  'frxUSDCHF',   # Second USD proxy
-        'RISK':  'frxAUDUSD',   # Risk-on proxy — AUD goes up in risk-on
+        'RISK':  'frxAUDUSD',   # Risk-on/off proxy
+        'OIL':   'frxUSOIL',    # Crude — inflation proxy (if available on Deriv)
     },
     'XAGUSD': {
-        'DXY':   'frxUSDJPY',
         'RISK':  'frxAUDUSD',
     },
     'BTCUSD': {
-        'RISK':  'frxAUDUSD',   # BTC correlated with risk appetite
+        'RISK':  'frxAUDUSD',
         'DXY':   'frxUSDJPY',
     },
     'EURUSD': {
-        'DXY':   'frxUSDJPY',   # EUR inverse of USD
+        'DXY':   'frxUSDJPY',
         'DXY2':  'frxUSDCHF',
     },
     'GBPUSD': {
         'DXY':   'frxUSDJPY',
+        'RISK':  'frxAUDUSD',
+    },
+    'USDJPY': {
         'RISK':  'frxAUDUSD',
     },
 }
@@ -2117,98 +2395,151 @@ CROSS_ASSET_CACHE_TTL = 300  # 5 minutes
 
 
 def fetch_cross_asset_data(asset: str) -> dict:
-    """
-    Fetch correlated assets from Deriv to build macro context.
-    Returns momentum direction for each correlated asset.
-    Uses 20 candles of 1H data for macro context.
-    """
     cache_key = asset
     now_ts = datetime.now(timezone.utc).timestamp()
     if (cache_key in _cross_asset_cache and
             (now_ts - _cross_asset_cache_time.get(cache_key, 0)) < CROSS_ASSET_CACHE_TTL):
         return _cross_asset_cache[cache_key]
 
-    symbols = CROSS_ASSET_SYMBOLS.get(asset, {})
-    if not symbols:
-        return {'status': 'NOT_CONFIGURED', 'correlations': []}
+    result = {
+        'status': 'OK', 'asset': asset,
+        'correlations': [], 'macro_bias': 'NEUTRAL', 'live_macro': {},
+    }
 
-    result = {'status': 'OK', 'asset': asset, 'correlations': [], 'macro_bias': 'NEUTRAL'}
+    td_key = os.environ.get('TWELVEDATA_API_KEY')
+    fred_key = os.environ.get('FRED_API_KEY')
 
-    for role, symbol in symbols.items():
-        try:
-            url = (f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
-                   f'&end=latest&count=20&style=candles&granularity=3600&app_id=1089')
-            req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-            candles = data.get('candles', [])
-            if len(candles) < 5:
-                continue
+    # Fetch foundational macro fields
+    dxy = fetch_twelve_data_price('DXY') if td_key else fetch_stooq_price('^DXY')
+    us10y = fetch_fred_data('DGS10') if fred_key else fetch_stooq_price('10USY.B')
+    us02y = fetch_fred_data('DGS2') if fred_key else fetch_stooq_price('2USY.B')
 
-            # Calculate momentum: compare current close to 10-candle average
-            closes   = [float(c['close']) for c in candles]
-            current  = closes[-1]
-            avg_10   = sum(closes[-10:]) / 10
-            pct_from_avg = round((current - avg_10) / avg_10 * 100, 3)
-            direction = 'UP' if pct_from_avg > 0.05 else 'DOWN' if pct_from_avg < -0.05 else 'FLAT'
+    # Add DXY
+    if dxy['status'] == 'OK':
+        result['correlations'].append({
+            'role': 'DXY', 'symbol': 'DXY', 'source': 'twelvedata' if td_key else 'stooq',
+            'current': dxy['price'], 'direction': dxy['direction'],
+            'pct_change': dxy['change_pct'], 'strength': dxy['strength'],
+            'raw_fact': dxy['raw_fact'],
+        })
 
-            # High/low range for context
-            highs = [float(c['high']) for c in candles[-10:]]
-            lows  = [float(c['low'])  for c in candles[-10:]]
-            rng   = max(highs) - min(lows)
-            momentum_strength = 'STRONG' if abs(pct_from_avg) > 0.3 else 'MODERATE' if abs(pct_from_avg) > 0.1 else 'WEAK'
+    # Add US10Y
+    if us10y['status'] == 'OK':
+        result['correlations'].append({
+            'role': 'US10Y', 'symbol': 'DGS10' if fred_key else '10USY.B', 'source': 'fred' if fred_key else 'stooq',
+            'current': us10y['price'], 'direction': us10y['direction'],
+            'pct_change': us10y['change_pct'], 'strength': us10y['strength'],
+            'raw_fact': us10y['raw_fact'],
+        })
 
+    if us02y['status'] == 'OK':
+        result['correlations'].append({
+            'role': 'US02Y', 'symbol': 'DGS2' if fred_key else '2USY.B', 'source': 'fred' if fred_key else 'stooq',
+            'current': us02y['price'], 'direction': us02y['direction'],
+            'pct_change': us02y['change_pct'], 'strength': us02y['strength'],
+            'raw_fact': us02y['raw_fact'],
+        })
+
+    # Additional Twelve Data / FRED metrics if keys available
+    if td_key:
+        for t_sym, role in [('VIX', 'VIX'), ('SPX', 'SP500'), ('IXIC', 'NASDAQ'), ('WTX/USD', 'OIL')]:
+            t_data = fetch_twelve_data_price(t_sym)
+            if t_data['status'] == 'OK':
+                result['correlations'].append({
+                    'role': role, 'symbol': t_sym, 'source': 'twelvedata',
+                    'current': t_data['price'], 'direction': t_data['direction'],
+                    'pct_change': t_data['change_pct'], 'strength': t_data['strength'],
+                    'raw_fact': t_data['raw_fact']
+                })
+    if fred_key:
+        rates = fetch_fred_data('DFF')
+        if rates['status'] == 'OK':
             result['correlations'].append({
-                'role':       role,
-                'symbol':     symbol,
-                'current':    round(current, 5),
-                'direction':  direction,
-                'pct_change': pct_from_avg,
-                'strength':   momentum_strength,
+                'role': 'RATES', 'symbol': 'DFF', 'source': 'fred',
+                'current': rates['price'], 'direction': rates['direction'],
+                'pct_change': rates['change_pct'], 'strength': rates['strength'],
+                'raw_fact': rates['raw_fact']
             })
 
-        except Exception as e:
-            result['correlations'].append({
-                'role': role, 'symbol': symbol,
-                'direction': 'UNAVAILABLE', 'error': str(e)
-            })
+    # Fallback to Deriv if no keys
+    if not td_key:
+        symbols = CROSS_ASSET_SYMBOLS.get(asset, {})
+        for role, symbol in symbols.items():
+            if role in ['DXY', 'US10Y', 'US02Y']: continue
+            try:
+                url = (f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
+                       f'&end=latest&count=20&style=candles&granularity=3600&app_id=1089')
+                req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                candles = data.get('candles', [])
+                if len(candles) < 5:
+                    continue
+                closes = [float(c['close']) for c in candles]
+                current = closes[-1]
+                avg_10  = sum(closes[-10:]) / 10
+                pct     = round((current - avg_10) / avg_10 * 100, 3)
+                direction = 'UP' if pct > 0.05 else 'DOWN' if pct < -0.05 else 'FLAT'
+                strength  = 'STRONG' if abs(pct) > 0.3 else 'MODERATE' if abs(pct) > 0.1 else 'WEAK'
+                result['correlations'].append({
+                    'role': role, 'symbol': symbol, 'source': 'deriv', 'current': round(current, 5),
+                    'direction': direction, 'pct_change': pct, 'strength': strength,
+                })
+            except Exception as e:
+                pass
 
-    # Interpret macro bias for Gold specifically
+    # Build macro bias summary
+    dxy_up    = dxy.get('direction') == 'UP'
+    yields_up = us10y.get('direction') == 'UP'
+    dxy_pct   = dxy.get('change_pct') or 0
+    y10_pct   = us10y.get('change_pct') or 0
+
+    risk_up = any(c.get('role') in ['SP500', 'NASDAQ', 'RISK'] and c.get('direction') == 'UP' for c in result['correlations'])
+
     if asset in ('XAUUSD', 'XAGUSD'):
-        dxy_data  = next((c for c in result['correlations'] if c['role'] == 'DXY'), None)
-        risk_data = next((c for c in result['correlations'] if c['role'] == 'RISK'), None)
-
-        # USD proxy (USDJPY): if USDJPY UP = USD strong = Gold bearish pressure
-        # Risk proxy (AUDUSD): if AUD DOWN = risk-off = Gold should get safe-haven bid
-        dxy_bearish_gold  = dxy_data  and dxy_data['direction']  == 'UP'    # USD strong
-        risk_off_gold_bid = risk_data and risk_data['direction'] == 'DOWN'  # risk-off
-
-        if dxy_bearish_gold and not risk_off_gold_bid:
-            macro_bias = 'BEARISH (USD strengthening, no safe-haven bid)'
-        elif risk_off_gold_bid and not dxy_bearish_gold:
-            macro_bias = 'BULLISH (risk-off environment, safe-haven demand)'
-        elif dxy_bearish_gold and risk_off_gold_bid:
-            macro_bias = 'MIXED (USD strong but risk-off — conflicting signals)'
-        elif not dxy_bearish_gold and not risk_off_gold_bid:
-            macro_bias = 'BULLISH (USD weakening, risk-on not negative for gold)'
-        else:
-            macro_bias = 'NEUTRAL'
-
-        result['macro_bias'] = macro_bias
-
-    elif asset in ('BTCUSD', 'ETHUSD'):
-        risk_data = next((c for c in result['correlations'] if c['role'] == 'RISK'), None)
-        if risk_data:
+        if dxy_up and yields_up and not risk_up:
             result['macro_bias'] = (
-                'BULLISH macro (risk-on)' if risk_data['direction'] == 'UP' else
-                'BEARISH macro (risk-off)' if risk_data['direction'] == 'DOWN' else
-                'NEUTRAL macro'
+                f'BEARISH for Gold — DXY {dxy_pct:+.2f}% + US10Y {y10_pct:+.2f}% both rising. '
+                f'USD strength + rising real yields = classic Gold headwind.'
             )
+        elif not dxy_up and not yields_up:
+            result['macro_bias'] = (
+                f'BULLISH for Gold — DXY {dxy_pct:+.2f}% + US10Y {y10_pct:+.2f}% both falling. '
+                f'Weaker USD + falling yields = tailwind for Gold.'
+            )
+        elif dxy_up and not yields_up:
+            result['macro_bias'] = f'MIXED — DXY {dxy_pct:+.2f}% (headwind) but US10Y {y10_pct:+.2f}% (supportive). '
+        elif not dxy_up and yields_up:
+            result['macro_bias'] = f'MIXED — DXY {dxy_pct:+.2f}% (supportive) but US10Y {y10_pct:+.2f}% (headwind). '
+        else:
+            result['macro_bias'] = f'NEUTRAL — DXY {dxy_pct:+.2f}% US10Y {y10_pct:+.2f}%. No clear direction.'
+    elif asset in ('BTCUSD', 'ETHUSD', 'SOLUSD'):
+        result['macro_bias'] = (
+            'BULLISH macro (risk-on)' if risk_up else
+            'BEARISH macro (risk-off)' if not risk_up else
+            'NEUTRAL macro'
+        )
+    elif asset in ('EURUSD', 'GBPUSD', 'AUDUSD', 'NZDUSD'):
+        result['macro_bias'] = (
+            f'BEARISH (DXY strengthening {dxy_pct:+.3f}%)' if dxy_up else
+            f'BULLISH (DXY weakening {dxy_pct:+.3f}%)'
+        )
+
+    # Put live_macro for XAUUSD fallback handling
+    result['live_macro'] = {
+        'dxy': dxy,
+        'us10y': us10y,
+        'us02y': us02y
+    }
+    spread = None
+    if us10y['status'] == 'OK' and us02y['status'] == 'OK':
+        spread = round((us10y['price'] or 0) - (us02y['price'] or 0), 4)
+        result['live_macro']['yield_spread'] = spread
+        result['live_macro']['yield_curve'] = 'NORMAL' if spread > 0 else 'INVERTED'
 
     _cross_asset_cache[cache_key] = result
     _cross_asset_cache_time[cache_key] = now_ts
     return result
-
 
 def detect_wyckoff_phase(candles, swing_highs, swing_lows, atr, volume_profile):
     """

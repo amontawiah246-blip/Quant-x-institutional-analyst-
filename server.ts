@@ -90,7 +90,7 @@ function runPythonOperation(payload: Record<string,any>): Promise<any> {
   return new Promise((resolve) => {
     const enginePath = path.join(process.cwd(), 'engine.py');
     const pythonCmd  = process.platform === 'win32' ? 'python' : 'python3';
-    const proc = spawn(pythonCmd, [enginePath], {timeout:45000});
+    const proc = spawn(pythonCmd, [enginePath], {timeout:15000});
     let stdout='', stderr='';
     proc.stdout.on('data',(d:Buffer)=>{ stdout+=d.toString(); });
     proc.stderr.on('data',(d:Buffer)=>{ stderr+=d.toString(); });
@@ -111,10 +111,12 @@ function runPythonEngine(candlesByTF:Record<string,Candle[]>, asset:string, acco
 
 // ─── RSS NEWS FETCHER ─────────────────────────────────────────────────────────
 const RSS_SOURCES: Record<string, {url:string; name:string}[]> = {
-  XAUUSD: [
-    {url:'https://www.forexlive.com/feed/news',         name:'ForexLive'},
-    {url:'https://www.dailyfx.com/feeds/market-news',   name:'DailyFX'},
-    {url:'https://www.fxstreet.com/rss/news',           name:'FXStreet'},
+    XAUUSD: [
+    {url:'https://www.forexlive.com/feed/news',              name:'ForexLive'},
+    {url:'https://www.dailyfx.com/feeds/market-news',        name:'DailyFX'},
+    {url:'https://www.fxstreet.com/rss/news',                name:'FXStreet'},
+    {url:'https://www.kitco.com/rss/kitconews.xml',          name:'Kitco'},
+    {url:'https://www.investing.com/rss/news_301.rss',       name:'Investing.com'},
   ],
   XAGUSD: [
     {url:'https://www.forexlive.com/feed/news',         name:'ForexLive'},
@@ -303,7 +305,10 @@ Answer 3 questions:
 
   for(const model of models) {
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
       const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        signal: controller.signal,
         method:'POST',
         headers:{
           'Authorization':`Bearer ${process.env.OPENROUTER_API_KEY}`,
@@ -313,6 +318,7 @@ Answer 3 questions:
         },
         body:JSON.stringify({model, messages:[{role:'user',content:prompt}], temperature:0.1, max_tokens:500}),
       });
+      clearTimeout(timeoutId);
       if(!resp.ok) {
         console.log(`OpenRouter ${model} returned ${resp.status}, trying next...`);
         continue;
@@ -338,6 +344,7 @@ async function callGitHubModel(
   const client = new OpenAI({
     baseURL: 'https://models.inference.ai.azure.com',
     apiKey: token,
+    timeout: 15000,
   });
   const response = await client.chat.completions.create({
     model,
@@ -372,23 +379,52 @@ function formatEngineResults(engineData:any): string {
     }
   }
   // Sentiment Intelligence
-  if(s.sentiment_intel?.status==='OK'){
+    if(s.sentiment_intel?.status==='OK'){
     const si = s.sentiment_intel;
     block += `\nSENTIMENT INTELLIGENCE:\n`;
-    block += `  Overall: ${si.sentiment_label} (score:${si.overall_score}) | Bull:${si.bullish_count} Bear:${si.bearish_count} Neutral:${si.neutral_count}\n`;
-    block += `  Note: ${si.note}\n`;
+    if(si.ai_interpreted) {
+      block += `  AI Sentiment: ${si.ai_sentiment_label} (score:${si.ai_sentiment_score}) [Confidence:${si.ai_confidence}]\n`;
+      block += `  Keyword Baseline: ${si.keyword_sentiment_label} (score:${si.keyword_score})\n`;
+      if(si.sentiment_divergence !== 'ALIGNED') block += `  ⚠️ ${si.sentiment_divergence}\n`;
+      if(si.trap_detected) block += `  🪤 TRAP: ${si.trap_explanation}\n`;
+      if(si.priced_in_assessment) block += `  Priced-In: ${si.priced_in_assessment}\n`;
+      if(si.actionable_headlines?.length){
+        block += `  ACTIONABLE:\n`;
+        si.actionable_headlines.slice(0,3).forEach((h:string) => block += `    ✓ "${h}"\n`);
+      }
+      if(si.noise_headlines?.length){
+        block += `  NOISE (priced-in):\n`;
+        si.noise_headlines.slice(0,2).forEach((h:string) => block += `    ~ "${h}"\n`);
+      }
+      if(si.ai_sentiment_note) block += `  AI Note: ${si.ai_sentiment_note}\n`;
+    } else {
+      block += `  Overall: ${si.sentiment_label} (score:${si.overall_score}) | Bull:${si.bullish_count} Bear:${si.bearish_count}\n`;
+      block += `  Note: ${si.note}\n`;
+    }
     if(si.breaking_items?.length){
       block += `  BREAKING:\n`;
-      si.breaking_items.slice(0,3).forEach((item:any) => {
-        block += `    [${item.age_minutes}min | ${item.source}] "${item.title}" → ${item.sentiment} (${item.score})\n`;
-      });
+      si.breaking_items.slice(0,3).forEach((item:any) =>
+        block += `    [${item.age_minutes}min] "${item.title}" → ${item.sentiment}\n`
+      );
     }
-    if(si.scored_headlines?.length){
+    if(!si.ai_interpreted && si.scored_headlines?.length){
       block += `  TOP HEADLINES:\n`;
       si.scored_headlines.slice(0,5).forEach((item:any) => {
         if(!item.is_breaking) block += `    [${item.source}] "${item.title}" → ${item.sentiment}\n`;
       });
     }
+  }
+
+  // NEW: Show DXY + Yield environment in formatEngineResults
+  if(s.fundamental_intel?.dxy_environment?.raw_fact) {
+    const dxy_env = s.fundamental_intel.dxy_environment;
+    block += `\nLIVE DXY: ${dxy_env.raw_fact}\n`;
+    if(dxy_env.interpretation) block += `  ${dxy_env.interpretation}\n`;
+  }
+  if(s.fundamental_intel?.yield_environment?.raw_fact) {
+    const y_env = s.fundamental_intel.yield_environment;
+    block += `\nLIVE YIELDS: ${y_env.raw_fact}\n`;
+    if(y_env.gold_implication) block += `  ${y_env.gold_implication}\n`;
   }
 
   // Fundamental Intelligence
@@ -592,33 +628,98 @@ QUANTITATIVE REVIEW:
 - Does the confluence score (from rule-based engine) agree with your qualitative assessment?
 
 ═══════════════════════════════════════════════════════
-CONTRADICTION DETECTION — CRITICAL
+CONTRADICTION DETECTION — CROSS-EXAMINATION ENGINE
 ═══════════════════════════════════════════════════════
 
-Before deciding, explicitly check for these contradictions:
+Before delivering a verdict, run this 3-layer cross-examination explicitly.
 
-TECHNICAL vs FUNDAMENTAL:
-- Technical says BUY + DXY strengthening for Gold = contradiction (fundamental headwind)
-- Technical says SELL + major CPI beat (dollar positive) = aligned
-- Technical says BUY + NFP in 10 minutes = WAIT (event risk overrides technical)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LAYER 1 — TECHNICAL vs MACRO (use LIVE NUMBERS)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-TECHNICAL vs SENTIMENT:
-- Strong bearish structure + strongly bullish news sentiment = possible trap
-  (Smart money distributes into positive news, not against it)
-- Strong bullish structure + strongly bearish news = possible spring setup
-  (Smart money accumulates while retail panics from bad news)
+Always cite actual DXY % and US10Y % from the live macro section. Never write "DXY is strengthening" without the number.
 
-MOMENTUM vs STRUCTURE:
-- HTF TRENDING_STRONG bearish + ETF showing bullish CHoCH = LTF retracement
-  (NOT a reversal — this is where retail longs get trapped)
-- RSI oversold + downtrend = exhaustion warning, NOT a buy signal
-  (In strong trends, RSI can stay oversold for extended periods)
+GOLD CROSS-EXAMINATION:
+- BUY + DXY UP + US10Y UP = CONTRADICTION (headwind). WAIT or reduce size.
+- BUY + DXY DOWN + US10Y DOWN = ALIGNED (tailwind). Highest conviction long.
+- BUY + DXY DOWN + US10Y UP = MIXED (partial headwind). Reduce size 50%.
+- BUY + DXY UP + US10Y DOWN = MIXED (partial headwind). Cautious.
+- SELL + DXY UP + US10Y UP = ALIGNED. Highest conviction short.
+- SELL + DXY DOWN + US10Y DOWN = CONTRADICTION. Avoid shorting into macro tailwind.
 
-WYCKOFF vs PRICE ACTION:
-- Wyckoff says DISTRIBUTION + price making new highs = Upthrust forming
-  (High-probability short setup if confirmed)
-- Wyckoff says ACCUMULATION + price making new lows = Spring forming
-  (High-probability long setup if confirmed)
+STATE EXPLICITLY: "DXY is [direction] [X.XX]% today. US10Y is [direction] [X.XX]%.
+This is [ALIGNED WITH / CONTRADICTING] the [BUY/SELL] technical signal."
+
+If macro data is unavailable: "Macro data unavailable — treating as NEUTRAL. Conviction reduced."
+
+FOR FOREX PAIRS:
+- DXY UP = headwind for EUR/GBP/AUD, tailwind for USDJPY/USDCAD
+- Always state: "DXY [direction] means [pair] faces [tailwind/headwind]"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LAYER 2 — SENTIMENT CROSS-EXAMINATION (Priced-In Test)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Check sentiment_intel for:
+- ai_interpreted = TRUE → use ai_sentiment_label (more accurate than keyword score)
+- trap_detected = TRUE → "Smart money may be distributing into positive headlines"
+- sentiment_divergence != ALIGNED → "Keywords say X but AI says Y — items are priced-in"
+- priced_in_assessment → quote it directly
+
+IF ai_interpreted = FALSE (keyword scoring only), apply these manual rules:
+- "Fed stays hawkish" after 3+ hawkish meetings = PRICED_IN
+- "Gold surges on safe-haven demand" if geopolitical risk was ongoing = PRICED_IN
+- "Emergency cut/hike" or "surprise GDP" = GENUINE
+- Headlines describing past moves = PRICED_IN
+
+STATE EXPLICITLY:
+"AI sentiment: [label]. [X] headlines actionable. [Y] headlines priced-in or noise.
+[TRAP DETECTED / No trap.] Net sentiment impact: [SUPPORTS/CONTRADICTS/NEUTRAL]."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LAYER 3 — CALENDAR RISK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Events within 30 minutes = HARD WAIT (no exceptions): NFP, CPI, FOMC, GDP, PCE, Fed speech
+Events within 60 minutes = WAIT, reduce size: ISM PMI, Retail Sales, ADP, PPI
+
+SURPRISE INTERPRETATION FOR GOLD:
+- CPI BEAT (actual > forecast) → USD bullish → Gold bearish pressure
+- CPI MISS (actual < forecast) → USD bearish → Gold bullish support
+- NFP BEAT → USD bullish → Gold bearish pressure
+- NFP MISS → USD bearish → Gold bullish support
+
+STATE: "[Event] at [actual] vs [forecast] = [BEAT/MISS]. For ${asset}: [specific implication]."
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CROSS-EXAMINATION VERDICT OUTPUT (MANDATORY FORMAT)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After all three layers, output this explicit grid:
+
+CROSS-EXAMINATION:
+Technical: [BUY/SELL/NONE] → [aligned/conflict]
+Macro (Live): [DXY X% + 10Y X%] → [supports/opposes]
+Sentiment: [AI label, priced-in summary] → [supports/opposes/neutral]
+Calendar: [CLEAR / EVENT in Xmin] → [go/wait/avoid]
+CONTRADICTION LEVEL: NONE / MINOR / MODERATE / SEVERE
+
+NONE = all layers aligned → highest conviction
+MINOR = one layer mildly opposed → reduce size, proceed
+MODERATE = one layer strongly OR two mildly opposed → WAIT for resolution
+SEVERE = two+ layers strongly opposed → AVOID regardless of technical quality
+
+When MODERATE or SEVERE: name the contradiction, explain which side dominates,
+give the exact condition that resolves it.
+
+Example output:
+"MODERATE CONTRADICTION:
+Technical: BUY — CHoCH on 15M, OB at 3285-3288, price in discount
+Macro: BEARISH — DXY +0.42% today, US10Y +8bps to 4.31% (rising yields = headwind)
+Sentiment: Bullish headlines but AI says PRICED_IN (rate cut hope story is 3 weeks old)
+Calendar: CLEAR (next USD event in 4h)
+VERDICT: WAIT — Valid technical setup but macro headwind reduces conviction.
+Enter if DXY drops back below yesterday's close and US10Y pulls below 4.25%."
 
 ═══════════════════════════════════════════════════════
 PROBABILITY RULES FOR EXECUTION PLAN
@@ -873,6 +974,7 @@ async function startServer() {
       if(!process.env.GEMINI_API_KEY) return res.status(500).json({error:'GEMINI_API_KEY not configured.'});
       const derivSymbol = DERIV_SYMBOLS[asset];
       if(!derivSymbol) return res.status(400).json({error:`No Deriv symbol: ${asset}`});
+      const ai = new GoogleGenAI({apiKey:process.env.GEMINI_API_KEY as string});
 
       // 1. Fetch candles
       const isSynthetic = SYNTHETICS.has(derivSymbol);
@@ -919,14 +1021,100 @@ async function startServer() {
       const newsBlock            = formatNewsBlock(newsData as any, asset);
       const openRouterReasoning  = await fetchOpenRouterReasoning(asset, engineData, etfCandles, newsBlock);
 
-      // Pass news items to Python for sentiment scoring
-      // Python scores keywords, AI interprets meaning and context
+            // ── Tier 1: Python keyword sentiment (fast baseline) ──────────────────
       const sentimentResult = await runPythonOperation({
         operation:  'score_sentiment',
         news_items: (newsData as any).items || [],
-        asset,
+        asset:      asset,
       });
-      const sentimentIntel = sentimentResult?.error ? null : sentimentResult;
+      let sentimentIntel = sentimentResult?.error ? null : sentimentResult;
+
+      // ── Tier 2: AI Sentiment Interpretation (priced-in detection) ─────────
+      const headlines = (newsData as any).items || [];
+      if (headlines.length > 0 && process.env.GEMINI_API_KEY && sentimentIntel) {
+        try {
+          const headlineBlock = headlines
+            .slice(0, 10)
+            .map((h: any, i: number) =>
+              `${i+1}. [${h.ageMinutes}min ago | ${h.source}] ${h.title}`
+              + (h.summary ? `\n   ${h.summary.slice(0, 100)}` : '')
+            ).join('\n');
+
+          const dxyFact   = engineData?._summary?.fundamental_intel?.dxy_environment?.raw_fact || 'DXY unavailable';
+          const yieldFact = engineData?._summary?.fundamental_intel?.yield_environment?.raw_fact || 'Yields unavailable';
+          const macroBias = engineData?._summary?.cross_asset?.macro_bias || 'Unknown';
+
+          const sentimentAIPrompt = `You are a professional macro analyst evaluating news sentiment for ${asset}.
+
+LIVE MACRO CONTEXT:
+- ${dxyFact}
+- ${yieldFact}
+- Macro bias: ${macroBias}
+
+RECENT HEADLINES (newest first):
+${headlineBlock}
+
+KEYWORD SCORE (Python baseline): ${sentimentIntel.sentiment_label} (score: ${sentimentIntel.overall_score})
+
+For each headline, classify: GENUINE (new market-moving info), PRICED_IN (market expected this), NOISE (irrelevant), or TRAP (sounds bullish but likely distribution/retail bait).
+
+Rules:
+- "Fed stays hawkish" after months of hawkish guidance = PRICED_IN
+- "CPI beats" when consensus expected a beat = PRICED_IN
+- "Emergency rate decision" or "surprise GDP miss" = GENUINE
+- Gold bullish news during DXY strength = possible TRAP
+- Headlines describing moves that already happened = PRICED_IN
+
+Respond ONLY with this JSON (no markdown):
+{"ai_sentiment_label":"STRONGLY_BULLISH|BULLISH|NEUTRAL|BEARISH|STRONGLY_BEARISH","ai_sentiment_score":0.0,"priced_in_assessment":"one sentence","actionable_headlines":["..."],"noise_headlines":["..."],"trap_detected":false,"trap_explanation":null,"ai_sentiment_note":"2-3 sentences for the trader","confidence":"HIGH|MEDIUM|LOW"}`;
+
+          let aiSentResp: any;
+          let attempt = 0;
+          const backoff = [1500, 3000];
+          while (attempt < 3) {
+            try {
+              aiSentResp = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: [{ role: 'user', parts: [{ text: sentimentAIPrompt }] }],
+                config: { temperature: 0.1, maxOutputTokens: 600 },
+              });
+              break;
+            } catch (err: any) {
+              attempt++;
+              if (attempt >= 3) throw err;
+              await new Promise(r => setTimeout(r, backoff[attempt - 1]));
+            }
+          }
+
+          const rawAI = (aiSentResp.text || '').replace(/```json|```/g, '').trim();
+          try {
+            const parsed = JSON.parse(rawAI);
+            sentimentIntel = {
+              ...sentimentIntel,
+              ai_interpreted:          true,
+              ai_sentiment_label:      parsed.ai_sentiment_label      || sentimentIntel.sentiment_label,
+              ai_sentiment_score:      parsed.ai_sentiment_score      ?? sentimentIntel.overall_score,
+              priced_in_assessment:    parsed.priced_in_assessment    || '',
+              actionable_headlines:    parsed.actionable_headlines    || [],
+              noise_headlines:         parsed.noise_headlines         || [],
+              trap_detected:           parsed.trap_detected           ?? false,
+              trap_explanation:        parsed.trap_explanation        || null,
+              ai_sentiment_note:       parsed.ai_sentiment_note       || '',
+              ai_confidence:           parsed.confidence              || 'LOW',
+              keyword_sentiment_label: sentimentIntel.sentiment_label,
+              keyword_score:           sentimentIntel.overall_score,
+              sentiment_divergence: (
+                sentimentIntel.sentiment_label !== parsed.ai_sentiment_label
+                  ? `DIVERGENCE: Keywords=${sentimentIntel.sentiment_label} vs AI=${parsed.ai_sentiment_label} — likely priced-in`
+                  : 'ALIGNED'
+              ),
+            };
+          } catch { sentimentIntel.ai_interpreted = false; }
+        } catch (err: any) {
+          console.log('AI sentiment failed:', err.message);
+          if (sentimentIntel) sentimentIntel.ai_interpreted = false;
+        }
+      }
 
       // Merge sentiment intelligence into engine summary
       if(engineData?._summary && sentimentIntel) {
@@ -971,10 +1159,10 @@ async function startServer() {
 
       // ── ANALYSIS LAYER ────────────────────────────────────────────────────
       // Step 1: Gemini 2.5 Flash (3 retries with exponential backoff)
-      const ai = new GoogleGenAI({apiKey:process.env.GEMINI_API_KEY});
+
       try {
         let response:any; let attempt=0;
-        const backoff=[3000,8000,15000];
+        const backoff=[2000, 4000];
         while(attempt<3){
           try {
             response=await ai.models.generateContent({
@@ -1113,7 +1301,7 @@ async function startServer() {
       console.log(`Done. AI:${aiUsed} | News:${newsData.freshCount}fresh/${newsData.staleCount}stale | Reasoning:${openRouterReasoning?'YES':'NO'}`);
       res.json({result:responseText});
 
-    } catch(err:any){ console.log('Error:',err); res.status(500).json({error:err.message}); }
+    } catch(err:any){ console.log('Error:',err); res.status(500).json({error:err.message}); } finally { analysisInProgress = false; }
   });
 
   if(process.env.NODE_ENV!=='production'){
