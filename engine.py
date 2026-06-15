@@ -344,6 +344,7 @@ def collect_sentiment_intelligence(news_items: list) -> dict:
         'total_headlines':  total,
         'breaking_items':   breaking_items,
         'scored_headlines': scored_headlines[:10],  # top 10 for AI review
+        'cb_analysis':      analyze_cb_speech(news_items),
         'note': 'Raw keyword scoring. AI must interpret hawkish/dovish context and whether sentiment is priced in.',
         'monetary_terms_detected': [kw for kw in MONETARY_KEYWORDS if kw.lower() in ' '.join(i.get('title','') for i in news_items).lower()],
     }
@@ -2192,7 +2193,17 @@ def fetch_stooq_price(symbol: str) -> dict:
 def fetch_twelve_data_price(symbol: str) -> dict:
     api_key = os.environ.get('TWELVEDATA_API_KEY')
     if not api_key:
-        return fetch_stooq_price('^DXY' if symbol == 'DXY' else symbol)
+        # Correct stooq symbol map — these are verified working symbols
+        STOOQ_SYMBOL_MAP = {
+            'DXY':     'usd.ind',    # US Dollar Index (verified stooq symbol)
+            'VIX':     '^vix',       # CBOE Volatility Index
+            'SPX':     'sp500.us',   # S&P 500
+            'IXIC':    'nq.f',       # NASDAQ (futures proxy — IXIC not on stooq)
+            'WTX/USD': 'cl.f',       # WTI Crude Oil front-month futures
+            'WTI':     'cl.f',
+        }
+        stooq_sym = STOOQ_SYMBOL_MAP.get(symbol, symbol.lower().replace('/', '') + '.us')
+        return fetch_stooq_price(stooq_sym)
 
     cache_key = 'twelve_' + symbol
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -2394,6 +2405,279 @@ _cross_asset_cache_time: dict = {}
 CROSS_ASSET_CACHE_TTL = 300  # 5 minutes
 
 
+# Central bank speakers and their current stance (updated periodically)
+# This gives the AI a baseline to measure "surprise" delta
+CB_SPEAKERS = {
+    # Fed
+    'powell':         {'institution': 'Fed',  'role': 'Chair'},
+    'jefferson':      {'institution': 'Fed',  'role': 'Vice Chair'},
+    'williams':       {'institution': 'Fed',  'role': 'President'},
+    'waller':         {'institution': 'Fed',  'role': 'Governor'},
+    'daly':           {'institution': 'Fed',  'role': 'President'},
+    'bostic':         {'institution': 'Fed',  'role': 'President'},
+    # ECB
+    'lagarde':        {'institution': 'ECB',  'role': 'President'},
+    'lane':           {'institution': 'ECB',  'role': 'Chief Economist'},
+    'de guindos':     {'institution': 'ECB',  'role': 'Vice President'},
+    # BOE
+    'bailey':         {'institution': 'BOE',  'role': 'Governor'},
+    'pill':           {'institution': 'BOE',  'role': 'Chief Economist'},
+    # BOJ
+    'ueda':           {'institution': 'BOJ',  'role': 'Governor'},
+    # BOC
+    'macklem':        {'institution': 'BOC',  'role': 'Governor'},
+}
+
+HAWKISH_CB_PHRASES = [
+    'rate hike', 'further tightening', 'higher for longer', 'not done yet',
+    'inflation too high', 'remain restrictive', 'more work to do', 'vigilant',
+    'not ruling out', 'data dependent and leaning', 'premature to cut',
+    'risks to upside', 'sticky inflation', 'strong labor market',
+]
+DOVISH_CB_PHRASES = [
+    'rate cut', 'easing', 'pivot', 'pause', 'patient', 'gradual',
+    'inflation returning to target', 'labor market cooling', 'balance of risks',
+    'data allows', 'appropriate to reduce', 'disinflation', 'peak rates',
+    'no need to tighten further', 'soft landing', 'restrictive enough',
+]
+SURPRISE_PHRASES = [
+    'emergency', 'unscheduled', 'surprise', 'unexpected', 'off-cycle',
+    'inter-meeting', 'urgent', 'extraordinary', 'crisis',
+]
+
+def analyze_cb_speech(news_items: list) -> dict:
+    """
+    Detects central bank speech content in news headlines and classifies:
+    - Which institution is speaking
+    - Hawkish vs Dovish tone
+    - Whether it represents a SHIFT from known stance (= surprise)
+    - Impact level: HIGH (Fed/ECB) | MEDIUM (BOE/BOJ/BOC) | LOW (others)
+
+    Returns structured CB speech intelligence for AI interpretation.
+    """
+    detected_speeches = []
+    overall_cb_tone   = 'NEUTRAL'
+    hawk_score = 0
+    dove_score = 0
+
+    for item in news_items:
+        text  = (item.get('title', '') + ' ' + item.get('summary', '')).lower()
+        title = item.get('title', '')
+        age   = item.get('ageMinutes', 9999)
+
+        # Detect speaker
+        speaker_found = None
+        institution   = None
+        for speaker, info in CB_SPEAKERS.items():
+            if speaker in text:
+                speaker_found = speaker.title()
+                institution   = info['institution']
+                break
+
+        if not speaker_found:
+            # Check institution mention without speaker
+            for inst in ['fed ', 'fomc', 'ecb', 'boe', 'boj', 'boc', 'federal reserve']:
+                if inst in text:
+                    institution = inst.upper().strip()
+                    break
+
+        if not institution:
+            continue  # Not a CB headline
+
+        # Score hawk/dove
+        hawk_hits = [p for p in HAWKISH_CB_PHRASES if p in text]
+        dove_hits = [p for p in DOVISH_CB_PHRASES  if p in text]
+        surprise  = any(p in text for p in SURPRISE_PHRASES)
+
+        if len(hawk_hits) > len(dove_hits):
+            cb_tone = 'HAWKISH'
+            hawk_score += len(hawk_hits)
+        elif len(dove_hits) > len(hawk_hits):
+            cb_tone = 'DOVISH'
+            dove_score += len(dove_hits)
+        else:
+            cb_tone = 'NEUTRAL'
+
+        # Determine impact
+        impact = ('HIGH'   if institution in ('FED', 'FOMC', 'FEDERAL RESERVE', 'ECB')
+                  else 'MEDIUM' if institution in ('BOE', 'BOJ', 'BOC')
+                  else 'LOW')
+
+        # Is this likely already priced in?
+        priced_in = (
+            age > 120 and not surprise  # >2hrs old and not a surprise = market has digested
+        )
+
+        detected_speeches.append({
+            'title':        title,
+            'speaker':      speaker_found,
+            'institution':  institution,
+            'cb_tone':      cb_tone,
+            'impact':       impact,
+            'is_surprise':  surprise,
+            'hawkish_phrases': hawk_hits[:3],
+            'dovish_phrases':  dove_hits[:3],
+            'age_minutes':  age,
+            'priced_in':    priced_in,
+            'actionable':   not priced_in,
+            'note': (
+                f'{institution} {"surprise — " if surprise else ""}{"HAWKISH" if cb_tone == "HAWKISH" else "DOVISH" if cb_tone == "DOVISH" else "NEUTRAL"} signal. '
+                + ('NOT priced in — fresh information.' if not priced_in else 'Likely priced in — market has had time to digest.')
+            )
+        })
+
+    # Overall CB tone from all detected speeches
+    if hawk_score > dove_score:
+        overall_cb_tone = 'HAWKISH' if hawk_score > dove_score * 1.5 else 'MILDLY_HAWKISH'
+    elif dove_score > hawk_score:
+        overall_cb_tone = 'DOVISH' if dove_score > hawk_score * 1.5 else 'MILDLY_DOVISH'
+
+    return {
+        'cb_speeches_detected': len(detected_speeches),
+        'overall_cb_tone':      overall_cb_tone,
+        'speeches':             detected_speeches,
+        'has_actionable':       any(s['actionable'] for s in detected_speeches),
+        'has_surprise':         any(s['is_surprise'] for s in detected_speeches),
+        'note': (
+            'No CB speeches detected in recent headlines.' if not detected_speeches
+            else f'{len(detected_speeches)} CB speech(es) detected. Tone: {overall_cb_tone}.'
+        )
+    }
+
+
+# Correlation direction tables — for each asset, what does each correlate signal mean?
+CORRELATION_RULES = {
+    'XAUUSD': {
+        'DXY':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 35},
+        'US10Y': {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 30},
+        'VIX':   {'UP': 'BULLISH', 'DOWN': 'BEARISH', 'FLAT': 'NEUTRAL', 'weight': 20},
+        'SP500': {'UP': 'MIXED',   'DOWN': 'BULLISH',  'FLAT': 'NEUTRAL', 'weight': 10},
+        'OIL':   {'UP': 'BULLISH', 'DOWN': 'NEUTRAL',  'FLAT': 'NEUTRAL', 'weight': 5},
+    },
+    'XAGUSD': {
+        'DXY':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 30},
+        'US10Y': {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 25},
+        'VIX':   {'UP': 'BULLISH', 'DOWN': 'NEUTRAL',  'FLAT': 'NEUTRAL', 'weight': 20},
+        'SP500': {'UP': 'BULLISH', 'DOWN': 'BEARISH',  'FLAT': 'NEUTRAL', 'weight': 15},
+        'OIL':   {'UP': 'BULLISH', 'DOWN': 'NEUTRAL',  'FLAT': 'NEUTRAL', 'weight': 10},
+    },
+    'BTCUSD': {
+        'SP500': {'UP': 'BULLISH', 'DOWN': 'BEARISH', 'FLAT': 'NEUTRAL', 'weight': 40},
+        'VIX':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 30},
+        'DXY':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 20},
+        'OIL':   {'UP': 'NEUTRAL', 'DOWN': 'NEUTRAL',  'FLAT': 'NEUTRAL', 'weight': 10},
+    },
+    'EURUSD': {
+        'DXY':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 50},
+        'US10Y': {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 30},
+        'VIX':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 20},
+    },
+    'GBPUSD': {
+        'DXY':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 45},
+        'US10Y': {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 30},
+        'VIX':   {'UP': 'BEARISH', 'DOWN': 'BULLISH', 'FLAT': 'NEUTRAL', 'weight': 25},
+    },
+}
+
+def score_cross_market_alignment(asset: str, correlations: list) -> dict:
+    """
+    Scores how aligned the cross-market data is with a bullish or bearish bias.
+    Returns a structured alignment report with a net score and verdict.
+
+    Score: +100 = all correlators bullish for asset
+           0    = split / neutral
+          -100  = all correlators bearish for asset
+    """
+    rules = CORRELATION_RULES.get(asset, {})
+    if not rules or not correlations:
+        return {
+            'status':         'NO_RULES',
+            'net_score':       0,
+            'alignment':      'NEUTRAL',
+            'verdict':        'No correlation rules for this asset.',
+            'details':        [],
+            'total_weight':    0,
+        }
+
+    details     = []
+    weighted_sum = 0.0
+    total_weight = 0.0
+
+    for corr in correlations:
+        role = corr.get('role')
+        if role not in rules:
+            continue
+        rule       = rules[role]
+        direction  = corr.get('direction', 'FLAT')
+        implication = rule.get(direction, 'NEUTRAL')
+        weight      = rule.get('weight', 10)
+        pct         = corr.get('pct_change', 0) or 0
+
+        # Convert implication to score
+        impl_score = {'BULLISH': 1.0, 'MIXED': 0.2, 'NEUTRAL': 0.0, 'BEARISH': -1.0}.get(implication, 0)
+        # Magnitude adjustment: stronger move = stronger signal
+        magnitude = min(2.0, 1.0 + abs(pct) / 2.0)
+        weighted_sum  += impl_score * weight * magnitude
+        total_weight  += weight * magnitude
+
+        details.append({
+            'role':        role,
+            'direction':   direction,
+            'pct_change':  pct,
+            'implication': implication,
+            'weight':      weight,
+            'raw_fact':    corr.get('raw_fact', ''),
+        })
+
+    if total_weight == 0:
+        net_score = 0.0
+    else:
+        net_score = round((weighted_sum / total_weight) * 100, 1)
+
+    alignment = (
+        'STRONGLY_BULLISH'  if net_score >=  60 else
+        'BULLISH'           if net_score >=  25 else
+        'MILDLY_BULLISH'    if net_score >=  10 else
+        'NEUTRAL'           if net_score >=  -10 else
+        'MILDLY_BEARISH'    if net_score >=  -25 else
+        'BEARISH'           if net_score >=  -60 else
+        'STRONGLY_BEARISH'
+    )
+
+    # Conviction grade
+    n_bullish  = sum(1 for d in details if d['implication'] == 'BULLISH')
+    n_bearish  = sum(1 for d in details if d['implication'] == 'BEARISH')
+    n_neutral  = sum(1 for d in details if d['implication'] in ('NEUTRAL', 'MIXED'))
+    conviction = (
+        'HIGHEST'  if (n_bullish >= 3 and n_bearish == 0) or (n_bearish >= 3 and n_bullish == 0) else
+        'HIGH'     if (n_bullish >= 2 and n_bearish == 0) or (n_bearish >= 2 and n_bullish == 0) else
+        'MEDIUM'   if abs(n_bullish - n_bearish) == 1 else
+        'LOW'      if n_bullish == n_bearish and n_bullish > 0 else
+        'NONE'
+    )
+
+    # Build human-readable verdict
+    bullish_roles = [d['role'] for d in details if d['implication'] == 'BULLISH']
+    bearish_roles = [d['role'] for d in details if d['implication'] == 'BEARISH']
+    verdict_parts = []
+    if bullish_roles: verdict_parts.append(f"Supporting ({', '.join(bullish_roles)})")
+    if bearish_roles: verdict_parts.append(f"Opposing ({', '.join(bearish_roles)})")
+    verdict = ' | '.join(verdict_parts) if verdict_parts else 'No clear directional signal.'
+
+    return {
+        'status':       'OK',
+        'net_score':     net_score,
+        'alignment':    alignment,
+        'conviction':   conviction,
+        'verdict':      verdict,
+        'n_bullish':    n_bullish,
+        'n_bearish':    n_bearish,
+        'n_neutral':    n_neutral,
+        'details':      details,
+        'total_weight': round(total_weight, 1),
+    }
+
+
 def fetch_cross_asset_data(asset: str) -> dict:
     cache_key = asset
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -2409,10 +2693,10 @@ def fetch_cross_asset_data(asset: str) -> dict:
     td_key = os.environ.get('TWELVEDATA_API_KEY')
     fred_key = os.environ.get('FRED_API_KEY')
 
-    # Fetch foundational macro fields
-    dxy = fetch_twelve_data_price('DXY') if td_key else fetch_stooq_price('^DXY')
-    us10y = fetch_fred_data('DGS10') if fred_key else fetch_stooq_price('10USY.B')
-    us02y = fetch_fred_data('DGS2') if fred_key else fetch_stooq_price('2USY.B')
+    # Fetch foundational macro fields via helper functions (transparent fallback handling)
+    dxy = fetch_twelve_data_price('DXY')
+    us10y = fetch_fred_data('DGS10')
+    us02y = fetch_fred_data('DGS2')
 
     # Add DXY
     if dxy['status'] == 'OK':
@@ -2440,9 +2724,60 @@ def fetch_cross_asset_data(asset: str) -> dict:
             'raw_fact': us02y['raw_fact'],
         })
 
+    # ── Free stooq fallback: VIX / SP500 / Oil / DXY (no API key needed) ──────
+    # These symbols are available free from stooq — always attempt them
+    FREE_STOOQ_ASSETS = [
+        ('usd.ind',  'DXY',   'US Dollar Index'),
+        ('^vix',     'VIX',   'CBOE Volatility Index'),
+        ('sp500.us', 'SP500', 'S&P 500'),
+        ('cl.f',     'OIL',   'WTI Crude Oil Futures'),
+    ]
+    for stooq_sym, role, label in FREE_STOOQ_ASSETS:
+        already_loaded = any(c.get('role') == role for c in result['correlations'])
+        if already_loaded:
+            continue
+        try:
+            d = fetch_stooq_price(stooq_sym)
+            if d.get('status') == 'OK':
+                # Add asset-specific interpretation
+                interp = ''
+                if role == 'DXY':
+                    interp = ('USD strengthening — headwind for Gold/EUR/GBP.' if d['direction'] == 'UP'
+                              else 'USD weakening — tailwind for Gold/EUR/GBP.' if d['direction'] == 'DOWN'
+                              else 'USD stable.')
+                elif role == 'VIX':
+                    interp = ('Risk-off (VIX rising) — safe-haven bid supports Gold.' if d['direction'] == 'UP'
+                              else 'Risk-on (VIX falling) — mild Gold headwind as equities preferred.'
+                              if d['direction'] == 'DOWN' else 'Volatility stable.')
+                elif role == 'SP500':
+                    interp = ('Equities rising — risk-on, DXY may strengthen.' if d['direction'] == 'UP'
+                              else 'Equities falling — risk-off, may support Gold/JPY.' if d['direction'] == 'DOWN'
+                              else 'Equities flat.')
+                elif role == 'OIL':
+                    interp = ('Oil rising — inflation expectations up, mild Gold support.' if d['direction'] == 'UP'
+                              else 'Oil falling — deflationary signal.' if d['direction'] == 'DOWN'
+                              else 'Oil stable.')
+                result['correlations'].append({
+                    'role':       role,
+                    'symbol':     stooq_sym,
+                    'source':     'stooq',
+                    'label':      label,
+                    'current':    d['price'],
+                    'direction':  d['direction'],
+                    'pct_change': d['change_pct'],
+                    'strength':   d['strength'],
+                    'raw_fact':   d['raw_fact'],
+                    'interpretation': interp,
+                })
+        except Exception:
+            pass  # Silently skip — stooq is best-effort
+
     # Additional Twelve Data / FRED metrics if keys available
     if td_key:
         for t_sym, role in [('VIX', 'VIX'), ('SPX', 'SP500'), ('IXIC', 'NASDAQ'), ('WTX/USD', 'OIL')]:
+            already_have = any(c.get('role') == role for c in result['correlations'])
+            if already_have:
+                continue
             t_data = fetch_twelve_data_price(t_sym)
             if t_data['status'] == 'OK':
                 result['correlations'].append({
@@ -2466,6 +2801,9 @@ def fetch_cross_asset_data(asset: str) -> dict:
         symbols = CROSS_ASSET_SYMBOLS.get(asset, {})
         for role, symbol in symbols.items():
             if role in ['DXY', 'US10Y', 'US02Y']: continue
+            already_have = any(c.get('role') == role for c in result['correlations'])
+            if already_have:
+                continue
             try:
                 url = (f'https://api.deriv.com/websockets/v3?ticks_history={symbol}'
                        f'&end=latest&count=20&style=candles&granularity=3600&app_id=1089')
@@ -2494,25 +2832,50 @@ def fetch_cross_asset_data(asset: str) -> dict:
     dxy_pct   = dxy.get('change_pct') or 0
     y10_pct   = us10y.get('change_pct') or 0
 
-    risk_up = any(c.get('role') in ['SP500', 'NASDAQ', 'RISK'] and c.get('direction') == 'UP' for c in result['correlations'])
+    risk_up  = any(c.get('role') in ['SP500', 'NASDAQ', 'RISK'] and c.get('direction') == 'UP' for c in result['correlations'])
+    vix_data = next((c for c in result['correlations'] if c.get('role') == 'VIX'),   None)
+    oil_data = next((c for c in result['correlations'] if c.get('role') == 'OIL'),   None)
+    sp5_data = next((c for c in result['correlations'] if c.get('role') == 'SP500'), None)
+    vix_up   = bool(vix_data and vix_data.get('direction') == 'UP')   # Risk-off = Gold bullish
+    oil_up   = bool(oil_data and oil_data.get('direction') == 'UP')   # Inflation proxy
+
+    def _vix_note():
+        if not vix_data: return ''
+        pct = vix_data.get('pct_change') if vix_data.get('pct_change') is not None else vix_data.get('change_pct', 0) or 0
+        return (f' VIX {pct:+.2f}% (risk-off adds safe-haven bid).'   if vix_up
+                else f' VIX {pct:+.2f}% (risk-on reduces safe-haven premium).')
+
+    def _oil_note():
+        if not oil_data: return ''
+        pct = oil_data.get('pct_change') if oil_data.get('pct_change') is not None else oil_data.get('change_pct', 0) or 0
+        return f' Oil {pct:+.2f}% (inflation proxy — mild Gold support).' if oil_up else ''
 
     if asset in ('XAUUSD', 'XAGUSD'):
-        if dxy_up and yields_up and not risk_up:
+        if dxy_up and yields_up:
             result['macro_bias'] = (
                 f'BEARISH for Gold — DXY {dxy_pct:+.2f}% + US10Y {y10_pct:+.2f}% both rising. '
-                f'USD strength + rising real yields = classic Gold headwind.'
+                f'USD strength + rising real yields = classic Gold headwind.{_vix_note()}'
             )
         elif not dxy_up and not yields_up:
             result['macro_bias'] = (
                 f'BULLISH for Gold — DXY {dxy_pct:+.2f}% + US10Y {y10_pct:+.2f}% both falling. '
-                f'Weaker USD + falling yields = tailwind for Gold.'
+                f'Weaker USD + falling yields = primary tailwind for Gold.{_vix_note()}{_oil_note()}'
             )
         elif dxy_up and not yields_up:
-            result['macro_bias'] = f'MIXED — DXY {dxy_pct:+.2f}% (headwind) but US10Y {y10_pct:+.2f}% (supportive). '
+            result['macro_bias'] = (
+                f'MIXED for Gold — DXY {dxy_pct:+.2f}% (headwind) but US10Y {y10_pct:+.2f}% '
+                f'(supportive via falling real yields). Net: cautious longs only.{_vix_note()}'
+            )
         elif not dxy_up and yields_up:
-            result['macro_bias'] = f'MIXED — DXY {dxy_pct:+.2f}% (supportive) but US10Y {y10_pct:+.2f}% (headwind). '
+            result['macro_bias'] = (
+                f'MIXED for Gold — DXY {dxy_pct:+.2f}% (supportive) but US10Y {y10_pct:+.2f}% '
+                f'(headwind via rising real yields). Net: reduce long size 50%.{_vix_note()}'
+            )
         else:
-            result['macro_bias'] = f'NEUTRAL — DXY {dxy_pct:+.2f}% US10Y {y10_pct:+.2f}%. No clear direction.'
+            result['macro_bias'] = (
+                f'NEUTRAL for Gold — DXY {dxy_pct:+.2f}%, US10Y {y10_pct:+.2f}%. '
+                f'No dominant macro signal.{_vix_note()}'
+            )
     elif asset in ('BTCUSD', 'ETHUSD', 'SOLUSD'):
         result['macro_bias'] = (
             'BULLISH macro (risk-on)' if risk_up else
@@ -2525,17 +2888,23 @@ def fetch_cross_asset_data(asset: str) -> dict:
             f'BULLISH (DXY weakening {dxy_pct:+.3f}%)'
         )
 
-    # Put live_macro for XAUUSD fallback handling
+    # Store enriched live_macro with all free data
     result['live_macro'] = {
-        'dxy': dxy,
+        'dxy':  dxy,
         'us10y': us10y,
-        'us02y': us02y
+        'us02y': us02y,
+        'vix':  vix_data,
+        'oil':  oil_data,
+        'sp500': sp5_data,
     }
     spread = None
     if us10y['status'] == 'OK' and us02y['status'] == 'OK':
         spread = round((us10y['price'] or 0) - (us02y['price'] or 0), 4)
         result['live_macro']['yield_spread'] = spread
         result['live_macro']['yield_curve'] = 'NORMAL' if spread > 0 else 'INVERTED'
+
+    # Score cross-market alignment
+    result['correlation_score'] = score_cross_market_alignment(asset, result['correlations'])
 
     _cross_asset_cache[cache_key] = result
     _cross_asset_cache_time[cache_key] = now_ts
@@ -3334,6 +3703,66 @@ def rule_based_score(htf_data, etf_data, indicators_by_tf, session_score):
 # SECTION 8 — MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def calculate_tf_confidence(
+    ema_trend:    str,
+    trend_bias:   str,
+    regime:       str,
+    rsi_value:    float,
+    bos_choch:    list,
+    is_htf:       bool = False,
+) -> int:
+    """
+    Returns 0-100 confidence score for a timeframe's directional bias.
+    High confidence = multiple indicators agree = this TF should dominate in conflict.
+
+    Inputs come directly from the tf result dict in run_engine().
+    """
+    score = 50  # neutral baseline
+
+    # EMA stack alignment (strongest structural signal)
+    ema_map = {
+        'STRONG_BULLISH': +20, 'BULLISH': +12,
+        'STRONG_BEARISH': -20, 'BEARISH': -12,
+        'NEUTRAL': 0,
+    }
+    score += ema_map.get(ema_trend, 0)
+
+    # Regime quality (does the regime support directional trades?)
+    regime_map = {
+        'TRENDING_STRONG':    +18,
+        'TRENDING_MODERATE':  +10,
+        'BREAKOUT':           +12,
+        'RANGING':            -15,
+        'VOLATILITY_COMPRESSION': -20,  # Direction unknown — compression resolves either way
+        'NO_TREND':           -15,
+        'MEAN_REVERSION':     -10,
+        'UNKNOWN':             -5,
+    }
+    score += regime_map.get(regime, 0)
+
+    # RSI alignment with trend bias
+    if trend_bias in ('BULLISH', 'STRONG_BULLISH') and rsi_value:
+        if rsi_value > 55:   score += 8
+        elif rsi_value < 45: score -= 8  # RSI contradicts trend
+    elif trend_bias in ('BEARISH', 'STRONG_BEARISH') and rsi_value:
+        if rsi_value < 45:   score += 8
+        elif rsi_value > 55: score -= 8
+
+    # Recent BOS vs CHoCH (BOS = trend continuation, CHoCH = reversal — only counts if fresh)
+    if bos_choch:
+        latest = bos_choch[-1] if isinstance(bos_choch, list) else None
+        if latest:
+            bos_type = latest.get('type', '')
+            if 'BOS' in bos_type:    score += 7   # Continuation signal
+            elif 'CHoCH' in bos_type: score += 3  # Reversal — slightly less certain
+
+    # HTF bonus — higher timeframes carry more structural weight
+    if is_htf:
+        score += 8
+
+    return max(5, min(98, score))
+
+
 def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
     result={}
     tf_order=['D1','4H','1H','15M','5M']
@@ -3396,8 +3825,21 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         if tf in ELLIOTT_TFS:
             elliott = detect_elliott_structure(candles, sh, sl, atr)
 
+        # Confidence Score calculation
+        rsi_val = rsi.get('value') if isinstance(rsi, dict) else None
+
+        tf_conf = calculate_tf_confidence(
+            ema_trend  = ema_trend,
+            trend_bias = trend,
+            regime     = regime.get('regime', 'UNKNOWN') if isinstance(regime, dict) else str(regime),
+            rsi_value  = rsi_val,
+            bos_choch  = bos,
+            is_htf     = (tf == htf),
+        )
+
         result[tf]={
             'atr':atr,'trend':trend,'ema_trend':ema_trend,'current_price':candles[-1]['close'],
+            'confidence':tf_conf,
             'swing_highs':sh[-5:],'swing_lows':sl[-5:],'bos_choch':bos[-8:],
             'fvg_fresh':[f for f in fvgs if f['status']=='FRESH'][-5:],
             'fvg_mitigated':[f for f in fvgs if f['status']=='MITIGATED'][-3:],
@@ -3534,6 +3976,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         'ml_score':        ml_score,
         'calendar':        calendar,
         'cross_asset':     cross_asset,
+        'correlation_score': cross_asset.get('correlation_score', {}),
         'win_probability': win_probability,
         'trade_expectancy':trade_expectancy,
         'wyckoff_htf':     htf_wyckoff,

@@ -386,16 +386,17 @@ function formatEngineResults(engineData:any): string {
       block += `  AI Sentiment: ${si.ai_sentiment_label} (score:${si.ai_sentiment_score}) [Confidence:${si.ai_confidence}]\n`;
       block += `  Keyword Baseline: ${si.keyword_sentiment_label} (score:${si.keyword_score})\n`;
       if(si.sentiment_divergence !== 'ALIGNED') block += `  ⚠️ ${si.sentiment_divergence}\n`;
-      if(si.trap_detected) block += `  🪤 TRAP: ${si.trap_explanation}\n`;
-      if(si.priced_in_assessment) block += `  Priced-In: ${si.priced_in_assessment}\n`;
-      if(si.actionable_headlines?.length){
-        block += `  ACTIONABLE:\n`;
+      if(si.priced_in_assessment) block += `  ⚡ PRICED-IN ASSESSMENT: ${si.priced_in_assessment}\n`;
+      if(si.actionable_headlines?.length > 0) {
+        block += `  ✅ ACTIONABLE (new info):\n`;
         si.actionable_headlines.slice(0,3).forEach((h:string) => block += `    ✓ "${h}"\n`);
       }
-      if(si.noise_headlines?.length){
-        block += `  NOISE (priced-in):\n`;
-        si.noise_headlines.slice(0,2).forEach((h:string) => block += `    ~ "${h}"\n`);
+      if(si.noise_headlines?.length > 0) {
+        block += `  🔇 NOISE (priced-in/old):\n`;
+        si.noise_headlines.slice(0,3).forEach((h:string) => block += `    ~ "${h}"\n`);
       }
+      if(si.trap_detected)   block += `  ⚠️  TRAP DETECTED: ${si.trap_explanation || 'Smart money may be distributing into sentiment'}\n`;
+      if(si.ai_confidence)   block += `  Sentiment Confidence: ${si.ai_confidence}\n`;
       if(si.ai_sentiment_note) block += `  AI Note: ${si.ai_sentiment_note}\n`;
     } else {
       block += `  Overall: ${si.sentiment_label} (score:${si.overall_score}) | Bull:${si.bullish_count} Bear:${si.bearish_count}\n`;
@@ -413,6 +414,21 @@ function formatEngineResults(engineData:any): string {
         if(!item.is_breaking) block += `    [${item.source}] "${item.title}" → ${item.sentiment}\n`;
       });
     }
+    // CB Communications (CB Speak) display
+    if (si.cb_analysis && si.cb_analysis.cb_speeches_detected > 0) {
+      const cb = si.cb_analysis;
+      block += `  📢 CENTRAL BANK COMMUNICATIONS (CB Speak):\n`;
+      block += `    Total Speeches: ${cb.cb_speeches_detected} | Tone: ${cb.overall_cb_tone} | Has Surprise Shift: ${cb.has_surprise ? 'YES ⚡' : 'NO'}\n`;
+      if (cb.speeches?.length) {
+        cb.speeches.forEach((sp: any) => {
+          const surpriseLabel = sp.is_surprise ? '⚡ SURPRISE SHIFT! ' : '';
+          block += `    • [${sp.institution}] ${sp.speaker || 'Speaker'}: ${sp.cb_tone} (Impact: ${sp.impact}) | ${surpriseLabel}${sp.note}\n`;
+          block += `      "${sp.title}"\n`;
+          if (sp.hawkish_phrases?.length) block += `      Hawkish phrases matching: ${sp.hawkish_phrases.join(', ')}\n`;
+          if (sp.dovish_phrases?.length)  block += `      Dovish phrases matching: ${sp.dovish_phrases.join(', ')}\n`;
+        });
+      }
+    }
   }
 
   // NEW: Show DXY + Yield environment in formatEngineResults
@@ -420,6 +436,14 @@ function formatEngineResults(engineData:any): string {
     const dxy_env = s.fundamental_intel.dxy_environment;
     block += `\nLIVE DXY: ${dxy_env.raw_fact}\n`;
     if(dxy_env.interpretation) block += `  ${dxy_env.interpretation}\n`;
+    
+    // Show VIX and Oil from cross-asset correlations
+    const vixCorr = engineData?._summary?.cross_asset?.correlations?.find((c:any) => c.role === 'VIX');
+    const oilCorr = engineData?._summary?.cross_asset?.correlations?.find((c:any) => c.role === 'OIL');
+    const sp5Corr = engineData?._summary?.cross_asset?.correlations?.find((c:any) => c.role === 'SP500');
+    if(vixCorr?.raw_fact) block += `LIVE VIX: ${vixCorr.raw_fact} ${vixCorr.direction === 'UP' ? '(risk-off — Gold bullish)' : vixCorr.direction === 'DOWN' ? '(risk-on — mild Gold headwind)' : ''}\n`;
+    if(sp5Corr?.raw_fact) block += `LIVE SP500: ${sp5Corr.raw_fact}\n`;
+    if(oilCorr?.raw_fact) block += `LIVE OIL: ${oilCorr.raw_fact} ${oilCorr.direction === 'UP' ? '(inflation proxy — mild Gold support)' : ''}\n`;
   }
   if(s.fundamental_intel?.yield_environment?.raw_fact) {
     const y_env = s.fundamental_intel.yield_environment;
@@ -477,8 +501,14 @@ function formatEngineResults(engineData:any): string {
     const ca=s.cross_asset;
     block+=`\nCROSS-ASSET INTELLIGENCE: ${ca.asset} | Macro Bias: ${ca.macro_bias}\n`;
     ca.correlations.filter((c:any)=>c.direction!=='UNAVAILABLE').forEach((c:any)=>{
-      block+=`  ${c.role}(${c.symbol}): ${c.direction} ${c.pct_change}% [${c.strength}]\n`;
+      const interpretationSuffix = c.interpretation ? ` — ${c.interpretation}` : '';
+      block+=`  ${c.role}(${c.symbol}): ${c.direction} ${c.pct_change}% [${c.strength}]${interpretationSuffix}\n`;
     });
+    if (s.correlation_score && s.correlation_score.status === 'OK') {
+      const cs = s.correlation_score;
+      block += `  CROSS-MARKET ALIGNMENT: Net Score: ${cs.net_score} (${cs.alignment}) | Conviction: ${cs.conviction}\n`;
+      block += `  Verdict: ${cs.verdict}\n`;
+    }
   }
   if(s.win_probability){
     const wp=s.win_probability;
@@ -566,6 +596,37 @@ function formatEngineResults(engineData:any): string {
     }
     block+='\n';
   }
+
+  // ── Contradiction Severity Calculator ─────────────────────────────────────
+  const tfBiases: string[] = [];
+  const tfConfidences: number[] = [];
+  
+  const byTF = engineData || {};
+  const tfsList = Object.keys(byTF).filter(k => k !== '_summary');
+
+  for (const label of tfsList) {
+    const d = byTF[label];
+    if (d) {
+      const bias = d.trend || d.bias || '';
+      const conf = d.confidence || 50;
+      if (bias && bias !== 'NEUTRAL') {
+        tfBiases.push(`${label}:${bias}`);
+        tfConfidences.push(conf);
+      }
+    }
+  }
+
+  // Count directional disagreements weighted by confidence
+  const bullBias = tfBiases.filter(b => b.includes('BULL') || b.includes('UP'));
+  const bearBias = tfBiases.filter(b => b.includes('BEAR') || b.includes('DOWN'));
+  const maxConflict = Math.min(bullBias.length, bearBias.length);
+  const techSeverity = maxConflict === 0 ? 'LOW' : maxConflict === 1 ? 'MEDIUM' : maxConflict >= 2 ? 'HIGH' : 'CRITICAL';
+  
+  block += `\nCONTRADICTION_SEVERITY_DATA:\n`;
+  block += `  Technical_Contradiction: ${techSeverity} (${bullBias.length} bullish TFs vs ${bearBias.length} bearish TFs)\n`;
+  block += `  TF_Biases: ${tfBiases.join(', ')}\n`;
+  block += `  TF_Confidences: ${tfBiases.map((b,i)=>b.split(':')[0]+':'+tfConfidences[i]).join(', ')}\n`;
+
   return block;
 }
 
@@ -720,6 +781,65 @@ Sentiment: Bullish headlines but AI says PRICED_IN (rate cut hope story is 3 wee
 Calendar: CLEAR (next USD event in 4h)
 VERDICT: WAIT — Valid technical setup but macro headwind reduces conviction.
 Enter if DXY drops back below yesterday's close and US10Y pulls below 4.25%."
+
+═══════════════════════════════════════════════════════
+CONTRADICTION SEVERITY SCORING (MANDATORY)
+═══════════════════════════════════════════════════════
+
+After your cross-examination, output a formal contradiction severity score.
+Use the CONTRADICTION_SEVERITY_DATA block from the engine output to inform this.
+
+FORMAT:
+CONTRADICTION SEVERITY REPORT:
+Technical Contradiction: [LOW | MEDIUM | HIGH | CRITICAL]
+  Reason: [Which TFs conflict and at what confidence levels]
+Fundamental Contradiction: [LOW | MEDIUM | HIGH | CRITICAL]  
+  Reason: [Does macro support or oppose the technical signal?]
+Sentiment Contradiction: [LOW | MEDIUM | HIGH | CRITICAL]
+  Reason: [Is sentiment actionable or priced-in?]
+OVERALL SEVERITY: [LOW | MEDIUM | HIGH | CRITICAL]
+  → The highest of the three individual scores.
+
+SEVERITY DEFINITIONS:
+LOW      = All or nearly all evidence aligns. Minor noise only.
+MEDIUM   = One clear conflict, but dominant direction is visible. Reduce size.
+HIGH     = Two or more evidence packages in real conflict. Direction unclear.
+CRITICAL = Evidence packages point in opposite directions at high confidence.
+
+═══════════════════════════════════════════════════════
+QUANTITATIVE OVERRIDE PROTOCOL (INSTITUTIONAL RULE)
+═══════════════════════════════════════════════════════
+
+When the quantitative engine shows a STRONG signal (ALL THREE true):
+• Confluence ≥ 70
+• Win Probability ≥ 60% (theoretical) or ≥ 50% (real data)  
+• Expected Value ≥ 1.5R
+
+You may only issue AVOID if OVERALL SEVERITY = HIGH or CRITICAL.
+
+If OVERALL SEVERITY = LOW or MEDIUM with a strong quant signal:
+→ The correct verdict is WAIT (not AVOID)
+→ Downgrade reason must be a SPECIFIC price event, not "mixed signals"
+→ State: "Quantitative signal is strong. Issuing WAIT (not AVOID) pending [specific condition]."
+
+AVOID requires at least one of:
+1. OVERALL SEVERITY = HIGH or CRITICAL, OR
+2. Hard calendar block (<30 min to high-impact event), OR
+3. Win probability < 40% AND confluence < 60, OR
+4. Negative EV in REAL_DATA mode, OR
+5. Price nowhere near any significant level (no entry zone exists)
+
+TIMEFRAME CONFIDENCE RULE:
+When TF_Confidences data is provided in CONTRADICTION_SEVERITY_DATA:
+• A timeframe with confidence ≥ 80 outweighs any number of timeframes below 60
+• D1 confidence 90 + 15M confidence 40 = D1 bias dominates
+• Do not call this "conflicted" — call it "D1 dominated with LTF noise"
+• Only call HIGH conflict when two TFs both have confidence ≥ 65 and oppose each other
+
+PRICED-IN RULE FOR SENTIMENT:
+• If ACTIONABLE headlines > 0 → Sentiment carries full weight
+• If ACTIONABLE headlines = 0 AND NOISE headlines > 2 → Sentiment = NEUTRAL (priced-in)
+• TRAP DETECTED → Reduce conviction by one level regardless of other factors
 
 ═══════════════════════════════════════════════════════
 PROBABILITY RULES FOR EXECUTION PLAN
@@ -974,7 +1094,14 @@ async function startServer() {
       if(!process.env.GEMINI_API_KEY) return res.status(500).json({error:'GEMINI_API_KEY not configured.'});
       const derivSymbol = DERIV_SYMBOLS[asset];
       if(!derivSymbol) return res.status(400).json({error:`No Deriv symbol: ${asset}`});
-      const ai = new GoogleGenAI({apiKey:process.env.GEMINI_API_KEY as string});
+      const ai = new GoogleGenAI({
+        apiKey: process.env.GEMINI_API_KEY as string,
+        httpOptions: {
+          headers: {
+            'User-Agent': 'aistudio-build',
+          }
+        }
+      });
 
       // 1. Fetch candles
       const isSynthetic = SYNTHETICS.has(derivSymbol);
@@ -1074,7 +1201,7 @@ Respond ONLY with this JSON (no markdown):
           while (attempt < 3) {
             try {
               aiSentResp = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
+                model: 'gemini-3.5-flash',
                 contents: [{ role: 'user', parts: [{ text: sentimentAIPrompt }] }],
                 config: { temperature: 0.1, maxOutputTokens: 600 },
               });
@@ -1166,7 +1293,7 @@ Respond ONLY with this JSON (no markdown):
         while(attempt<3){
           try {
             response=await ai.models.generateContent({
-              model:'gemini-2.5-flash', contents:promptParts,
+              model:'gemini-3.5-flash', contents:promptParts,
               config:{
                 systemInstruction: buildSystemPrompt(asset,mode),
                 temperature: 0.1,
