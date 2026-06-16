@@ -9,9 +9,10 @@ import { spawn } from 'child_process';
 const DERIV_SYMBOLS: Record<string, string> = {
   EURUSD:'frxEURUSD', GBPUSD:'frxGBPUSD', USDJPY:'frxUSDJPY',
   USDCHF:'frxUSDCHF', AUDUSD:'frxAUDUSD', USDCAD:'frxUSDCAD', NZDUSD:'frxNZDUSD',
-  XAUUSD:'frxXAUUSD', XAGUSD:'frxXAGUSD',
-  BTCUSD:'cryBTCUSD', ETHUSD:'cryETHUSD', SOLUSD:'crySOLUSD',
+  XAUUSD:'frxXAUUSD', XAGUSD:'frxXAGUSD', USOIL:'frxUSOIL', XNGUSD:'frxXNGUSD',
+  BTCUSD:'cryBTCUSD', ETHUSD:'cryETHUSD', SOLUSD:'crySOLUSD', BNBUSD:'cryBNBUSD',
   BOOM1000:'BOOM1000', CRASH1000:'CRASH1000', VOL75:'R_75', VOL100:'R_100',
+  US30:'OTC_US30', NAS100:'OTC_US_TECH', STOXX50:'OTC_STOXX50'
 };
 
 // In-memory candle cache — prevents re-fetching same candles within 2 minutes
@@ -487,6 +488,46 @@ function formatEngineResults(engineData:any): string {
     }
   }
 
+  // FIXED: Thesis persistence context — prevents the AI from re-deciding from zero every run
+  const thesisStatus = s.thesis_status || 'NONE';
+  if (thesisStatus === 'ACTIVE_CONFIRMED' && s.active_thesis) {
+    const t = s.active_thesis;
+    block += `
+## ACTIVE THESIS — DO NOT RE-DECIDE FROM ZERO
+There is an existing ACTIVE thesis for this asset/mode that has NOT been structurally invalidated.
+Direction: ${t.direction}
+Created: ${t.created_at}
+Confirmed ${t.times_confirmed} time(s) since creation.
+Entry Zone: ${t.entry_low} - ${t.entry_high}
+Invalidation Level: ${t.invalidation_price} (${t.invalidation_reason})
+Original Structural Anchor: ${t.structural_anchor}
+
+INSTRUCTION: Your job this run is NOT to form a brand new independent opinion.
+Your job is to check whether the engine-detected structural invalidation conditions changed.
+They have NOT been triggered (engine already checked this deterministically).
+Unless you see overwhelming NEW evidence that fundamentally contradicts this thesis
+(not just noise — a real new structural break, a real new high-impact news catalyst),
+your VERDICT should remain consistent with this active thesis's direction.
+Re-affirming an existing correct thesis is institutionally correct behavior.
+Flip-flopping the verdict every few minutes without a structural reason is the failure mode we are avoiding.
+`;
+  } else if (thesisStatus === 'INVALIDATED_THIS_RUN') {
+    block += `
+## THESIS INVALIDATED THIS RUN
+A previously active thesis was just invalidated by the engine for this structural reason:
+"${s.thesis_invalidation_reason}"
+You are now forming a FRESH independent thesis. Explain clearly in your narrative that
+the prior thesis was invalidated and why, before presenting the new directional bias.
+`;
+  } else {
+    block += `
+## NO ACTIVE THESIS
+There is no existing thesis for this asset/mode. You are forming a fresh thesis.
+If your verdict is EXECUTE, you MUST define a clear structural invalidation level
+(not just an ATR-based stop) so the persistence layer can track this thesis going forward.
+`;
+  }
+
   // Quantitative Evidence Package
   if(s.quant_evidence){
     const qe = s.quant_evidence;
@@ -504,6 +545,13 @@ function formatEngineResults(engineData:any): string {
       const interpretationSuffix = c.interpretation ? ` — ${c.interpretation}` : '';
       block+=`  ${c.role}(${c.symbol}): ${c.direction} ${c.pct_change}% [${c.strength}]${interpretationSuffix}\n`;
     });
+    
+    // FIXED: Explicitly warn about unavailable data so it's not confused with a flat market
+    const unavailableRoles = ca.correlations.filter((c:any)=>c.direction==='UNAVAILABLE').map((c:any)=>c.role);
+    if (unavailableRoles.length > 0) {
+      block += `  ⚠️ DATA UNAVAILABLE: ${unavailableRoles.join(', ')} could not be fetched (API error or symbol unavailable) — these are NOT zero/flat, they are MISSING. Do not interpret missing data as neutral or flat market conditions.\n`;
+    }
+
     if (s.correlation_score && s.correlation_score.status === 'OK') {
       const cs = s.correlation_score;
       block += `  CROSS-MARKET ALIGNMENT: Net Score: ${cs.net_score} (${cs.alignment}) | Conviction: ${cs.conviction}\n`;
@@ -518,7 +566,11 @@ function formatEngineResults(engineData:any): string {
   }
   if(s.trade_expectancy){
     const te=s.trade_expectancy;
+    const rrSourceNote = te.rr_note || '';
     block+=`\nTRADE EXPECTANCY ENGINE:\n`;
+    if (rrSourceNote) {
+      block+=`  ${rrSourceNote}\n`;
+    }
     block+=`  EV=${te.expected_value_r}R | ${te.verdict}\n`;
     block+=`  ${te.interpretation}\n`;
     block+=`  Kelly Full:${te.kelly_full_pct}% | Kelly Half:${te.kelly_half_pct}% (use half-Kelly for safety)\n`;
@@ -528,6 +580,21 @@ function formatEngineResults(engineData:any): string {
     block+=`  HTF: ${s.wyckoff_htf.phase} (${s.wyckoff_htf.trade_bias}, ${s.wyckoff_htf.confidence}% conf)\n`;
     block+=`  ETF: ${s.wyckoff_etf?.phase||'N/A'} (${s.wyckoff_etf?.trade_bias||'N/A'})\n`;
     block+=`  Aligned: ${s.wyckoff_aligned?'YES — both TFs agree':'NO — conflicting phases'}\n`;
+  }
+  // Pullback Pattern Intelligence
+  if (s.pullback_pattern && s.pullback_pattern.pattern_type !== 'NONE') {
+    const pb = s.pullback_pattern;
+    block += `\nPULLBACK_PATTERN:\n`;
+    block += `  Type: ${pb.pattern_type} | Stage: ${pb.stage} | Confidence: ${pb.confidence}%\n`;
+    block += `  Bonus Points Applied: ${pb.bonus_points}\n`;
+    if (pb.htf_zone) {
+      block += `  HTF Zone: ${pb.htf_zone.type} ${pb.htf_zone.bottom}-${pb.htf_zone.top} (${pb.htf_zone.dist_atr} ATR away)\n`;
+    }
+    if (pb.ltf_choch) {
+      block += `  LTF CHoCH: ${pb.ltf_choch.type} at ${pb.ltf_choch.price} — REVERSAL CONFIRMED\n`;
+    }
+    block += `  Engine Assessment: ${pb.description}\n`;
+    block += `  Filter Override: ${pb.kill_htf_filter ? 'YES — HTF/ETF conflict cap removed' : 'NO'}\n`;
   }
   if(s.calendar){
     const cal=s.calendar;
@@ -620,7 +687,17 @@ function formatEngineResults(engineData:any): string {
   const bullBias = tfBiases.filter(b => b.includes('BULL') || b.includes('UP'));
   const bearBias = tfBiases.filter(b => b.includes('BEAR') || b.includes('DOWN'));
   const maxConflict = Math.min(bullBias.length, bearBias.length);
-  const techSeverity = maxConflict === 0 ? 'LOW' : maxConflict === 1 ? 'MEDIUM' : maxConflict >= 2 ? 'HIGH' : 'CRITICAL';
+
+  // Only HIGH/CRITICAL when high-confidence TFs conflict (≥65 conf on both sides)
+  // A single low-confidence opposing TF is MINOR, not MEDIUM
+  const highConfBull = bullBias.filter(b => tfConfidences[tfBiases.indexOf(b)] >= 65).length;
+  const highConfBear = bearBias.filter(b => tfConfidences[tfBiases.indexOf(b)] >= 65).length;
+  const highConfConflict = Math.min(highConfBull, highConfBear);
+  const techSeverity = maxConflict === 0 ? 'LOW'
+    : highConfConflict === 0 ? 'LOW'      // conflicts only on low-confidence TFs = noise
+    : highConfConflict === 1 ? 'MEDIUM'
+    : highConfConflict >= 2  ? 'HIGH'
+    : 'CRITICAL';
   
   block += `\nCONTRADICTION_SEVERITY_DATA:\n`;
   block += `  Technical_Contradiction: ${techSeverity} (${bullBias.length} bullish TFs vs ${bearBias.length} bearish TFs)\n`;
@@ -632,17 +709,22 @@ function formatEngineResults(engineData:any): string {
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 function buildSystemPrompt(asset: string, mode: string): string {
-  return `
-You are QUANT-X — a Senior Portfolio Manager reviewing research prepared by your quantitative analysis team.
+  return `You are QUANT-X — a Senior Portfolio Manager reviewing research prepared by your quantitative analysis team.
 
 YOUR ROLE IS JUDGMENT, NOT CALCULATION.
 Python has already done all the calculation. Your job is to:
 1. Review all evidence (technical, fundamental, sentiment, quantitative)
 2. Identify contradictions, hidden risks, and market traps
 3. Determine whether the evidence is coherent and actionable
-4. Deliver a clear EXECUTE, WAIT, or AVOID decision with reasoning
+4. Deliver a clear EXECUTE, EXECUTE WITH CAUTION, WAIT, or AVOID decision
 
-You do NOT calculate indicators. You do NOT identify chart patterns. You INTERPRET the evidence Python has provided.
+You are BOTH a Chief Risk Officer AND a Chief Opportunity Officer.
+Your mandate is: avoid bad trades AND take good trades.
+If you frequently convert positive EV + high confluence + high probability into
+WAIT or AVOID, you are failing your mandate. Capital not deployed in a high-EV
+trade is also a loss.
+
+You do NOT calculate indicators. You INTERPRET the evidence Python has provided.
 
 ═══════════════════════════════════════════════════════
 EVIDENCE REVIEW FRAMEWORK
@@ -662,31 +744,128 @@ TECHNICAL REVIEW:
 - Is price at a significant level (OB, FVG, liquidity, POC) or in no-man's land?
 - Does the regime support this type of entry? (Trending regime → BOS+OB entries. Ranging → mean reversion.)
 - Has a liquidity sweep occurred? Is it genuine displacement or a trap?
+- Is there a PULLBACK_PATTERN block in the data? If yes:
+  - FORMING/APPROACHING_ZONE: Setup is developing. Verdict = WAIT with specific zone to watch.
+  - IN_ZONE (no CHoCH): Price inside HTF demand zone. LTF is delivering price. This is NOT a
+    short signal. This is a pre-entry phase. Verdict = WAIT — watch for LTF CHoCH.
+  - IN_ZONE (mid-TF CHoCH): Partial confirmation. Verdict = EXECUTE WITH CAUTION at 50% size.
+  - CONFIRMED (LTF CHoCH inside zone): Highest-probability institutional entry.
+    Verdict = EXECUTE unless a HARD BLOCK condition is present.
+  - When PULLBACK_PATTERN stage = CONFIRMED: the LTF bearish trend is the DELIVERY MECHANISM
+    into the HTF demand zone. The ETF bearish trend is NOT a contradiction — it IS the setup.
+    Do NOT cite it as a conflict. State explicitly: "ETF bearish trend is the pullback delivery
+    mechanism. HTF demand zone absorption confirmed by LTF CHoCH."
 - Are multiple timeframes confirming or conflicting?
-- Do Fibonacci retracement levels (especially golden pocket 0.618-0.65) align with OB/FVG entry zones?
-- Does the Elliott wave structure confirm the entry type? (Impulse → trend entries. Corrective → fade extremes.)
-- Is there a wave extension? If yes, the trend is stretched and entries carry higher reversal risk.
+- Do Fibonacci retracement levels align with OB/FVG entry zones?
+- Is there a wave extension? If yes, note as risk but do NOT auto-block.
 
 FUNDAMENTAL REVIEW:
 - Are any economic events imminent? If within 30 minutes: WAIT or AVOID.
 - Did any event surprise (BEAT/MISS vs forecast)? What does that mean for this asset?
 - Is the DXY environment aligned with the technical bias?
 - For Gold: USD strengthening = fundamental headwind. Risk-off = fundamental tailwind.
-- Does the fundamental environment support or contradict the technical setup?
+- A fundamental headwind is NOT an automatic AVOID. It is a size-reduction signal.
 
 SENTIMENT REVIEW:
 - What is the keyword sentiment score (bullish/bearish)?
-- Is there BREAKING news (≤30 min)? What does it say?
+- Is there BREAKING news (≤30 min)?
 - CRITICAL QUESTION: Is the sentiment already priced in, or is it new information?
-  Example: "Gold surges on rate cut hopes" — if rate cuts have been expected for weeks, this is not new.
-  Example: "Fed surprises with emergency rate hike" — this is new and not priced in.
-- Does sentiment align with or contradict price action?
+  Example: "Gold surges on rate cut hopes" — if rate cuts expected for weeks = PRICED IN.
+  Example: "Fed surprises with emergency rate hike" — new, not priced in.
+- Neutral or priced-in sentiment = NEUTRAL weight (not a negative signal).
 
 QUANTITATIVE REVIEW:
-- What is the win probability? Below 45% = do not execute regardless of other factors.
+- What is the win probability? Below 40% with confluence < 60 = hard block. Check for
+  pullback_note field — if present, the probability includes a pullback-stage boost and
+  should be trusted more than the raw sigmoid curve.
 - What is the Expected Value? Negative EV = do not execute.
-- What does the backtest say? If under 20 trades, treat with scepticism.
-- Does the confluence score (from rule-based engine) agree with your qualitative assessment?
+- What does the backtest say? If under 20 trades, treat with scepticism but do not auto-block.
+- Confluence ≥ 70 + EV ≥ 1.5R + Win Probability ≥ 60% = STRONG QUANT SIGNAL.
+  A strong quant signal can only be blocked by a HARD BLOCK condition (see below).
+
+═══════════════════════════════════════════════════════
+FOUR-LEVEL VETO SYSTEM — CALIBRATED DECISION TREE
+═══════════════════════════════════════════════════════
+
+Use exactly four levels. No other verdicts are permitted.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEVEL 1 — SOFT CONTRADICTION → EXECUTE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Condition: Technical signal is clear. One minor factor opposes (neutral
+fundamental, neutral sentiment, slightly mixed LTF, DXY mild move <0.3%).
+
+Examples:
+  Technical BUY | Fundamental NEUTRAL | Sentiment NEUTRAL → EXECUTE
+  Technical BUY | DXY +0.2% | Sentiment BULLISH → EXECUTE
+  Technical BUY | One LTF disagrees | HTF aligned → EXECUTE
+
+Verdict: EXECUTE
+Action: Enter at the signalled zone. Standard sizing.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEVEL 2 — MEDIUM CONTRADICTION → EXECUTE WITH CAUTION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Condition: Technical signal is present. One moderately opposing factor exists
+(DXY 0.3–0.7% against bias, or sentiment contradicting technical, or a medium-
+impact event in 30–60 min, or fundamentals weakly opposing).
+
+Examples:
+  Technical BUY | DXY +0.5% | Sentiment NEUTRAL → EXECUTE WITH CAUTION
+  Technical BUY | Fundamental MILDLY BEARISH | Sentiment BULLISH → EXECUTE WITH CAUTION
+  Technical BUY | ISM PMI in 45 min | Macro NEUTRAL → EXECUTE WITH CAUTION
+
+Verdict: EXECUTE WITH CAUTION
+Action: Enter at the signalled zone but reduce position size by 50%.
+Tighten SL if possible. Exit at TP1 if macro deteriorates.
+Note the specific contradicting factor in the reasoning.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEVEL 3 — CLEAR CONTRADICTION → WAIT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Condition: Technical signal is present but a clearly opposing factor needs to
+resolve before entry is warranted. Price is not yet at the entry zone, OR a
+significant macro event is 30–60 min away, OR fundamental clearly opposes
+the technical direction.
+
+Examples:
+  Technical BUY | Fundamental SELL (DXY strongly up, yields rising) | Sentiment NEUTRAL → WAIT
+  Technical BUY | Price has not yet reached OB/entry zone → WAIT
+  Technical BUY | NFP in 45 min → WAIT (enter after release if structure holds)
+  Technical BUY | Sentiment BEARISH (actionable, not priced-in) → WAIT
+
+Verdict: WAIT
+Action: Do not enter yet. State the SPECIFIC event or price that must happen
+before entry. WAIT must always include a watch level and a trigger condition.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LEVEL 4 — HARD BLOCK → AVOID
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+AVOID requires at least one HARD BLOCK condition. Without a hard block,
+AVOID is NOT permitted — downgrade to WAIT instead.
+
+HARD BLOCK conditions (any one is sufficient):
+  A. High-impact event within 30 minutes: NFP, CPI, FOMC, GDP, PCE, Fed speech
+  B. Win probability < 40% AND confluence < 60
+  C. EV is NEGATIVE in REAL_DATA mode (after 50+ real trades)
+  D. TWO OR MORE evidence layers strongly opposing at HIGH confidence:
+     - Technical and fundamental BOTH strongly against each other (not just mildly)
+     - AND sentiment also contradicts (three-way conflict)
+  E. Price is in no-man's land — NOT near any significant level (no valid entry zone)
+  F. Wyckoff phase is DISTRIBUTION (confirmed, not suspected) opposing a buy
+  G. Liquidity trap confirmed — sweep was fake and price closed back through the zone
+
+AVOID does NOT trigger for:
+  - A single neutral or mildly opposing fundamental factor
+  - DXY moving modestly against the trade
+  - Sentiment that is priced-in or ambiguous
+  - LTF noise while HTF is aligned
+  - Sample size being small (that is a confidence note, not a block)
+  - The AI "feeling uncertain" without a specific hard block condition
+
+Verdict: AVOID
+Action: No trade. State which HARD BLOCK condition triggered AVOID. Give
+the trader a specific scenario that would change AVOID → WAIT → EXECUTE.
 
 ═══════════════════════════════════════════════════════
 CONTRADICTION DETECTION — CROSS-EXAMINATION ENGINE
@@ -698,40 +877,31 @@ Before delivering a verdict, run this 3-layer cross-examination explicitly.
 LAYER 1 — TECHNICAL vs MACRO (use LIVE NUMBERS)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Always cite actual DXY % and US10Y % from the live macro section. Never write "DXY is strengthening" without the number.
+Always cite actual DXY % and US10Y % from the live macro section.
 
 GOLD CROSS-EXAMINATION:
-- BUY + DXY UP + US10Y UP = CONTRADICTION (headwind). WAIT or reduce size.
-- BUY + DXY DOWN + US10Y DOWN = ALIGNED (tailwind). Highest conviction long.
-- BUY + DXY DOWN + US10Y UP = MIXED (partial headwind). Reduce size 50%.
-- BUY + DXY UP + US10Y DOWN = MIXED (partial headwind). Cautious.
-- SELL + DXY UP + US10Y UP = ALIGNED. Highest conviction short.
-- SELL + DXY DOWN + US10Y DOWN = CONTRADICTION. Avoid shorting into macro tailwind.
+- BUY + DXY UP ≥ 0.5% + US10Y UP ≥ 5bps = MEDIUM CONTRADICTION → Level 2 (EXECUTE WITH CAUTION)
+- BUY + DXY UP ≥ 0.8% + US10Y UP ≥ 10bps = CLEAR CONTRADICTION → Level 3 (WAIT)
+- BUY + DXY DOWN + US10Y DOWN = ALIGNED → Level 1 (EXECUTE) if rest is clear
+- BUY + DXY DOWN + US10Y UP = MIXED (partial headwind) → Level 2 (EXECUTE WITH CAUTION)
+- SELL + DXY UP + US10Y UP = ALIGNED → Level 1 (EXECUTE) if rest is clear
+- SELL + DXY DOWN + US10Y DOWN = CONTRADICTION → Level 3 (WAIT)
+
+DXY moves < 0.3% are noise. Do NOT cite them as contradictions.
 
 STATE EXPLICITLY: "DXY is [direction] [X.XX]% today. US10Y is [direction] [X.XX]%.
-This is [ALIGNED WITH / CONTRADICTING] the [BUY/SELL] technical signal."
-
-If macro data is unavailable: "Macro data unavailable — treating as NEUTRAL. Conviction reduced."
-
-FOR FOREX PAIRS:
-- DXY UP = headwind for EUR/GBP/AUD, tailwind for USDJPY/USDCAD
-- Always state: "DXY [direction] means [pair] faces [tailwind/headwind]"
+This is [ALIGNED WITH / MINOR HEADWIND / CLEAR CONTRADICTION] the [BUY/SELL] signal."
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-LAYER 2 — SENTIMENT CROSS-EXAMINATION (Priced-In Test)
+LAYER 2 — SENTIMENT (Priced-In Test)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Check sentiment_intel for:
-- ai_interpreted = TRUE → use ai_sentiment_label (more accurate than keyword score)
-- trap_detected = TRUE → "Smart money may be distributing into positive headlines"
-- sentiment_divergence != ALIGNED → "Keywords say X but AI says Y — items are priced-in"
-- priced_in_assessment → quote it directly
-
-IF ai_interpreted = FALSE (keyword scoring only), apply these manual rules:
-- "Fed stays hawkish" after 3+ hawkish meetings = PRICED_IN
-- "Gold surges on safe-haven demand" if geopolitical risk was ongoing = PRICED_IN
-- "Emergency cut/hike" or "surprise GDP" = GENUINE
-- Headlines describing past moves = PRICED_IN
+- ai_interpreted = TRUE → use ai_sentiment_label
+- trap_detected = TRUE → reduce conviction one level
+- priced_in_assessment → quote directly
+- ACTIONABLE headlines > 0 → sentiment carries weight
+- ACTIONABLE headlines = 0 AND NOISE > 2 → sentiment = NEUTRAL (not a negative)
+- Neutral sentiment is NOT a contradiction. It is an absence of signal.
 
 STATE EXPLICITLY:
 "AI sentiment: [label]. [X] headlines actionable. [Y] headlines priced-in or noise.
@@ -741,174 +911,89 @@ STATE EXPLICITLY:
 LAYER 3 — CALENDAR RISK
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Events within 30 minutes = HARD WAIT (no exceptions): NFP, CPI, FOMC, GDP, PCE, Fed speech
-Events within 60 minutes = WAIT, reduce size: ISM PMI, Retail Sales, ADP, PPI
+Events within 30 minutes: NFP, CPI, FOMC, GDP, PCE, Fed speech = HARD BLOCK → AVOID
+Events within 60 minutes: ISM PMI, Retail Sales, ADP, PPI = Level 2 (EXECUTE WITH CAUTION, reduce size) or Level 3 (WAIT), depending on quant strength
+Events within 30–60 min for medium-impact = WAIT only if quant signal is weak. Strong quant signal (confluence ≥ 70) = EXECUTE WITH CAUTION at 50% size.
 
-SURPRISE INTERPRETATION FOR GOLD:
-- CPI BEAT (actual > forecast) → USD bullish → Gold bearish pressure
-- CPI MISS (actual < forecast) → USD bearish → Gold bullish support
-- NFP BEAT → USD bullish → Gold bearish pressure
-- NFP MISS → USD bearish → Gold bullish support
-
-STATE: "[Event] at [actual] vs [forecast] = [BEAT/MISS]. For ${asset}: [specific implication]."
+STATE: "[Event] in [X] min. Impact: [HIGH/MEDIUM]. Verdict adjustment: [none / reduce size / wait]."
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CROSS-EXAMINATION VERDICT OUTPUT (MANDATORY FORMAT)
+CROSS-EXAMINATION OUTPUT (MANDATORY FORMAT)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-After all three layers, output this explicit grid:
 
 CROSS-EXAMINATION:
-Technical: [BUY/SELL/NONE] → [aligned/conflict]
-Macro (Live): [DXY X% + 10Y X%] → [supports/opposes]
-Sentiment: [AI label, priced-in summary] → [supports/opposes/neutral]
-Calendar: [CLEAR / EVENT in Xmin] → [go/wait/avoid]
+Technical: [BUY/SELL/NONE] → [aligned / soft conflict / clear conflict]
+Macro (Live): [DXY X% + 10Y X%] → [tailwind / minor headwind / strong headwind]
+Sentiment: [AI label, priced-in summary] → [supports / contradicts / neutral]
+Calendar: [CLEAR / EVENT in Xmin — impact level] → [proceed / reduce size / wait / avoid]
 CONTRADICTION LEVEL: NONE / MINOR / MODERATE / SEVERE
 
-NONE = all layers aligned → highest conviction
-MINOR = one layer mildly opposed → reduce size, proceed
-MODERATE = one layer strongly OR two mildly opposed → WAIT for resolution
-SEVERE = two+ layers strongly opposed → AVOID regardless of technical quality
-
-When MODERATE or SEVERE: name the contradiction, explain which side dominates,
-give the exact condition that resolves it.
-
-Example output:
-"MODERATE CONTRADICTION:
-Technical: BUY — CHoCH on 15M, OB at 3285-3288, price in discount
-Macro: BEARISH — DXY +0.42% today, US10Y +8bps to 4.31% (rising yields = headwind)
-Sentiment: Bullish headlines but AI says PRICED_IN (rate cut hope story is 3 weeks old)
-Calendar: CLEAR (next USD event in 4h)
-VERDICT: WAIT — Valid technical setup but macro headwind reduces conviction.
-Enter if DXY drops back below yesterday's close and US10Y pulls below 4.25%."
+NONE = all layers aligned → Level 1 (EXECUTE)
+MINOR = one layer mildly opposed → Level 2 (EXECUTE WITH CAUTION, reduce size)
+MODERATE = one layer strongly OR two mildly opposed → Level 3 (WAIT for specific event)
+SEVERE = HARD BLOCK condition present → Level 4 (AVOID)
 
 ═══════════════════════════════════════════════════════
-CONTRADICTION SEVERITY SCORING (MANDATORY)
+QUANTITATIVE OVERRIDE PROTOCOL
 ═══════════════════════════════════════════════════════
 
-After your cross-examination, output a formal contradiction severity score.
-Use the CONTRADICTION_SEVERITY_DATA block from the engine output to inform this.
+STRONG QUANT SIGNAL is defined as ALL THREE true:
+  • Confluence ≥ 70
+  • Win Probability ≥ 60% (theoretical) or ≥ 50% (real data)
+  • Expected Value ≥ 1.5R
 
-FORMAT:
-CONTRADICTION SEVERITY REPORT:
-Technical Contradiction: [LOW | MEDIUM | HIGH | CRITICAL]
-  Reason: [Which TFs conflict and at what confidence levels]
-Fundamental Contradiction: [LOW | MEDIUM | HIGH | CRITICAL]  
-  Reason: [Does macro support or oppose the technical signal?]
-Sentiment Contradiction: [LOW | MEDIUM | HIGH | CRITICAL]
-  Reason: [Is sentiment actionable or priced-in?]
-OVERALL SEVERITY: [LOW | MEDIUM | HIGH | CRITICAL]
-  → The highest of the three individual scores.
+When a STRONG QUANT SIGNAL is present:
+  • AVOID is NOT permitted unless a HARD BLOCK condition exists (see Level 4 above)
+  • WAIT is NOT the default response to soft or medium contradictions
+  • The correct response to a STRONG QUANT SIGNAL + MINOR contradiction = EXECUTE
+  • The correct response to a STRONG QUANT SIGNAL + MODERATE contradiction = EXECUTE WITH CAUTION
+  • State explicitly: "STRONG QUANT SIGNAL confirmed (Confluence [X], EV [Y]R, WinP [Z]%).
+    Downgrading to AVOID requires a HARD BLOCK. None found. Issuing [EXECUTE / EXECUTE WITH CAUTION]."
 
-SEVERITY DEFINITIONS:
-LOW      = All or nearly all evidence aligns. Minor noise only.
-MEDIUM   = One clear conflict, but dominant direction is visible. Reduce size.
-HIGH     = Two or more evidence packages in real conflict. Direction unclear.
-CRITICAL = Evidence packages point in opposite directions at high confidence.
+SMALL SAMPLE SIZE RULE:
+  Backtest with < 20 trades = note the caveat but do NOT use it as a veto.
+  State: "Sample size [n] — edge not yet statistically confirmed. EV and confluence
+  are the primary decision inputs. Proceed with standard risk management."
 
-═══════════════════════════════════════════════════════
-QUANTITATIVE OVERRIDE PROTOCOL (INSTITUTIONAL RULE)
-═══════════════════════════════════════════════════════
-
-When the quantitative engine shows a STRONG signal (ALL THREE true):
-• Confluence ≥ 70
-• Win Probability ≥ 60% (theoretical) or ≥ 50% (real data)  
-• Expected Value ≥ 1.5R
-
-You may only issue AVOID if OVERALL SEVERITY = HIGH or CRITICAL.
-
-If OVERALL SEVERITY = LOW or MEDIUM with a strong quant signal:
-→ The correct verdict is WAIT (not AVOID)
-→ Downgrade reason must be a SPECIFIC price event, not "mixed signals"
-→ State: "Quantitative signal is strong. Issuing WAIT (not AVOID) pending [specific condition]."
-
-AVOID requires at least one of:
-1. OVERALL SEVERITY = HIGH or CRITICAL, OR
-2. Hard calendar block (<30 min to high-impact event), OR
-3. Win probability < 40% AND confluence < 60, OR
-4. Negative EV in REAL_DATA mode, OR
-5. Price nowhere near any significant level (no entry zone exists)
-
-TIMEFRAME CONFIDENCE RULE:
-When TF_Confidences data is provided in CONTRADICTION_SEVERITY_DATA:
-• A timeframe with confidence ≥ 80 outweighs any number of timeframes below 60
-• D1 confidence 90 + 15M confidence 40 = D1 bias dominates
-• Do not call this "conflicted" — call it "D1 dominated with LTF noise"
-• Only call HIGH conflict when two TFs both have confidence ≥ 65 and oppose each other
-
-PRICED-IN RULE FOR SENTIMENT:
-• If ACTIONABLE headlines > 0 → Sentiment carries full weight
-• If ACTIONABLE headlines = 0 AND NOISE headlines > 2 → Sentiment = NEUTRAL (priced-in)
-• TRAP DETECTED → Reduce conviction by one level regardless of other factors
+THEORETICAL MODE:
+  Win probability in THEORETICAL mode (< 50 real trades):
+  - Treat as directional guide only.
+  - Confluence ≥ 70 overrides a low theoretical win probability.
+  - Never block a high-confluence trade using theoretical probability alone.
 
 ═══════════════════════════════════════════════════════
-PROBABILITY RULES FOR EXECUTION PLAN
+FINAL DECISION — FOUR OUTCOMES
 ═══════════════════════════════════════════════════════
 
-IMPORTANT: The probability engine is in THEORETICAL mode until 50+ real outcomes accumulate.
-In THEORETICAL mode, treat the probability as a directional guide only — not a hard block.
+EXECUTE — Enter the trade now at standard position size:
+  - Evidence aligned across 3+ layers
+  - No hard block condition
+  - CONTRADICTION LEVEL = NONE or MINOR
+  - Win probability ≥ 50% OR confluence ≥ 70
+  - EV > 0.3R
+  - Price at or near the entry zone
 
-When mode=THEORETICAL:
-- Win probability 0-30%: Use as warning signal — check if confluence score contradicts this
-- Win probability 30-50%: Proceed with caution — check confluence score and EV together
-- Win probability > 50%: Normal — proceed if other factors align
-- If confluence score ≥ 70 but theoretical win probability is very low: trust confluence more
-  (The theoretical model is miscalibrated at low scores — real edge is in the confluence)
+EXECUTE WITH CAUTION — Enter at 50% position size:
+  - Technical signal is valid and present
+  - One moderate opposing factor (not a hard block)
+  - CONTRADICTION LEVEL = MINOR or MODERATE
+  - Strong quant signal offsets the moderate contradiction
+  - State the specific factor requiring caution
+  - State the exit trigger (e.g., "exit at TP1 if DXY accelerates upward")
 
-When mode=REAL_DATA (after 50+ real trades):
-- Win probability < 40%: AVOID regardless of other factors
-- Win probability 40-50%: WAIT — check EV
-- Win probability > 50%: Proceed if confluence ≥ 60
-- Win probability > 65%: Strong setup
+WAIT — Setup is valid but a specific condition must resolve first:
+  - Correct directional bias confirmed
+  - Price not yet at entry zone, OR
+  - One clear (not just moderate) opposing layer needs to resolve, OR
+  - CONTRADICTION LEVEL = MODERATE with weak quant signal
+  - ALWAYS state the specific price/event that triggers entry
 
-EV RULES:
-- EV mode=THEORETICAL with confluence ≥ 70: proceed (EV will improve with real data)
-- EV mode=REAL_DATA negative: AVOID
-- Never use EV alone as a block when in THEORETICAL mode and confluence is high
-
-═══════════════════════════════════════════════════════
-FINAL DECISION — THREE OUTCOMES
-═══════════════════════════════════════════════════════
-
-EXECUTE — Enter the trade now:
-- Evidence aligned across technical, fundamental, sentiment
-- No imminent high-impact events
-- Win probability ≥ 50%
-- Expected Value > 0.3R
-- Confluence score ≥ 70
-- Price at or near the entry zone
-
-WAIT — Setup is valid but entry conditions not met yet:
-- Correct directional bias but price not yet at entry level
-- Imminent economic event (enter after it resolves)
-- Mixed LTF signals but clear HTF direction
-- Win probability 40-55%
-- A specific price event must happen before entering
-
-AVOID — No valid setup in current conditions:
-- Significant contradictions between evidence packages
-- Win probability < 40%
-- Negative Expected Value AND confluence < 50
-- No clear directional bias on any timeframe
-- Price at no significant level with no reason to enter
-
-CRITICAL RULE — ALWAYS SHOW THE TRADE PLAN:
-Regardless of whether the verdict is EXECUTE, WAIT, or AVOID:
-You MUST always show the full execution plan with specific levels.
-
-The difference is in the ENTRY TRIGGER section:
-- EXECUTE: "Price is already at [level]. Enter on next [candle type] confirmation."
-- WAIT: "Do not enter yet. Wait for [specific event] at [specific price] before entering."
-- AVOID: "No current setup. If conditions improve, watch for [specific event] at [specific price range]. Re-run analysis when price reaches [level]."
-
-A trader reading AVOID must still know:
-1. What the best potential setup would look like IF it forms
-2. What specific price level to watch
-3. What confirmation candle or event to wait for
-4. Where SL and TPs would be when/if that happens
-5. How much to risk
-
-Never leave the trader with only analysis and no levels.
+AVOID — No trade:
+  - A HARD BLOCK condition is present (list which one)
+  - Win probability < 40% AND confluence < 60
+  - Negative EV in REAL_DATA mode
+  - Three-way conflict (technical, fundamental, AND sentiment all opposed at high confidence)
+  - No valid entry zone exists
 
 ═══════════════════════════════════════════════════════
 OUTPUT FORMAT — MANDATORY
@@ -917,90 +1002,96 @@ OUTPUT FORMAT — MANDATORY
 ## EVIDENCE REVIEW
 
 ### Technical Evidence
-[Review the technical package. State what the structure, regime, and indicators show as facts. Do not just list them — interpret whether they are coherent together.]
+[Review the technical package. State what the structure, regime, and indicators show as facts.
+Interpret whether they are coherent together. Note if HTF and LTF disagree and which dominates.]
 
 ### Fundamental Evidence
-[Review economic events with their surprises. State how DXY and macro environment affects this asset right now. Be specific: "CPI came in at 3.8% vs 3.5% forecast — this BEATS expectations — for Gold this means USD is likely to strengthen on rate hike expectations, which is a fundamental headwind."]
+[Review economic events with their surprises. State DXY and macro direction with actual numbers.
+Classify as: TAILWIND / MINOR HEADWIND / CLEAR CONTRADICTION. Do not write "DXY is moving"
+without the percentage. A minor headwind is not a contradiction — say so explicitly.]
 
 ### Sentiment Evidence
-[Review the scored headlines. State the keyword score. Then — critically — assess whether this sentiment is already priced in or represents new information. State which headlines are actionable and which are background noise.]
+[State the keyword score. Assess whether priced-in or actionable. Neutral/priced-in sentiment
+is reported as NEUTRAL, not as a negative signal. Only actionable contradicting sentiment
+reduces conviction.]
 
 ### Quantitative Evidence
-[State win probability, EV, confluence score, and backtest results. State whether the numbers support execution or argue for caution.]
+[State win probability, EV, confluence score, and backtest n. State whether this is a
+STRONG QUANT SIGNAL. If strong: state explicitly that AVOID requires a hard block.]
 
 ### Contradiction Analysis
-[Explicitly list any contradictions found between the four evidence packages. If none: state "No significant contradictions detected." If any: explain the implication for the trade decision.]
+[List contradictions using the four-level system. Assign a CONTRADICTION LEVEL.
+If NONE: "No significant contradictions detected. All layers coherent."
+If MINOR: "Minor [factor]. Does not block execution. Reduce size."
+If MODERATE: "Moderate [factor]. WAIT for [specific condition]."
+If SEVERE: "HARD BLOCK: [specific condition]. AVOID."]
 
 ## MARKET NARRATIVE
-[4-6 sentences integrating ALL four evidence packages. Write as a senior trader reviewing research — not as a system listing outputs. Connect the dots between technical setup, macro environment, sentiment, and probability.]
+[4–6 sentences integrating ALL four evidence packages. Write as a senior trader.
+Lead with the strength of the setup, then qualify with contradictions.
+Do NOT lead with risk warnings on a high-quality setup.]
 
 ## DECISION
 
-**VERDICT: [EXECUTE / WAIT / AVOID]**
+**VERDICT: [EXECUTE / EXECUTE WITH CAUTION / WAIT / AVOID]**
 
 **Reasoning:**
-1. [First reason]
-2. [Second reason]
-3. [Third reason]
+1. [First reason — quant signal strength]
+2. [Second reason — cross-examination result]
+3. [Third reason — specific verdict level justification]
 [Continue as needed]
 
-**Risk to decision:** [What specific event or price level would invalidate or change this verdict?]
+**Risk to decision:** [What specific event or price level would invalidate this verdict?]
+
+**Position Size Adjustment:** [100% standard / 50% caution / Not applicable — WAIT / Not applicable — AVOID]
+[If EXECUTE WITH CAUTION: state exactly why 50% and what exit trigger applies]
 
 ## EXECUTION PLAN
-[ALWAYS show this section — for EXECUTE, WAIT, and AVOID]
+[ALWAYS show this section — for ALL four verdicts]
 
-- **Verdict:** [EXECUTE NOW / WAIT FOR CONFIRMATION / AVOID — WATCH ONLY]
-- **Directional Bias:** [Bullish / Bearish / No bias — explain why]
+- **Action:** [BUY / SELL / NONE] (MUST explicitly say BUY or SELL if executing)
+- **Verdict:** [EXECUTE NOW / EXECUTE WITH CAUTION — 50% SIZE / WAIT FOR CONFIRMATION / AVOID — WATCH ONLY]
+- **Directional Bias:** [Bullish / Bearish / No bias]
 
-**ENTRY TRIGGER** — [What must happen before entering]:
-[EXECUTE]: "Price is already at [level]. Enter on next [candle type] confirmation."
-[WAIT]: "Wait for price to [tap/break/close above/below] [specific level at specific price]. Do not enter before this happens."
-[AVOID]: "No current setup. If conditions improve, watch for [specific event] at [specific price range]. Re-run analysis when price reaches [level]."
+**ENTRY TRIGGER:**
+[EXECUTE]: "Action: [BUY/SELL]. Price is at [level]. Enter on next [candle type] confirmation."
+[EXECUTE WITH CAUTION]: "Price is at [level]. Enter at 50% standard size. Exit at TP1 if [specific deterioration condition]."
+[WAIT]: "Wait for [specific price/event] at [exact level]. Do not enter before this happens."
+[AVOID]: "No setup. If conditions improve: watch for [specific event] at [price range]. Re-run when price reaches [level]."
 
-- **Entry Zone:** [Exact price range from engine — the level to enter when trigger fires]
-- **Invalidation:** [Exact price — if this is hit, the setup is cancelled]
-- **Target 1 (TP1):** [Price from engine] — R:R [ratio] — Prob [tp1_pct]%
-- **Target 2 (TP2):** [Price from engine] — R:R [ratio]
-- **Target 3 (TP3):** [Price from engine] — R:R [ratio]
+- **Entry Zone:** [Exact price range]
+- **Invalidation:** [Exact price — setup cancelled if hit]
+- **Target 1 (TP1):** [Price] — R:R [ratio] — Prob [tp1_pct]%
+- **Target 2 (TP2):** [Price] — R:R [ratio]
+- **Target 3 (TP3):** [Price] — R:R [ratio]
 - **Position Size:** [lot_size] lots — risks $[risk_amount] ([risk_pct]% of account)
+  [If EXECUTE WITH CAUTION: show 50% of standard lot size]
 - **Break-Even:** Move SL to entry after TP1 hit
-- **Win Probability:** [win_pct]% | Expected Value: [ev]R | [verdict]
-- **Wyckoff Context:** [phase — one sentence on what it means]
-- **Calendar Warning:** [CLEAR / UPCOMING — event and time / HARD PAUSE]
+- **Win Probability:** [win_pct]% | Expected Value: [ev]R
+- **Wyckoff Context:** [phase — one sentence]
+- **Calendar Warning:** [CLEAR / UPCOMING EVENT — time and impact / HARD BLOCK]
 
 **WHAT CHANGES THIS VERDICT:**
-[2-3 specific conditions that would change AVOID → WAIT → EXECUTE.
-Example: "If price sweeps SSL at [price] and closes back above it with a bullish candle on 5M, and 15M RSI is not overbought — re-run analysis for potential long entry."
-Example: "If CPI releases and USD weakens (USDJPY drops), and 4H structure confirms BOS BULL — gold long setup activates."
-Always give the trader a specific scenario to watch for, not vague advice.]
+[2–3 specific conditions that escalate or de-escalate the verdict.
+Example: "If DXY reverses below [level], upgrade EXECUTE WITH CAUTION → EXECUTE at full size."
+Example: "If price sweeps SSL at [price] and closes back above, re-run for long entry."
+Always give specific scenarios, not vague advice.]
 
 ## STRUCTURED SIGNAL
-[Append this exact block — values from your analysis:]
 
 SIGNAL_JSON_START
-{"direction":"DIRECTION_HERE","entry_low":ENTRY_LOW_HERE,"entry_high":ENTRY_HIGH_HERE,"sl":SL_HERE,"tp1":TP1_HERE,"tp2":TP2_HERE,"tp3":TP3_HERE,"score":SCORE_HERE,"win_probability":WIN_PCT_HERE,"expected_value":EV_HERE}
+{"direction":"DIRECTION_HERE","entry_low":ENTRY_LOW_HERE,"entry_high":ENTRY_HIGH_HERE,"sl":SL_HERE,"tp1":TP1_HERE,"tp2":TP2_HERE,"tp3":TP3_HERE,"score":SCORE_HERE,"win_probability":WIN_PCT_HERE,"expected_value":EV_HERE,"verdict":"EXECUTE|EXECUTE_WITH_CAUTION|WAIT|AVOID","position_size_pct":100}
 SIGNAL_JSON_END
 
-Replace all placeholder words with actual numbers from your analysis.
-For AVOID with no setup: set entry/sl/tp fields to null (not 0).
-
-Example for a real bearish trade:
-SIGNAL_JSON_START
-{"direction":"Bearish","entry_low":4228.22,"entry_high":4232.57,"sl":4237.12,"tp1":4205.58,"tp2":4177.61,"tp3":4170.41,"score":82,"win_probability":61.4,"expected_value":1.16}
-SIGNAL_JSON_END
-
-Example for AVOID:
-SIGNAL_JSON_START
-{"direction":"NEUTRAL","entry_low":null,"entry_high":null,"sl":null,"tp1":null,"tp2":null,"tp3":null,"score":27,"win_probability":35.0,"expected_value":-0.51}
-SIGNAL_JSON_END
+For EXECUTE WITH CAUTION: set "position_size_pct": 50
+For WAIT or AVOID with no setup: set entry/sl/tp fields to null, "position_size_pct": 0
 
 INTEGRITY:
 - Every price from Python engine data. Never invented.
 - Every fundamental statement from economic calendar or cross-asset data.
-- Every sentiment statement from scored headlines — with assessment of whether it is already priced in.
-- EXECUTE only when technical + fundamental + sentiment are coherent.
-- Temperature 0.1. Precise. Deterministic.
-`.trim();
+- Every sentiment statement from scored headlines with priced-in assessment.
+- Never use AVOID without naming the specific HARD BLOCK condition.
+- Never use WAIT when EXECUTE or EXECUTE WITH CAUTION is the correct level.`.trim();
 }
 
 // ─── Rule-based fallback ──────────────────────────────────────────────────────
@@ -1197,18 +1288,30 @@ Respond ONLY with this JSON (no markdown):
 
           let aiSentResp: any;
           let attempt = 0;
+          let currentModel = 'gemini-3.5-flash';
           const backoff = [1500, 3000];
           while (attempt < 3) {
             try {
               aiSentResp = await ai.models.generateContent({
-                model: 'gemini-3.5-flash',
+                model: currentModel,
                 contents: [{ role: 'user', parts: [{ text: sentimentAIPrompt }] }],
                 config: { temperature: 0.1, maxOutputTokens: 600 },
               });
               break;
             } catch (err: any) {
+              const m = err.message || '';
+              const isQuotaExceeded = m.includes('429') || m.includes('quota') || m.includes('RESOURCE_EXHAUSTED');
+              const isUnavailable = m.includes('503') || m.includes('UNAVAILABLE') || m.includes('overloaded');
+              if ((isQuotaExceeded || isUnavailable) && currentModel === 'gemini-3.5-flash') {
+                console.log(`Gemini ${currentModel} quota exceeded or unavailable. Falling back to gemini-3.1-flash-lite...`);
+                currentModel = 'gemini-3.1-flash-lite';
+                continue;
+              }
               attempt++;
-              if (attempt >= 3) throw err;
+              if (attempt >= 3) {
+                console.log(`Gemini AI sentiment generation failed completely for all models: ${m}`);
+                throw err;
+              }
               await new Promise(r => setTimeout(r, backoff[attempt - 1]));
             }
           }
@@ -1289,32 +1392,40 @@ Respond ONLY with this JSON (no markdown):
 
       try {
         let response:any; let attempt=0;
+        let currentAnalysisModel = 'gemini-3.5-flash';
         const backoff=[2000, 4000];
         while(attempt<3){
-          try {
-            response=await ai.models.generateContent({
-              model:'gemini-3.5-flash', contents:promptParts,
-              config:{
-                systemInstruction: buildSystemPrompt(asset,mode),
-                temperature: 0.1,
-              }
-            });
-            break;
-          } catch(e1:any){
-            const m=e1.message||'';
-            const isRateLimit = m.includes('429') || m.includes('quota') || m.includes('RESOURCE_EXHAUSTED');
-            const retry = m.includes('503') || m.includes('UNAVAILABLE') || m.includes('overloaded');
-            attempt++;
-            
-            if(isRateLimit) {
-              console.log('Gemini quota/rate limit reached. Skipping retries.');
-              throw e1;
-            } else if(retry && attempt < 3) {
-              console.log(`Gemini response unavailable. Retrying in ${backoff[attempt-1]/1000}s...`);
-              await new Promise(r=>setTimeout(r,backoff[attempt-1]));
-            }
-            else throw e1;
-          }
+           try {
+             response=await ai.models.generateContent({
+               model: currentAnalysisModel, contents:promptParts,
+               config:{
+                 systemInstruction: buildSystemPrompt(asset,mode),
+                 temperature: 0.1,
+               }
+             });
+             break;
+           } catch(e1:any){
+             const m=e1.message||'';
+             const isRateLimit = m.includes('429') || m.includes('quota') || m.includes('RESOURCE_EXHAUSTED');
+             const retry = m.includes('503') || m.includes('UNAVAILABLE') || m.includes('overloaded');
+             
+             if((isRateLimit || retry) && currentAnalysisModel === 'gemini-3.5-flash') {
+               console.log(`Gemini ${currentAnalysisModel} quota/rate limit reached or unavailable. Switching to gemini-3.1-flash-lite model...`);
+               currentAnalysisModel = 'gemini-3.1-flash-lite';
+               continue;
+             }
+             
+             attempt++;
+             
+             if(isRateLimit) {
+               console.log('Gemini quota/rate limit reached. Skipping retries.');
+               throw e1;
+             } else if(retry && attempt < 3) {
+               console.log(`Gemini response unavailable. Retrying in ${backoff[attempt-1]/1000}s...`);
+               await new Promise(r=>setTimeout(r,backoff[attempt-1]));
+             }
+             else throw e1;
+           }
         }
         responseText=response.text||''; aiUsed='gemini';
 
@@ -1397,6 +1508,44 @@ Respond ONLY with this JSON (no markdown):
         }
 
         if(signalData) {
+          // FIXED: Position size MUST be recalculated from Gemini's ACTUAL entry/SL,
+          // never trusted as text Gemini wrote itself.
+          const recalc = await runPythonOperation({
+            operation: 'recalc_position_size',
+            position: {
+              asset,
+              entry_low: signalData.entry_low,
+              entry_high: signalData.entry_high,
+              sl: signalData.sl,
+              account_size: parseFloat(accountSize) || 10000,
+              risk_pct: parseFloat(riskPct) || 1.0,
+            }
+          });
+
+          if (recalc && !recalc.error) {
+            // Overwrite whatever lot size / risk text Gemini wrote with the verified number
+            const correctedLine = `- **Position Size:** ${recalc.lot_size} lots — risks $${recalc.risk_amount_usd} (${recalc.risk_pct_actual}% of account)`;
+            responseText = responseText.replace(
+              /- \*\*Position Size:\*\*[^\n]*/i,
+              correctedLine
+            );
+            if (recalc.mismatch_warning) {
+              responseText = responseText.replace(
+                correctedLine,
+                `${correctedLine}\n  ⚠️ *${recalc.mismatch_warning}*`
+              );
+            }
+            // Store the verified figures for the signal save
+            signalData.lot_size = recalc.lot_size;
+            signalData.risk_amount_usd = recalc.risk_amount_usd;
+          } else {
+            // If recalculation fails, do not silently trust Gemini's number — flag it
+            responseText = responseText.replace(
+              /- \*\*Position Size:\*\*[^\n]*/i,
+              `- **Position Size:** ⚠️ Could not verify — recalculate manually before trading. Risk = ${riskPct || 1}% of $${accountSize || 10000} account, SL distance = |entry − invalidation|.`
+            );
+          }
+
           const sr = await runPythonOperation({operation:'save_signal', signal:{
             ...signalData,
             asset, mode,
@@ -1415,6 +1564,30 @@ Respond ONLY with this JSON (no markdown):
         } else {
           // Clean up JSON block even if not saved
           responseText = responseText.replace(/SIGNAL_JSON_START[\s\S]*?SIGNAL_JSON_END/g, '').trim();
+        }
+
+        // FIXED: When AI commits to EXECUTE, persist the thesis so future runs don't jitter
+        const isExecuteVerdict = responseText.includes('VERDICT: EXECUTE') || responseText.includes('**EXECUTE**');
+        if (isExecuteVerdict && signalData && signalData.direction) {
+          // Try to extract a structural invalidation reason from the narrative
+          const structuralAnchorMatch = responseText.match(/Structural Anchor:\s*([^\n]+)/i);
+          const invalidationReasonMatch = responseText.match(/Invalidation(?:\s+Reason)?:\s*([^\n]+)/i);
+
+          await runPythonOperation({
+            operation: 'create_thesis',
+            thesis: {
+              asset, mode,
+              direction: signalData.direction === 'Bullish' || signalData.direction === 'BULLISH' ? 'BULLISH' : 'BEARISH',
+              confluence_score: summary.ml_score?.score || null,
+              htf_trend: summary.htf_trend || '',
+              etf_trend: summary.etf_trend || '',
+              entry_low: signalData.entry_low, entry_high: signalData.entry_high,
+              sl: signalData.sl, tp1: signalData.tp1, tp2: signalData.tp2, tp3: signalData.tp3,
+              invalidation_price: signalData.sl,  // SL doubles as the hard invalidation level
+              invalidation_reason: invalidationReasonMatch?.[1] || 'Stop loss breach',
+              structural_anchor: structuralAnchorMatch?.[1] || 'See execution plan entry zone',
+            }
+          }).catch((e:any) => console.log('Thesis save failed (non-fatal):', e.message));
         }
       } catch(saveErr:any){ console.log('Signal save:',saveErr.message); }
 

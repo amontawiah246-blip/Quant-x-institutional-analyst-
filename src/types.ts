@@ -1,21 +1,19 @@
-export type MarketCategory = 'Forex' | 'Metals' | 'Crypto' | 'Indices';
+export type MarketCategory = 'Futures' | 'Crypto' | 'Metals' | 'Forex';
 
 export const MARKETS: Record<MarketCategory, string[]> = {
-  Forex:   ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD', 'NZDUSD'],
-  Metals:  ['XAUUSD', 'XAGUSD'],
-  Crypto:  ['BTCUSD', 'ETHUSD', 'SOLUSD'],
-  Indices: ['BOOM1000', 'CRASH1000', 'VOL75', 'VOL100'],
+  Futures: ['US30', 'NAS100', 'STOXX50', 'BOOM1000', 'CRASH1000', 'VOL75'],
+  Crypto:  ['BTCUSD', 'ETHUSD', 'SOLUSD', 'BNBUSD'],
+  Metals:  ['XAUUSD', 'XAGUSD', 'USOIL', 'XNGUSD'],
+  Forex:   ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD'],
 };
 
-// Deriv WebSocket symbol map — used server-side
-// Kept here for reference and future client-side use
 export const DERIV_SYMBOLS: Record<string, string> = {
   EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
   USDCHF: 'frxUSDCHF', AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
-  NZDUSD: 'frxNZDUSD',
-  XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD',
-  BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD',
-  BOOM1000: 'BOOM1000', CRASH1000: 'CRASH1000', VOL75: 'R_75', VOL100: 'R_100',
+  XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD', USOIL: 'frxUSOIL', XNGUSD: 'frxXNGUSD',
+  BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD', BNBUSD: 'cryBNBUSD',
+  BOOM1000: 'BOOM1000', CRASH1000: 'CRASH1000', VOL75: 'R_75',
+  US30: 'US30', NAS100: 'NAS100', STOXX50: 'STOXX50'
 };
 
 export type TradingMode = 'SCALPING MODE' | 'SWING MODE';
