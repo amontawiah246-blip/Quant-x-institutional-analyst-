@@ -260,9 +260,6 @@ function formatNewsBlock(newsData:Awaited<ReturnType<typeof fetchRSSNews>>, asse
 async function fetchOpenRouterReasoning(
   asset:string, engineData:any, etfCandles:Candle[], newsBlock:string
 ): Promise<string> {
-  if(!process.env.OPENROUTER_API_KEY) return '';
-
-  // Handle both full engine data and early context (when called in parallel before engine finishes)
   const isEarlyContext = engineData?.htfTrend === 'CALCULATING';
   const summary  = isEarlyContext ? {} : (engineData?._summary || {});
   const etfKey   = summary.etf || '5M';
@@ -297,44 +294,49 @@ Answer 3 questions:
 2. Is this move aligned with HTF trend or counter-trend?
 3. What should a trader watch in the next 1-3 candles to confirm or invalidate this move?`;
 
-  // Removed deepseek-r1 because it uses <think> and can take 2-3 minutes to generate.
-  // Real-time trading needs responses in seconds. Use fast models.
-  const models = [
-    'qwen/qwen-2.5-72b-instruct',     // Free fallback — strong reasoning, extremely fast
-    'google/gemini-2.0-flash-lite-preview-02-05:free', // Very fast
-  ];
-
-  for(const model of models) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
-      const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        signal: controller.signal,
-        method:'POST',
-        headers:{
-          'Authorization':`Bearer ${process.env.OPENROUTER_API_KEY}`,
-          'Content-Type':'application/json',
-          'HTTP-Referer':'https://quant-x.app',
-          'X-Title':'QUANT-X',
-        },
-        body:JSON.stringify({model, messages:[{role:'user',content:prompt}], temperature:0.1, max_tokens:500}),
-      });
-      clearTimeout(timeoutId);
-      if(!resp.ok) {
-        console.log(`OpenRouter ${model} returned ${resp.status}, trying next...`);
-        continue;
-      }
-      const data = await resp.json();
-      const text = data.choices?.[0]?.message?.content||'';
-      if(text) {
-        console.log(`OpenRouter reasoning: used ${model}`);
-        return text;
-      }
-    } catch(err:any) {
-      console.log(`OpenRouter ${model} skipped:`, err.message);
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
+  if(openRouterKey) {
+    const models = [
+      'qwen/qwen-2.5-72b-instruct',
+      'google/gemini-2.0-flash-lite-preview-02-05:free',
+    ];
+    for(const model of models) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
+        const resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+          signal: controller.signal,
+          method:'POST',
+          headers:{
+            'Authorization':`Bearer ${openRouterKey}`,
+            'Content-Type':'application/json',
+            'HTTP-Referer':'https://quant-x.app',
+            'X-Title':'QUANT-X',
+          },
+          body:JSON.stringify({model, messages:[{role:'user',content:prompt}], temperature:0.1, max_tokens:500}),
+        });
+        clearTimeout(timeoutId);
+        if(!resp.ok) continue;
+        const data = await resp.json();
+        const text = data.choices?.[0]?.message?.content||'';
+        if(text) return text;
+      } catch(err:any) {}
     }
   }
-  return ''; // All OpenRouter models failed — continue without reasoning
+
+  // Fallback if OpenRouter missing/failed: Use second ChatGPT (GITHUB_TOKEN2)
+  if (process.env.GITHUB_TOKEN2) {
+      try {
+          const text = await callGitHubModel(
+              process.env.GITHUB_TOKEN2, 
+              'gpt-4.1-mini', 
+              'You are a quantitative market analyst computing preliminary context.', 
+              prompt
+          );
+          if (text) return text;
+      } catch (e) {}
+  }
+  return '';
 }
 
 // ── GitHub Models API caller (shared by both GitHub tokens) ──────────────────
@@ -601,7 +603,10 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     if(cal.hard_pause) block+=`\n⛔ CALENDAR HARD PAUSE: ${cal.pause_reason}\n`;
     else if(cal.events?.length){
       block+=`\nCALENDAR:\n`;
-      cal.events.slice(0,3).forEach((e:any)=>block+=`  ${e.title} (${e.currency}) @ ${e.time_utc} ${e.status} | F:${e.forecast} P:${e.previous}\n`);
+      cal.events.slice(0,3).forEach((e:any)=>{
+        const isSafe = e.minutes_away > 120;
+        block+=`  ${e.title} (${e.currency}) @ ${e.time_utc} (in ${e.minutes_away} min) ${e.status} | F:${e.forecast} P:${e.previous} ${isSafe ? '[SAFE - IGNORE THIS CALENDAR EVENT]' : ''}\n`;
+      });
     }
   }
   const tfs=Object.keys(engineData).filter(k=>k!=='_summary');
@@ -710,6 +715,9 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
 // ─── System prompt ────────────────────────────────────────────────────────────
 function buildSystemPrompt(asset: string, mode: string): string {
   return `You are QUANT-X — a Senior Portfolio Manager reviewing research prepared by your quantitative analysis team.
+
+CURRENT UTC TIME: ${new Date().toISOString()}
+(CRITICAL: Always compare event times in the calendar to this exact current UTC time. If an event is tomorrow, or more than 2 hours away, IT IS NOT A BLOCK. Do not treat future events as imminent.)
 
 YOUR ROLE IS JUDGMENT, NOT CALCULATION.
 Python has already done all the calculation. Your job is to:
@@ -911,11 +919,16 @@ STATE EXPLICITLY:
 LAYER 3 — CALENDAR RISK
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+CRITICAL CALENDAR RULE:
+Look at the CURRENT UTC TIME at the top of this prompt. Compare it to the event time.
+DO NOT apply Calendar blocks for events that are more than 2 hours (120 minutes) away.
+If the news is tomorrow, or later today, it is CLEAR. Do NOT block.
+
 Events within 30 minutes: NFP, CPI, FOMC, GDP, PCE, Fed speech = HARD BLOCK → AVOID
 Events within 60 minutes: ISM PMI, Retail Sales, ADP, PPI = Level 2 (EXECUTE WITH CAUTION, reduce size) or Level 3 (WAIT), depending on quant strength
 Events within 30–60 min for medium-impact = WAIT only if quant signal is weak. Strong quant signal (confluence ≥ 70) = EXECUTE WITH CAUTION at 50% size.
 
-STATE: "[Event] in [X] min. Impact: [HIGH/MEDIUM]. Verdict adjustment: [none / reduce size / wait]."
+STATE: "[Event] in [X] min. Impact: [HIGH/MEDIUM]. Verdict adjustment: [none / reduce size / wait]." (If event >120m away, state: "Event > 2 hours away. CLEAR.")
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CROSS-EXAMINATION OUTPUT (MANDATORY FORMAT)
@@ -1049,27 +1062,36 @@ Do NOT lead with risk warnings on a high-quality setup.]
 ## EXECUTION PLAN
 [ALWAYS show this section — for ALL four verdicts]
 
-- **Action:** [BUY / SELL / NONE] (MUST explicitly say BUY or SELL if executing)
+**CRITICAL ENTRY RULE:** 
+- For SCALPING mode, you MUST find and state the entry zone and triggers strictly on the lower 5-minute timeframe, not the higher timeframe.
+- For SWING mode, you MUST find and state the entry zone and triggers strictly on the 15-minute timeframe.
+- Use HTF for directional bias, but exclusively use the execution timeframe (LTF) for entry placements.
+
+### 🚨 TRADE DIRECTION: [BUY (LONG) / SELL (SHORT) / NO SETUP]
+
+- **Action (Trade Type):** [BUY (LONG) / SELL (SHORT) / NONE] (CRITICAL: Define explicitly whether this is a BUY or a SELL)
 - **Verdict:** [EXECUTE NOW / EXECUTE WITH CAUTION — 50% SIZE / WAIT FOR CONFIRMATION / AVOID — WATCH ONLY]
 - **Directional Bias:** [Bullish / Bearish / No bias]
 
 **ENTRY TRIGGER:**
-[EXECUTE]: "Action: [BUY/SELL]. Price is at [level]. Enter on next [candle type] confirmation."
-[EXECUTE WITH CAUTION]: "Price is at [level]. Enter at 50% standard size. Exit at TP1 if [specific deterioration condition]."
-[WAIT]: "Wait for [specific price/event] at [exact level]. Do not enter before this happens."
-[AVOID]: "No setup. If conditions improve: watch for [specific event] at [price range]. Re-run when price reaches [level]."
+[EXECUTE]: "Action: [BUY/SELL]. Price is at [level]. Place a [BUY/SELL] order on next [candle type] confirmation."
+[EXECUTE WITH CAUTION]: "Action: [BUY/SELL]. Price is at [level]. Place a [BUY/SELL] order at 50% standard size. Exit at TP1 if [specific deterioration condition]."
+[WAIT]: "Wait for [specific price/event] at [exact level]. Do not place a [BUY/SELL] order before this happens."
+[AVOID]: "No setup. If conditions improve: watch for [specific event] at [price range] for potential [BUY/SELL] order. Re-run when price reaches [level]."
 
-- **Entry Zone:** [Exact price range]
-- **Invalidation:** [Exact price — setup cancelled if hit]
+- **Entry Zone:** [Exact price range] (Where to place your [BUY / SELL] entry order)
+- **Invalidation / Stop Loss (SL):** [Exact price] (Where to cut loss for this [BUY / SELL] setup — must have an explicit SL)
 - **Target 1 (TP1):** [Price] — R:R [ratio] — Prob [tp1_pct]%
 - **Target 2 (TP2):** [Price] — R:R [ratio]
 - **Target 3 (TP3):** [Price] — R:R [ratio]
-- **Position Size:** [lot_size] lots — risks $[risk_amount] ([risk_pct]% of account)
+- **Position Size:** [lot_size] lots — risks $[risk_amount] ([risk_pct]% of account) for this [BUY/SELL] position
   [If EXECUTE WITH CAUTION: show 50% of standard lot size]
 - **Break-Even:** Move SL to entry after TP1 hit
 - **Win Probability:** [win_pct]% | Expected Value: [ev]R
 - **Wyckoff Context:** [phase — one sentence]
 - **Calendar Warning:** [CLEAR / UPCOMING EVENT — time and impact / HARD BLOCK]
+
+**CRITICAL RULE:** Never just specify 'entry' or list price values without clearly and repeatedly labeling whether the position is a BUY (LONG) or a SELL (SHORT). Every execution instruction must explicitly designate the buy/sell directive.
 
 **WHAT CHANGES THIS VERDICT:**
 [2–3 specific conditions that escalate or de-escalate the verdict.
@@ -1593,9 +1615,15 @@ Respond ONLY with this JSON (no markdown):
 
       const aiFooter = [
         `Analysis: ${aiUsed}`,
-        openRouterReasoning ? `Reasoning: Qwen-2.5` : `Reasoning: SKIPPED`,
+        openRouterReasoning ? `Reasoning: Qwen-2.5 / GPT` : `Reasoning: SKIPPED`,
         `News: ${(newsData as any).freshCount || 0} fresh / ${(newsData as any).staleCount || 0} older`,
       ].join(' │ ');
+      
+      if (openRouterReasoning) {
+        const quotedReasoning = openRouterReasoning.replace(/\n/g, '\n> ');
+        responseText = `### 🧠 Quant Reasoning Step (Preliminary AI)\n> *Context generated before execution analysis:*\n>\n> ${quotedReasoning}\n\n---\n\n` + responseText;
+      }
+      
       responseText += `\n\n---\n*${aiFooter}*`;
 
       console.log(`Done. AI:${aiUsed} | News:${newsData.freshCount}fresh/${newsData.staleCount}stale | Reasoning:${openRouterReasoning?'YES':'NO'}`);

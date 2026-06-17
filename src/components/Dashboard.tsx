@@ -48,24 +48,24 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
   const categories: MarketCategory[] = ['Futures', 'Crypto', 'Metals', 'Forex'];
 
   return (
-    <div className="min-h-[100dvh] bg-[#0f1714] text-white p-4 sm:p-6 flex flex-col font-sans relative overflow-x-hidden">
+    <div className="min-h-[100dvh] bg-slate-50 text-slate-900 p-4 sm:p-6 flex flex-col font-sans relative overflow-x-hidden">
       {/* Background glow effects */}
-      <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-[#27ff5c] rounded-full blur-[150px] opacity-[0.03] pointer-events-none" />
+      <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-indigo-500 rounded-full blur-[150px] opacity-[0.1] pointer-events-none" />
 
       {/* Header */}
       <header className="flex items-center justify-between mb-6 relative z-10 w-full max-w-[1600px] mx-auto">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-[#14231a] rounded-lg flex items-center justify-center text-[#38F17A]">
+          <div className="w-10 h-10 bg-indigo-100 rounded-lg flex items-center justify-center text-indigo-600">
             <Activity className="w-5 h-5" />
           </div>
           <div>
-            <h1 className="text-lg font-bold tracking-tight text-white">QUANT-X Dashboard</h1>
+            <h1 className="text-lg font-bold tracking-tight text-slate-900">QUANT-X Dashboard</h1>
           </div>
         </div>
         
         <div className="flex items-center gap-3">
-          <button className="p-2 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
-            <Settings className="w-5 h-5 text-[#869b8e]" />
+          <button className="p-2 bg-slate-200/50 rounded-lg hover:bg-slate-200 transition-colors">
+            <Settings className="w-5 h-5 text-slate-500" />
           </button>
         </div>
       </header>
@@ -77,11 +77,11 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
         <motion.div 
           initial={{ opacity: 0, x: -20 }}
           animate={{ opacity: 1, x: 0 }}
-          className="lg:w-[400px] h-[500px] lg:h-auto shrink-0 flex flex-col bg-[#16201a] border border-white/5 rounded-2xl shadow-xl overflow-hidden"
+          className="lg:w-[400px] h-[500px] lg:h-auto shrink-0 flex flex-col bg-white border border-slate-200 rounded-2xl shadow-xl overflow-hidden"
         >
-          <div className="p-4 border-b border-white/5">
-            <h2 className="text-[11px] font-bold uppercase tracking-widest text-[#869b8e] mb-3">Instruments</h2>
-            <div className="flex bg-[#0f1714] rounded-lg p-1">
+          <div className="p-4 border-b border-slate-100">
+            <h2 className="text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-3">Instruments</h2>
+            <div className="flex bg-slate-100 rounded-lg p-1">
               {categories.map(c => (
                 <button
                   key={c}
@@ -89,14 +89,14 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
                      setActiveCategory(c);
                      setSelectedAsset(MARKETS[c][0]);
                   }}
-                  className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${activeCategory === c ? 'bg-[#212f27] text-white shadow-sm' : 'text-[#869b8e] hover:text-white'}`}
+                  className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${activeCategory === c ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
                 >
                   {c}
                 </button>
               ))}
             </div>
             
-            <div className="grid grid-cols-[1fr_70px_70px] gap-2 mt-4 px-2 text-[10px] text-[#869b8e] font-semibold tracking-wide uppercase">
+            <div className="grid grid-cols-[1fr_70px_70px] gap-2 mt-4 px-2 text-[10px] text-slate-400 font-semibold tracking-wide uppercase">
               <span>Symbol</span>
               <span className="text-center">Bid</span>
               <span className="text-center">Ask</span>
@@ -119,19 +119,19 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
                   <button
                     key={asset}
                     onClick={() => setSelectedAsset(asset)}
-                    className={`grid grid-cols-[1fr_70px_70px] gap-2 items-center w-full p-2 rounded-lg transition-all border ${isSelected ? 'bg-[#202e26] border-white/10 shadow-sm' : 'bg-transparent border-transparent hover:bg-white/5'}`}
+                    className={`grid grid-cols-[1fr_70px_70px] gap-2 items-center w-full p-2 rounded-lg transition-all border ${isSelected ? 'bg-indigo-50/50 border-indigo-100 shadow-sm' : 'bg-transparent border-transparent hover:bg-slate-50'}`}
                   >
                     <div className="flex items-center gap-3 text-left">
                        <span className="text-base">{getAssetIcon(asset)}</span>
-                       <span className={`font-semibold tracking-wide text-sm ${isSelected ? 'text-white' : 'text-[#acbfaa]'}`}>
+                       <span className={`font-semibold tracking-wide text-sm ${isSelected ? 'text-indigo-900' : 'text-slate-600'}`}>
                          {asset}
                        </span>
                     </div>
                     
-                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${isUp ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
+                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${isUp ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
                       {basePrice.toFixed(activeCategory === 'Forex' ? 4 : 2)}
                     </div>
-                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${isUp ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}`}>
+                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${isUp ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
                       {(basePrice + spread).toFixed(activeCategory === 'Forex' ? 4 : 2)}
                     </div>
                   </button>
@@ -140,19 +140,19 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
             </div>
           </div>
 
-          <div className="p-4 border-t border-white/5 bg-[#121b16]">
+          <div className="p-4 border-t border-slate-100 bg-slate-50">
              <div className="flex gap-2 mb-4">
-                 <button onClick={() => setMode('SCALPING MODE')} className={`flex-1 py-2 rounded-lg border text-xs font-bold uppercase transition-all ${mode === 'SCALPING MODE' ? 'border-[#38F17A] text-[#38F17A] bg-[#1a3823]' : 'border-white/10 text-[#869b8e] hover:text-white hover:bg-white/5'}`}>
+                 <button onClick={() => setMode('SCALPING MODE')} className={`flex-1 py-2 rounded-lg border text-xs font-bold uppercase transition-all ${mode === 'SCALPING MODE' ? 'border-indigo-400 text-indigo-700 bg-indigo-50' : 'border-slate-200 text-slate-500 hover:text-slate-700 hover:bg-white'}`}>
                     Scalp
                  </button>
-                 <button onClick={() => setMode('SWING MODE')} className={`flex-1 py-2 rounded-lg border text-xs font-bold uppercase transition-all ${mode === 'SWING MODE' ? 'border-[#38F17A] text-[#38F17A] bg-[#1a3823]' : 'border-white/10 text-[#869b8e] hover:text-white hover:bg-white/5'}`}>
+                 <button onClick={() => setMode('SWING MODE')} className={`flex-1 py-2 rounded-lg border text-xs font-bold uppercase transition-all ${mode === 'SWING MODE' ? 'border-indigo-400 text-indigo-700 bg-indigo-50' : 'border-slate-200 text-slate-500 hover:text-slate-700 hover:bg-white'}`}>
                     Swing
                  </button>
              </div>
              <button 
                onClick={handleExecute}
                disabled={isLoading}
-               className="w-full bg-[#38F17A] hover:bg-[#4aff8a] text-black font-bold uppercase tracking-widest text-sm py-4 rounded-xl shadow-[0_0_20px_rgba(56,241,122,0.2)] transition-all disabled:opacity-50 disabled:cursor-wait"
+               className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold uppercase tracking-widest text-sm py-4 rounded-xl shadow-[0_0_20px_rgba(79,70,229,0.2)] transition-all disabled:opacity-50 disabled:cursor-wait"
              >
                {isLoading ? 'Processing...' : 'Get Signal'}
              </button>
@@ -164,18 +164,18 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
           initial={{ opacity: 0, x: 20 }}
           animate={{ opacity: 1, x: 0 }}
           transition={{ delay: 0.1 }}
-          className="flex-1 min-h-[500px] lg:min-h-0 bg-[#16201a] border border-white/5 rounded-2xl shadow-xl flex flex-col overflow-hidden"
+          className="flex-1 min-h-[500px] lg:min-h-0 bg-white border border-slate-200 rounded-2xl shadow-xl flex flex-col overflow-hidden"
         >
-           <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between">
-             <div className="flex items-center gap-2 text-[#869b8e]">
+           <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between">
+             <div className="flex items-center gap-2 text-slate-500">
                <BarChart3 className="w-4 h-4"/>
                <span className="text-xs font-bold uppercase tracking-widest">Signal Output</span>
              </div>
              
              {selectedAsset && (
-                <div className="flex items-center gap-2 bg-[#0f1714] px-3 py-1 rounded-md border border-white/5">
-                  <span className="text-xs text-[#869b8e]">Target:</span>
-                  <span className="text-xs font-bold text-white tracking-widest">{selectedAsset}</span>
+                <div className="flex items-center gap-2 bg-slate-50 px-3 py-1 rounded-md border border-slate-200">
+                  <span className="text-xs text-slate-500">Target:</span>
+                  <span className="text-xs font-bold text-slate-900 tracking-widest">{selectedAsset}</span>
                 </div>
              )}
            </div>
@@ -189,8 +189,8 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
       <style dangerouslySetInnerHTML={{__html: `
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
         .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
       `}} />
     </div>
   );
