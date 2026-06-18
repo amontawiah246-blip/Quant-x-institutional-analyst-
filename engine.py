@@ -115,6 +115,25 @@ def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: di
                 except (ValueError, TypeError):
                     surprise_dir = 'UNKNOWN'
 
+            minutes_away = event.get('minutes_away', 9999)
+            days_away    = round(minutes_away / 1440, 1)  # 1440 min = 1 day
+
+            # ── Time-bucket classification (this is the missing piece) ───────
+            # This determines HOW the AI should treat the event — not just
+            # whether to ignore it, but whether it's a positioning opportunity.
+            if minutes_away < -30:
+                time_bucket = 'PASSED'
+            elif -30 <= minutes_away <= 30:
+                time_bucket = 'IMMEDIATE_BLOCK'      # true hard block zone
+            elif 30 < minutes_away <= 120:
+                time_bucket = 'NEAR_TERM_CAUTION'    # reduce size, don't block
+            elif 120 < minutes_away <= 1440:
+                time_bucket = 'SAME_DAY_AWARENESS'   # event today, hours away
+            elif 1440 < minutes_away <= 4320:
+                time_bucket = 'POSITIONING_WINDOW'   # 1-3 days: pre-event positioning territory
+            else:
+                time_bucket = 'DISTANT_NO_IMPACT'    # >3 days: no bearing on a scalp/swing decision today
+
             event_data = {
                 'title':        event.get('title', 'Unknown'),
                 'currency':     event.get('currency', ''),
@@ -124,7 +143,11 @@ def fetch_fundamental_data(asset: str, calendar_data: dict, cross_asset_data: di
                 'forecast':     forecast,
                 'previous':     previous,
                 'surprise':     surprise_dir,
-                'minutes_away': event.get('minutes_away', 9999),
+                'minutes_away': minutes_away,
+                'days_away':    days_away,
+                'time_bucket':  time_bucket,
+                'is_safe_to_ignore_for_entry_timing': time_bucket in
+                    ('DISTANT_NO_IMPACT', 'POSITIONING_WINDOW', 'PASSED'),
             }
             fundamental['economic_events'].append(event_data)
 
@@ -1442,20 +1465,47 @@ def fetch_economic_calendar(asset):
 
             minutes_away = (ev_time - now).total_seconds() / 60
 
+            # Fix: previous logic checked IMMINENT before JUST_RELEASED,
+            # which is fine, but the 120-minute IMMINENT window was too wide
+            # and didn't distinguish "30 min away" from "close to 2 hours away."
+            # Tightened to match the actual hard-block threshold used in the
+            # AI prompt (30 minutes), with a separate near-term caution band.
+            if minutes_away < -30:
+                ev_status = 'PASSED'
+            elif -30 <= minutes_away < 0:
+                ev_status = 'JUST_RELEASED'
+            elif 0 <= minutes_away <= 30:
+                ev_status = 'IMMINENT'
+            elif 30 < minutes_away <= 120:
+                ev_status = 'NEAR_TERM'
+            else:
+                ev_status = 'UPCOMING'
+
+            days_away = round(minutes_away / 1440, 1)
+            if minutes_away < -30:
+                time_bucket = 'PASSED'
+            elif -30 <= minutes_away <= 30:
+                time_bucket = 'IMMEDIATE_BLOCK'
+            elif 30 < minutes_away <= 120:
+                time_bucket = 'NEAR_TERM_CAUTION'
+            elif 120 < minutes_away <= 1440:
+                time_bucket = 'SAME_DAY_AWARENESS'
+            elif 1440 < minutes_away <= 4320:
+                time_bucket = 'POSITIONING_WINDOW'
+            else:
+                time_bucket = 'DISTANT_NO_IMPACT'
+
             relevant.append({
                 'title':        ev.get('title', 'Unknown Event'),
                 'currency':     ev.get('currency', ''),
                 'time_utc':     ev_time.strftime('%Y-%m-%d %H:%M UTC'),
                 'minutes_away': round(minutes_away),
+                'days_away':    days_away,
+                'time_bucket':  time_bucket,
                 'forecast':     ev.get('forecast', 'N/A'),
                 'previous':     ev.get('previous', 'N/A'),
                 'actual':       ev.get('actual', 'Pending'),
-                'status': (
-                    'IMMINENT'   if -30 <= minutes_away <= 120 else
-                    'JUST_RELEASED' if -30 < minutes_away < 0 else
-                    'UPCOMING'   if minutes_away > 0 else
-                    'PASSED'
-                )
+                'status':       ev_status,
             })
 
         relevant.sort(key=lambda x: abs(x['minutes_away']))
@@ -1471,10 +1521,11 @@ def fetch_economic_calendar(asset):
                 break
 
         result = {
-            'status':       'OK',
-            'hard_pause':   hard_pause,
-            'pause_reason': pause_reason,
-            'events':       relevant[:5],
+            'status':            'OK',
+            'hard_pause':        hard_pause,
+            'pause_reason':      pause_reason,
+            'events':            relevant[:5],      # top-5 nearest, for the existing display block
+            'events_full':       relevant,           # FULL list, for positioning-window detection
         }
         _calendar_cache[cache_key] = result
         _calendar_cache_time[cache_key] = now_ts
@@ -1492,6 +1543,99 @@ def fetch_economic_calendar(asset):
         _calendar_cache_time[cache_key] = now_ts
         return result
 
+def assess_event_positioning(economic_events: list, htf_trend: str,
+                              etf_trend: str, dxy_data: dict,
+                              asset: str) -> dict:
+    """
+    PRE-EVENT POSITIONING ASSESSMENT
+    ══════════════════════════════════════════════════════════
+    For known, scheduled, high-impact events that are 1-3 days away
+    (POSITIONING_WINDOW), this function gathers — but does NOT decide —
+    the factual signals a professional macro desk would use to judge
+    whether the market is already leaning a direction ahead of the print.
+
+    Python's job here is still measurement, not judgment:
+    - It identifies the nearest POSITIONING_WINDOW event
+    - It states what the structure/trend has done in the days leading up
+    - It flags whether the consensus forecast implies a directional bias
+      (e.g. GDP consensus 1.6% vs previous — slowing or accelerating?)
+    - It hands all of this to the AI to interpret, exactly like every
+      other evidence package in this system
+
+    Returns:
+      - has_positioning_event: bool
+      - event: the event dict
+      - days_until: float
+      - pre_event_drift: 'BUILDING_LONG_BIAS' | 'BUILDING_SHORT_BIAS' | 'NEUTRAL_CONSOLIDATION'
+      - consensus_direction_hint: text describing what consensus implies
+      - description: human-readable summary for the AI
+    """
+    result = {
+        'has_positioning_event':    False,
+        'event':                    None,
+        'days_until':               None,
+        'pre_event_drift':          'NEUTRAL_CONSOLIDATION',
+        'consensus_direction_hint': None,
+        'description':              'No pre-event positioning window currently active.',
+    }
+
+    positioning_events = [e for e in economic_events
+                          if e.get('time_bucket') == 'POSITIONING_WINDOW']
+    if not positioning_events:
+        return result
+
+    # Take the nearest one
+    event = sorted(positioning_events, key=lambda e: e.get('minutes_away', 9999))[0]
+    result['has_positioning_event'] = True
+    result['event']                 = event
+    result['days_until']            = event.get('days_away')
+
+    # ── Pre-event structural drift ────────────────────────────────────────────
+    # HTF and ETF both trending the same direction in the days leading into
+    # a major event suggests the market is already positioning, not waiting.
+    if htf_trend == etf_trend and htf_trend != 'NEUTRAL':
+        result['pre_event_drift'] = ('BUILDING_LONG_BIAS' if htf_trend == 'BULLISH'
+                                     else 'BUILDING_SHORT_BIAS')
+    else:
+        result['pre_event_drift'] = 'NEUTRAL_CONSOLIDATION'
+
+    # ── Consensus directional hint (factual only — Python does not predict) ──
+    title    = event.get('title', '')
+    forecast = event.get('forecast', 'N/A')
+    previous = event.get('previous', 'N/A')
+    hint = None
+    try:
+        fore_val = float(str(forecast).replace('%', ''))
+        prev_val = float(str(previous).replace('%', ''))
+        if 'GDP' in title.upper():
+            if fore_val < prev_val:
+                hint = (f'Consensus GDP forecast ({forecast}) is BELOW the previous '
+                        f'reading ({previous}) — market expects growth deceleration.')
+            elif fore_val > prev_val:
+                hint = (f'Consensus GDP forecast ({forecast}) is ABOVE the previous '
+                        f'reading ({previous}) — market expects growth acceleration.')
+            else:
+                hint = f'Consensus GDP forecast ({forecast}) is unchanged from previous.'
+        elif fore_val != prev_val:
+            direction = 'higher' if fore_val > prev_val else 'lower'
+            hint = f'Consensus for {title} ({forecast}) is {direction} than previous ({previous}).'
+    except (ValueError, TypeError):
+        hint = None
+
+    result['consensus_direction_hint'] = hint
+
+    days_txt = f"{event.get('days_away', '?')} days"
+    result['description'] = (
+        f"PRE-EVENT POSITIONING WINDOW: {event.get('title')} ({event.get('currency')}) "
+        f"in {days_txt} ({event.get('time_utc')}). "
+        f"This is NOT a trading hard block — it is {days_txt} away. "
+        f"Current HTF/ETF structural drift: {result['pre_event_drift']}. "
+        f"{hint if hint else 'No clear consensus-vs-previous skew detected.'} "
+        f"A scalp or swing decision made TODAY should treat this event as background "
+        f"context only, unless the trade's holding period extends into the event window."
+    )
+
+    return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — TECHNICAL INDICATORS
@@ -2703,10 +2847,14 @@ def analyze_cb_speech(news_items: list) -> dict:
         else:
             cb_tone = 'NEUTRAL'
 
-        # Determine impact
-        impact = ('HIGH'   if institution in ('FED', 'FOMC', 'FEDERAL RESERVE', 'ECB')
-                  else 'MEDIUM' if institution in ('BOE', 'BOJ', 'BOC')
-                  else 'LOW')
+        # Determine SENTIMENT relevance (NOT a calendar/timing signal —
+        # this only measures how much weight to give this speaker's
+        # institution within the sentiment layer, never a trading hard block)
+        sentiment_relevance = (
+            'HIGH'   if institution in ('FED', 'FOMC', 'FEDERAL RESERVE', 'ECB')
+            else 'MEDIUM' if institution in ('BOE', 'BOJ', 'BOC')
+            else 'LOW'
+        )
 
         # Is this likely already priced in?
         priced_in = (
@@ -2714,11 +2862,12 @@ def analyze_cb_speech(news_items: list) -> dict:
         )
 
         detected_speeches.append({
-            'title':        title,
-            'speaker':      speaker_found,
-            'institution':  institution,
-            'cb_tone':      cb_tone,
-            'impact':       impact,
+            'title':                title,
+            'speaker':              speaker_found,
+            'institution':          institution,
+            'cb_tone':              cb_tone,
+            'sentiment_relevance':  sentiment_relevance,   # renamed from 'impact'
+            'is_calendar_event':    False,                  # explicit flag — never a scheduled/timed event
             'is_surprise':  surprise,
             'hawkish_phrases': hawk_hits[:3],
             'dovish_phrases':  dove_hits[:3],
@@ -3389,12 +3538,24 @@ def calc_position_size(
         Pip Value     = value per pip per standard lot (from ASSET_PIP_VALUES)
         Lot Size      = Risk Amount / (SL in Pips × Pip Value)
 
-    Example (XAUUSD):
-        Account = $10,000 | Risk = 1% = $100
-        Entry = 4230, SL = 4220 → SL Distance = 10 points
-        SL in Pips = 10 / 0.01 = 1000 pips  (Gold pip = $0.01)
-        Pip Value = $10 per lot
-        Lot Size = $100 / (1000 × $10) = 0.01 lots = 1 micro lot
+    FLOOR BREACH HANDLING (v7 fix):
+    If the mathematically correct lot size to hit the requested risk% is
+    BELOW the broker minimum (0.01 lots), there are only three honest options:
+      A. Accept the minimum lot size and the resulting HIGHER actual risk%
+         (this is what the old code did silently — now it's explicit and flagged)
+      B. Tighten the stop loss (move SL closer to entry) to make the minimum
+         lot size correspond to the requested risk% — this requires a
+         DIFFERENT entry/SL combination, which this function cannot invent
+         on its own, but it CAN tell the caller exactly how much closer the
+         SL would need to be
+      C. Reduce position to the minimum lot but explicitly recommend the
+         trader treat this as a smaller "risk unit" — i.e. they are
+         intentionally risking more than planned because the instrument's
+         minimum lot size doesn't divide finely enough for this stop distance
+
+    This function now returns a `floor_breach` flag and a clear
+    `floor_breach_detail` explanation whenever option A is forced, instead of
+    silently returning an inflated risk number with no resolution path.
     """
     if not entry or not sl or entry == sl:
         return {'error': 'Invalid entry or SL', 'lot_size': None}
@@ -3424,27 +3585,74 @@ def calc_position_size(
     raw_lot_size = risk_amt / (sl_in_pips * pip_value)
 
     # Round to nearest lot step
-    lot_size = round(round(raw_lot_size / ASSET_LOT_STEP) * ASSET_LOT_STEP, 2)
-    lot_size = max(ASSET_MIN_LOT, min(ASSET_MAX_LOT, lot_size))
+    rounded_lot_size = round(round(raw_lot_size / ASSET_LOT_STEP) * ASSET_LOT_STEP, 2)
 
-    # Risk validation
+    # ── FLOOR BREACH DETECTION (v7 fix) ───────────────────────────────────────
+    floor_breach        = False
+    floor_breach_detail = None
+    lot_size            = rounded_lot_size
+
+    if rounded_lot_size < ASSET_MIN_LOT:
+        floor_breach = True
+        lot_size     = ASSET_MIN_LOT
+
+        # Calculate what SL distance WOULD have produced exactly the
+        # requested risk% at the minimum lot size — this tells the trader
+        # exactly how much tighter their stop would need to be
+        max_affordable_pips = risk_amt / (ASSET_MIN_LOT * pip_value)
+        max_affordable_sl_distance = round(max_affordable_pips * pip_size, 6)
+
+        floor_breach_detail = (
+            f'The mathematically correct lot size to risk exactly {risk_pct}% '
+            f'(${round(risk_amt,2)}) over a {round(sl_distance,2)}-point stop is '
+            f'{round(raw_lot_size,4)} lots — below the broker minimum of '
+            f'{ASSET_MIN_LOT} lots. At the minimum lot size, actual risk will '
+            f'exceed your request. To risk exactly {risk_pct}% at the minimum '
+            f'lot size, the stop would need to be {max_affordable_sl_distance} '
+            f'points from entry (vs the current {round(sl_distance,2)} points). '
+            f'OPTIONS: (1) Accept the minimum lot size and the higher actual '
+            f'risk% shown below, (2) tighten the stop to {max_affordable_sl_distance} '
+            f'points if the technical structure supports a closer invalidation '
+            f'level, or (3) reduce account risk tolerance for this specific '
+            f'wide-stop setup.'
+        )
+    elif raw_lot_size > ASSET_MAX_LOT:
+        # Symmetric ceiling breach handling — extremely tight stop relative
+        # to account size would require a lot size above the safety cap
+        floor_breach = True  # reusing the same flag name for "size was clamped"
+        lot_size     = ASSET_MAX_LOT
+        floor_breach_detail = (
+            f'The mathematically correct lot size ({round(raw_lot_size,2)} lots) '
+            f'exceeds the safety cap of {ASSET_MAX_LOT} lots for a '
+            f'{round(sl_distance,2)}-point stop. Position has been capped at '
+            f'{ASSET_MAX_LOT} lots, which results in LOWER actual risk than '
+            f'requested (safer than planned, not riskier).'
+        )
+    else:
+        lot_size = max(ASSET_MIN_LOT, min(ASSET_MAX_LOT, rounded_lot_size))
+
+    # Risk validation (now reflects the ACTUAL lot size used, post floor/ceiling logic)
     actual_risk     = lot_size * sl_in_pips * pip_value
     actual_risk_pct = round(actual_risk / account_size * 100, 3)
 
-    # Reward calculations
-    # These will be filled by the analysis engine using TP levels
     return {
-        'lot_size':          lot_size,
-        'risk_amount_usd':   round(risk_amt, 2),
-        'actual_risk_usd':   round(actual_risk, 2),
-        'actual_risk_pct':   actual_risk_pct,
-        'sl_distance_pts':   round(sl_distance, 6),
-        'sl_in_pips':        round(sl_in_pips, 1),
-        'pip_value':         pip_value,
-        'pip_size':          pip_size,
-        'account_size':      account_size,
-        'risk_pct_used':     risk_pct,
-        'note':              f'{lot_size} lots risks ${round(actual_risk,2)} ({actual_risk_pct}% of account)',
+        'lot_size':            lot_size,
+        'raw_lot_size':        round(raw_lot_size, 4),
+        'risk_amount_usd':     round(risk_amt, 2),
+        'actual_risk_usd':     round(actual_risk, 2),
+        'actual_risk_pct':     actual_risk_pct,
+        'sl_distance_pts':     round(sl_distance, 6),
+        'sl_in_pips':          round(sl_in_pips, 1),
+        'pip_value':           pip_value,
+        'pip_size':            pip_size,
+        'account_size':        account_size,
+        'risk_pct_used':       risk_pct,
+        'floor_breach':        floor_breach,
+        'floor_breach_detail': floor_breach_detail,
+        'note': (
+            f'{lot_size} lots risks ${round(actual_risk,2)} ({actual_risk_pct}% of account)'
+            + (' ⚠️ MINIMUM LOT FLOOR BREACH — see floor_breach_detail' if floor_breach and actual_risk_pct > risk_pct else '')
+        ),
     }
 
 
@@ -3527,18 +3735,31 @@ def recalc_position_size_from_actual(asset, entry_low, entry_high, sl,
     if sizing.get('error'):
         return sizing
 
+    risk_diff = abs(sizing['actual_risk_pct'] - risk_pct)
+
+    if sizing.get('floor_breach') and sizing.get('floor_breach_detail'):
+        # Genuine floor/ceiling breach — use the detailed, actionable explanation
+        risk_warning = sizing['floor_breach_detail']
+    elif risk_diff > 0.15:
+        # Minor rounding mismatch, not a floor breach — keep a lightweight note
+        risk_warning = (
+            f"Requested risk was {risk_pct}% — actual risk at the nearest "
+            f"valid lot size is {sizing['actual_risk_pct']}% (rounding to the "
+            f"broker's {ASSET_LOT_STEP} lot step). This is normal rounding, "
+            f"not a sizing error."
+        )
+    else:
+        risk_warning = None
+
     return {
-        'lot_size':        sizing['lot_size'],
-        'risk_amount_usd': sizing['actual_risk_usd'],
-        'risk_pct_actual': sizing['actual_risk_pct'],
-        'sl_distance_pts': sizing['sl_distance_pts'],
-        'sl_in_pips':      sizing['sl_in_pips'],
-        'note':            f"{sizing['lot_size']} lots risks ${sizing['actual_risk_usd']} ({sizing['actual_risk_pct']}% of ${account_size:,.0f} account)",
-        'mismatch_warning': (
-            f"Requested risk was {risk_pct}% but actual SL distance produces "
-            f"{sizing['actual_risk_pct']}% risk at this lot size — verify before executing"
-            if abs(sizing['actual_risk_pct'] - risk_pct) > 0.15 else None
-        ),
+        'lot_size':            sizing['lot_size'],
+        'risk_amount_usd':     sizing['actual_risk_usd'],
+        'risk_pct_actual':     sizing['actual_risk_pct'],
+        'sl_distance_pts':     sizing['sl_distance_pts'],
+        'sl_in_pips':          sizing['sl_in_pips'],
+        'floor_breach':        sizing.get('floor_breach', False),
+        'note':                f"{sizing['lot_size']} lots risks ${sizing['actual_risk_usd']} ({sizing['actual_risk_pct']}% of ${account_size:,.0f} account)",
+        'risk_warning':        risk_warning,
     }
 
 
@@ -3554,10 +3775,45 @@ def detect_swings(candles, left=5, right=5):
     return swing_highs, swing_lows
 
 
-def detect_bos_choch(candles, swing_highs, swing_lows):
-    events, trend = [], 'NEUTRAL'
+def detect_bos_choch(candles, swing_highs, swing_lows, staleness_max_candles=None):
+    """
+    BOS/CHoCH detector with recency-aware trend output (v8 fix).
+
+    THE PROBLEM THIS FIXES:
+    The original version returned whatever trend was set by the LAST
+    BOS/CHoCH event anywhere in the full candle window, with no regard for
+    how long ago that event happened relative to current price. This caused
+    a stale, weeks-old BOS on a long-lookback timeframe (like H4 with 500
+    candles) to lock in a trend label that no longer reflected what price
+    had actually been doing recently — manufacturing false HTF/LTF
+    "conflicts" that were really just artifacts of lookback depth.
+
+    THE FIX:
+    The function still detects every BOS/CHoCH exactly as before (the
+    `events` list is unchanged). But the returned `trend` is now staleness-
+    aware: if the most recent event is older than `staleness_max_candles`
+    candles ago (relative to the last candle in the window), the trend
+    decays to 'NEUTRAL' rather than staying locked at a label that no longer
+    reflects recent price action.
+
+    `staleness_max_candles` defaults are timeframe-appropriate:
+      None (not provided) → defaults to 40% of the candle window length,
+      which keeps roughly the same "real time" staleness tolerance whether
+      the window is 300 or 500 candles.
+
+    Returns:
+      events       — same as before, full list of detected BOS/CHoCH events
+      trend        — 'BULLISH' / 'BEARISH' / 'NEUTRAL', staleness-adjusted
+      trend_age    — candles since the defining event (None if NEUTRAL/no events)
+      trend_stale  — True if a real trend exists in raw form but has decayed
+                     to NEUTRAL due to staleness (useful for diagnostics/UI)
+      raw_trend    — the OLD behavior's trend value, unadjusted, for comparison
+    """
+    events, raw_trend = [], 'NEUTRAL'
     all_swings = sorted([('SH',sh) for sh in swing_highs]+[('SL',sl) for sl in swing_lows], key=lambda x:x[1]['index'])
     confirmed_sh, confirmed_sl = [], []
+    last_event_index = None
+
     for i, c in enumerate(candles):
         for stype, swing in all_swings:
             if swing['index'] == i:
@@ -3565,16 +3821,41 @@ def detect_bos_choch(candles, swing_highs, swing_lows):
         if confirmed_sh:
             lsh = confirmed_sh[-1]
             if c['close'] > lsh['price'] and lsh['index'] < i:
-                etype = 'CHoCH' if trend=='BEARISH' else 'BOS'
+                etype = 'CHoCH' if raw_trend=='BEARISH' else 'BOS'
                 events.append({'type':f'{etype} BULL','price':lsh['price'],'candle_price':c['close'],'epoch':c['epoch'],'date':c.get('date',str(c['epoch'])),'index':i})
-                trend, confirmed_sh = 'BULLISH', []
+                raw_trend, confirmed_sh = 'BULLISH', []
+                last_event_index = i
         if confirmed_sl:
             lsl = confirmed_sl[-1]
             if c['close'] < lsl['price'] and lsl['index'] < i:
-                etype = 'CHoCH' if trend=='BULLISH' else 'BOS'
+                etype = 'CHoCH' if raw_trend=='BULLISH' else 'BOS'
                 events.append({'type':f'{etype} BEAR','price':lsl['price'],'candle_price':c['close'],'epoch':c['epoch'],'date':c.get('date',str(c['epoch'])),'index':i})
-                trend, confirmed_sl = 'BEARISH', []
-    return events, trend
+                raw_trend, confirmed_sl = 'BEARISH', []
+                last_event_index = i
+
+    # ── Staleness decay (v8 fix) ──────────────────────────────────────────────
+    trend       = raw_trend
+    trend_age   = None
+    trend_stale = False
+
+    if last_event_index is not None and len(candles) > 0:
+        trend_age = (len(candles) - 1) - last_event_index
+
+        if staleness_max_candles is None:
+            staleness_max_candles = max(20, int(len(candles) * 0.40))
+
+        if trend_age > staleness_max_candles:
+            trend       = 'NEUTRAL'
+            trend_stale = True
+
+    return {
+        'events':      events,
+        'trend':       trend,
+        'raw_trend':   raw_trend,
+        'trend_age':   trend_age,
+        'trend_stale': trend_stale,
+        'staleness_threshold_used': staleness_max_candles if last_event_index is not None else None,
+    }
 
 
 def detect_fvg(candles, atr):
@@ -4398,6 +4679,87 @@ def calculate_tf_confidence(
     return max(5, min(98, score))
 
 
+def calc_trigger_proximity(current_price: float, entry_zone_low: float,
+                            entry_zone_high: float, atr: float,
+                            direction: str = 'BULLISH') -> dict:
+    """
+    TRIGGER PROXIMITY CALCULATOR
+    ══════════════════════════════════════════════════════════
+    Measures how close current price is to a previously-identified entry
+    trigger zone, in both absolute price terms and ATR units. This gives
+    the AI (and the trader) an explicit sense of "imminent" vs "still far"
+    instead of treating every analysis run as a cold start with no memory
+    of how close the setup has become.
+
+    This does NOT require persistent state between calls — it is computed
+    fresh each run directly from current price vs. the engine's own
+    just-calculated entry zone, so it works even with no database/session
+    memory.
+    """
+    if not entry_zone_low or not entry_zone_high or not atr or atr <= 0:
+        return {
+            'proximity_status': 'UNKNOWN',
+            'distance_price':   None,
+            'distance_atr':     None,
+            'description':      'Insufficient data to calculate trigger proximity.',
+        }
+
+    zone_mid = (entry_zone_low + entry_zone_high) / 2
+
+    if direction == 'BULLISH':
+        # For a long setup, the relevant trigger is typically the zone's
+        # near edge (the level price needs to break/reach)
+        trigger_level = entry_zone_low if current_price < entry_zone_low else entry_zone_high
+        already_in_zone = entry_zone_low <= current_price <= entry_zone_high
+    else:
+        trigger_level = entry_zone_high if current_price > entry_zone_high else entry_zone_low
+        already_in_zone = entry_zone_low <= current_price <= entry_zone_high
+
+    distance_price = abs(current_price - trigger_level)
+    distance_atr    = round(distance_price / atr, 3)
+
+    if already_in_zone:
+        proximity_status = 'IN_ZONE'
+        description = (
+            f'Price ({current_price}) is ALREADY INSIDE the entry zone '
+            f'({entry_zone_low}-{entry_zone_high}). The trigger condition '
+            f'may already be satisfied — re-check the specific candle-close '
+            f'confirmation requirement before treating this as a fresh WAIT.'
+        )
+    elif distance_atr <= 0.15:
+        proximity_status = 'IMMINENT'
+        description = (
+            f'Price is {distance_price:.2f} points ({distance_atr} ATR) from '
+            f'the trigger level {trigger_level}. This is IMMINENT — the next '
+            f'1-2 candles are highly likely to test this level. Do not treat '
+            f'this as a generic "setup developing" WAIT; treat it as '
+            f'"trigger about to fire, monitor closely."'
+        )
+    elif distance_atr <= 0.5:
+        proximity_status = 'APPROACHING'
+        description = (
+            f'Price is {distance_price:.2f} points ({distance_atr} ATR) from '
+            f'the trigger level {trigger_level}. Approaching but not yet '
+            f'imminent.'
+        )
+    else:
+        proximity_status = 'DISTANT'
+        description = (
+            f'Price is {distance_price:.2f} points ({distance_atr} ATR) from '
+            f'the trigger level {trigger_level}. Still a meaningful distance '
+            f'away — standard WAIT framing is appropriate.'
+        )
+
+    return {
+        'proximity_status': proximity_status,
+        'trigger_level':     trigger_level,
+        'distance_price':    round(distance_price, 4),
+        'distance_atr':      distance_atr,
+        'already_in_zone':   already_in_zone,
+        'description':       description,
+    }
+
+
 def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
     result={}
     tf_order=['D1','4H','1H','15M','5M']
@@ -4421,7 +4783,21 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         }
         atr=calc_atr(candles)
         sh,sl=detect_swings(candles)
-        bos,trend=detect_bos_choch(candles,sh,sl)
+        # v8 fix: detect_bos_choch now returns a dict with staleness-aware trend
+        # Pass a timeframe-appropriate staleness window: HTFs get a slightly
+        # more generous tolerance since one HTF candle represents much more
+        # real time than one LTF candle of the same count.
+        _staleness_map = {
+            '4H': 30, '1H': 35, '15M': 40, '5M': 45, '1M': 50,
+            'D1': 20, 'W1': 15,
+        }
+        _staleness = _staleness_map.get(tf, None)  # None → auto 40% of window
+        bos_result = detect_bos_choch(candles, sh, sl, staleness_max_candles=_staleness)
+        bos        = bos_result['events']
+        trend      = bos_result['trend']
+        trend_age       = bos_result['trend_age']
+        trend_stale     = bos_result['trend_stale']
+        trend_raw       = bos_result['raw_trend']
         fvgs=detect_fvg(candles,atr)
         obs=detect_order_blocks(candles,bos,atr)
         liq=detect_liquidity(candles,sh,sl,atr)
@@ -4473,7 +4849,8 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         )
 
         result[tf]={
-            'atr':atr,'trend':trend,'ema_trend':ema_trend,'current_price':candles[-1]['close'],
+            'atr':atr,'trend':trend,'trend_age':trend_age,'trend_stale':trend_stale,
+            'trend_raw':trend_raw,'ema_trend':ema_trend,'current_price':candles[-1]['close'],
             'confidence':tf_conf,
             'swing_highs':sh[-5:],'swing_lows':sl[-5:],'bos_choch':bos[-8:],
             'fvg_fresh':[f for f in fvgs if f['status']=='FRESH'][-5:],
@@ -4495,6 +4872,18 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
     session=calc_session(etf_candles[-1]['epoch']) if etf_candles else {'session':'UNKNOWN','score':0}
     calendar         = fetch_economic_calendar(asset)
     cross_asset      = fetch_cross_asset_data(asset)
+    
+    # Pre-event positioning assessment — for events 1-3 days out
+    # This must run on the FULL events list (not the top-5 truncated one)
+    # so we don't miss a positioning-window event that got pushed out of frame.
+    event_positioning = assess_event_positioning(
+        economic_events = calendar.get('events_full', calendar.get('events', [])),
+        htf_trend       = result.get(htf, {}).get('trend', 'NEUTRAL'),
+        etf_trend       = result.get(etf, {}).get('trend', 'NEUTRAL'),
+        dxy_data        = cross_asset.get('dxy', {}) if 'cross_asset' in dir() else {},
+        asset           = asset,
+    )
+    
     real_outcomes    = get_real_outcomes(asset)
     ml_score         = ml_signal_score(result.get(htf,{}),result.get(etf,{}),indicators_by_tf,
                                session.get('score',0), asset, all_tf_results=result)
@@ -4623,11 +5012,30 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         and wyckoff_compare_htf.get('trade_bias') not in (None, 'NEUTRAL', 'INSUFFICIENT DATA', '')
     )
 
+    # ── Calculate Entry Zone and Trigger Proximity ────────────────────────────
+    # If a pullback pattern with an HTF target zone was identified, use that exact zone
+    # to measure proximity. Otherwise, use a standard ±0.1% estimate around current price.
+    htf_zone = pullback_pattern.get('htf_zone', {}) or {}
+    if htf_zone and 'bottom' in htf_zone and 'top' in htf_zone:
+        approx_entry_low  = htf_zone['bottom']
+        approx_entry_high = htf_zone['top']
+    else:
+        approx_entry_low  = etf_price_for_ev * 0.999
+        approx_entry_high = etf_price_for_ev * 1.001
+
+    trigger_proximity = calc_trigger_proximity(
+        current_price   = etf_price_for_ev,
+        entry_zone_low  = approx_entry_low,
+        entry_zone_high = approx_entry_high,
+        atr             = etf_atr_for_ev,
+        direction       = etf_trend_for_ev,
+    )
+
     # Full risk plan with user's actual account size
     risk_plan = calc_full_risk_plan(
         asset=asset,
-        entry_low=etf_price_for_ev * 0.999,   # approximate — Gemini will use real entry
-        entry_high=etf_price_for_ev * 1.001,
+        entry_low=approx_entry_low,
+        entry_high=approx_entry_high,
         sl=etf_price_for_ev - etf_atr_for_ev * 1.5 if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * 1.5,
         tp1=etf_price_for_ev - etf_atr_for_ev * tp1_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp1_rr,
         tp2=etf_price_for_ev - etf_atr_for_ev * tp2_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp2_rr,
@@ -4659,12 +5067,22 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         'etf':             etf,
         'htf_trend':       result.get(htf, {}).get('trend',      'NEUTRAL'),
         'htf_ema_trend':   result.get(htf, {}).get('ema_trend',  'NEUTRAL'),
+        'trend_staleness_check': {
+            tf_name: {
+                'trend':       result.get(tf_name, {}).get('trend', 'NEUTRAL'),
+                'raw_trend':   result.get(tf_name, {}).get('trend_raw', 'NEUTRAL'),
+                'trend_age':   result.get(tf_name, {}).get('trend_age', None),
+                'is_stale':    result.get(tf_name, {}).get('trend_stale', False),
+            }
+            for tf_name in avail
+        },
         'session':         session,
         'asset_price':     etf_candles[-1]['close'] if etf_candles else 0,
         'ml_score':        ml_score,
         'calendar':        calendar,
         'cross_asset':     cross_asset,
         'correlation_score': cross_asset.get('correlation_score', {}),
+        'event_positioning': event_positioning,
         'win_probability': win_probability,
         'trade_expectancy':trade_expectancy,
         'thesis_status':   thesis_status,
@@ -4676,6 +5094,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
         'wyckoff_aligned': wyckoff_aligned,
         'pullback_pattern':   pullback_pattern,
         'pullback_stage':     pullback_stage,
+        'trigger_proximity':  trigger_proximity,
         'risk_plan':       risk_plan,
         'libs_available':  {
             'numpy': HAS_NUMPY, 'talib': HAS_TALIB,

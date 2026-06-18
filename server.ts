@@ -418,15 +418,19 @@ function formatEngineResults(engineData:any): string {
       });
     }
     // CB Communications (CB Speak) display
+    // NOTE: This is SENTIMENT-LAYER data only. It is NOT a calendar event.
+    // It must never be cited as "Calendar Risk" or "HARD BLOCK" in the verdict —
+    // only as part of the Sentiment Evidence review.
     if (si.cb_analysis && si.cb_analysis.cb_speeches_detected > 0) {
       const cb = si.cb_analysis;
-      block += `  📢 CENTRAL BANK COMMUNICATIONS (CB Speak):\n`;
+      block += `  📢 CENTRAL BANK COMMUNICATIONS (CB Speak) — SENTIMENT LAYER ONLY, NOT A CALENDAR EVENT:\n`;
       block += `    Total Speeches: ${cb.cb_speeches_detected} | Tone: ${cb.overall_cb_tone} | Has Surprise Shift: ${cb.has_surprise ? 'YES ⚡' : 'NO'}\n`;
       if (cb.speeches?.length) {
         cb.speeches.forEach((sp: any) => {
           const surpriseLabel = sp.is_surprise ? '⚡ SURPRISE SHIFT! ' : '';
-          block += `    • [${sp.institution}] ${sp.speaker || 'Speaker'}: ${sp.cb_tone} (Impact: ${sp.impact}) | ${surpriseLabel}${sp.note}\n`;
+          block += `    • [${sp.institution}] ${sp.speaker || 'Speaker'}: ${sp.cb_tone} (Sentiment Relevance: ${sp.sentiment_relevance}) | ${surpriseLabel}${sp.note}\n`;
           block += `      "${sp.title}"\n`;
+          block += `      ⚠️ This is a NEWS HEADLINE, not a scheduled calendar release. Do NOT cite this under "Calendar Risk" or "HARD BLOCK." It belongs in Sentiment Evidence only.\n`;
           if (sp.hawkish_phrases?.length) block += `      Hawkish phrases matching: ${sp.hawkish_phrases.join(', ')}\n`;
           if (sp.dovish_phrases?.length)  block += `      Dovish phrases matching: ${sp.dovish_phrases.join(', ')}\n`;
         });
@@ -460,8 +464,17 @@ function formatEngineResults(engineData:any): string {
     block += `\nFUNDAMENTAL INTELLIGENCE:\n`;
     if(fi.economic_events?.length){
       block += `  ECONOMIC EVENTS:\n`;
+      const tagMap: Record<string,string> = {
+        'IMMEDIATE_BLOCK':     '[HARD BLOCK ZONE]',
+        'NEAR_TERM_CAUTION':   '[NEAR-TERM — CAUTION ONLY]',
+        'SAME_DAY_AWARENESS':  '[LATER TODAY — BACKGROUND]',
+        'POSITIONING_WINDOW':  '[1-3 DAYS OUT — NOT A BLOCK]',
+        'DISTANT_NO_IMPACT':   '[SAFE - IGNORE FOR ENTRY TIMING]',
+        'PASSED':              '[ALREADY RELEASED]',
+      };
       fi.economic_events.forEach((e:any) => {
-        block += `    ${e.title} (${e.currency}) @ ${e.time_utc} | Status:${e.status} | Actual:${e.actual} Forecast:${e.forecast} → SURPRISE:${e.surprise}\n`;
+        const tag = tagMap[e.time_bucket] || '[CHECK TIMING]';
+        block += `    ${e.title} (${e.currency}) @ ${e.time_utc} (${e.days_away ?? '?'} days away) | Status:${e.status} | Actual:${e.actual} Forecast:${e.forecast} → SURPRISE:${e.surprise} ${tag}\n`;
       });
     }
     if(fi.surprises?.length){
@@ -598,16 +611,51 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     block += `  Engine Assessment: ${pb.description}\n`;
     block += `  Filter Override: ${pb.kill_htf_filter ? 'YES — HTF/ETF conflict cap removed' : 'NO'}\n`;
   }
+  
+  if (s.trigger_proximity) {
+    const prox = s.trigger_proximity;
+    block += `\nTRIGGER PROXIMITY INTELLIGENCE:\n`;
+    block += `  Proximity Status: ${prox.proximity_status} (Level: ${prox.trigger_level})\n`;
+    block += `  Distance: ${prox.distance_price} points (${prox.distance_atr} ATR)\n`;
+    block += `  Engine Assessment: ${prox.description}\n`;
+  }
+
+  if (s.trend_staleness_check) {
+    block += `\nTREND_STALENESS_CHECK (v8):\n`;
+    Object.entries(s.trend_staleness_check).forEach(([tf, data]: [string, any]) => {
+      const staleFlag = data.is_stale ? ' ⚠️ DECAYED TO NEUTRAL — raw structure was stale' : '';
+      const ageTxt = data.trend_age !== null ? `${data.trend_age} candles since defining BOS/CHoCH` : 'no structure event found';
+      block += `  ${tf}: ${data.trend} (raw: ${data.raw_trend}, ${ageTxt})${staleFlag}\n`;
+    });
+  }
+
   if(s.calendar){
     const cal=s.calendar;
     if(cal.hard_pause) block+=`\n⛔ CALENDAR HARD PAUSE: ${cal.pause_reason}\n`;
     else if(cal.events?.length){
       block+=`\nCALENDAR:\n`;
       cal.events.slice(0,3).forEach((e:any)=>{
-        const isSafe = e.minutes_away > 120;
-        block+=`  ${e.title} (${e.currency}) @ ${e.time_utc} (in ${e.minutes_away} min) ${e.status} | F:${e.forecast} P:${e.previous} ${isSafe ? '[SAFE - IGNORE THIS CALENDAR EVENT]' : ''}\n`;
+        const bucket = e.time_bucket || (e.minutes_away > 120 ? 'DISTANT_NO_IMPACT' : 'SAME_DAY_AWARENESS');
+        const tagMap: Record<string,string> = {
+          'IMMEDIATE_BLOCK':     '[HARD BLOCK ZONE — 0-30 MIN]',
+          'NEAR_TERM_CAUTION':   '[NEAR-TERM — REDUCE SIZE, DO NOT HARD BLOCK]',
+          'SAME_DAY_AWARENESS':  '[LATER TODAY — BACKGROUND AWARENESS ONLY]',
+          'POSITIONING_WINDOW':  '[1-3 DAYS OUT — NOT A BLOCK. SEE EVENT_POSITIONING BELOW]',
+          'DISTANT_NO_IMPACT':   '[SAFE - IGNORE THIS CALENDAR EVENT FOR ENTRY TIMING]',
+          'PASSED':              '[ALREADY RELEASED]',
+        };
+        const tag = tagMap[bucket] || '';
+        block+=`  ${e.title} (${e.currency}) @ ${e.time_utc} (in ${e.minutes_away} min / ${e.days_away ?? '?'} days) ${e.status} | F:${e.forecast} P:${e.previous} ${tag}\n`;
       });
     }
+  }
+
+  if(s.event_positioning?.has_positioning_event){
+    const ep = s.event_positioning;
+    block += `\nEVENT_POSITIONING:\n`;
+    block += `  ${ep.description}\n`;
+    block += `  Pre-Event Structural Drift: ${ep.pre_event_drift}\n`;
+    if(ep.consensus_direction_hint) block += `  Consensus Signal: ${ep.consensus_direction_hint}\n`;
   }
   const tfs=Object.keys(engineData).filter(k=>k!=='_summary');
   for(const tf of tfs){
@@ -749,6 +797,25 @@ Review each package and ask:
 
 TECHNICAL REVIEW:
 - Is structure aligned across timeframes? Or mixed and contradictory?
+- BEFORE citing an HTF/LTF "conflict," check the TREND_STALENESS_CHECK block:
+    - If either timeframe's trend_age is large relative to its own typical
+      structure cycle (a rough guide: HTF trend_age > 30 H4 candles ≈ 5 days
+      of no new structure, LTF trend_age > 40 candles on 5M ≈ 3+ hours of no
+      new structure), treat that timeframe's trend label with skepticism.
+      A trend label backed by an old, unrefreshed BOS/CHoCH is weaker
+      evidence than one backed by a recent event, even if both are
+      technically "BULLISH" or "BEARISH."
+    - If a timeframe shows is_stale = true, its trend has already decayed to
+      NEUTRAL — treat it as NEUTRAL, not as the opposite extreme of whatever
+      it used to be. A decayed-to-NEUTRAL HTF does NOT create a conflict with
+      a clearly-trending LTF; it simply means the HTF currently has no fresh
+      directional conviction.
+    - A genuine, actionable HTF/LTF conflict requires BOTH timeframes to have
+      a RECENT (non-stale) trend in opposing directions. If one side is stale
+      or has decayed to NEUTRAL, downgrade your contradiction language —
+      do not describe this as a "moderate conflict" or "tug-of-war." Describe
+      it accurately as "HTF structure lacks recent confirmation" or similar,
+      and weight the fresher timeframe's trend more heavily in your bias.
 - Is price at a significant level (OB, FVG, liquidity, POC) or in no-man's land?
 - Does the regime support this type of entry? (Trending regime → BOS+OB entries. Ranging → mean reversion.)
 - Has a liquidity sweep occurred? Is it genuine displacement or a trap?
@@ -768,15 +835,75 @@ TECHNICAL REVIEW:
 - Is there a wave extension? If yes, note as risk but do NOT auto-block.
 
 FUNDAMENTAL REVIEW:
-- Are any economic events imminent? If within 30 minutes: WAIT or AVOID.
+- Are any economic events imminent? Use the event's time_bucket, NOT your own
+  estimate of "feels soon":
+    IMMEDIATE_BLOCK (0-30 min)      → HARD BLOCK candidate. See Level 4.
+    NEAR_TERM_CAUTION (30-120 min)  → Reduce size. Do NOT hard block on this alone.
+    SAME_DAY_AWARENESS (2-24 hrs)   → Background context only. Does not change verdict
+                                       for a scalp/intraday decision made now.
+    POSITIONING_WINDOW (1-3 days)   → NOT a block of any kind. See PRE-EVENT
+                                       POSITIONING PROTOCOL below — this is where
+                                       professional desks find opportunity, not risk.
+    DISTANT_NO_IMPACT (3+ days)     → Ignore completely. Do not mention it as a
+                                       factor in your verdict.
 - Did any event surprise (BEAT/MISS vs forecast)? What does that mean for this asset?
 - Is the DXY environment aligned with the technical bias?
 - For Gold: USD strengthening = fundamental headwind. Risk-off = fundamental tailwind.
 - A fundamental headwind is NOT an automatic AVOID. It is a size-reduction signal.
 
+PRE-EVENT POSITIONING PROTOCOL (events 1-3 days out):
+A known, scheduled, high-impact event 1-3 days away is not a reason to do
+nothing — it is a reason to ask a different question: "Is the market already
+leaning a direction ahead of this print, and is there a positioning edge?"
+
+When the EVENT_POSITIONING block is present in the data:
+- pre_event_drift = BUILDING_LONG_BIAS or BUILDING_SHORT_BIAS means HTF and ETF
+  already agree on direction in the days leading into the event. This is
+  informative: institutional flow may already be positioning ahead of the
+  release, consistent with how professional macro desks trade known catalysts
+  (build the position before the print, not gamble on the print itself).
+- pre_event_drift = NEUTRAL_CONSOLIDATION means the market is undecided ahead
+  of the event. Treat the event as a coiling/compression signal — note it,
+  but do not invent a directional bias that isn't supported by the technical
+  evidence.
+- The consensus_direction_hint (e.g. "GDP forecast below previous — market
+  expects deceleration") is a FACTUAL data point, not a trade signal by
+  itself. Combine it with your technical and quantitative evidence as you
+  would any other fundamental fact. Do NOT treat the mere existence of the
+  hint as bullish or bearish — only state what it implies IF the
+  technical/quant evidence in this report independently agrees.
+- A trade entered today with a 1-3 day positioning-window event ahead of it
+  is normal and acceptable, PROVIDED:
+    a) the technical and quantitative evidence support entry independent of
+       the event, and
+    b) you note in your reasoning that the position may face volatility
+       around the event date if the holding period extends that far, and
+       suggest a partial profit-take or stop-tightening approach before
+       the event if the trade is still open near that time.
+- NEVER use a POSITIONING_WINDOW or DISTANT_NO_IMPACT event as a HARD BLOCK
+  or as a reason for AVOID. Doing so is a calibration error — name it as
+  such if you catch yourself about to do this, and proceed to your verdict
+  based on the technical/quant/sentiment evidence instead.
+
 SENTIMENT REVIEW:
 - What is the keyword sentiment score (bullish/bearish)?
 - Is there BREAKING news (≤30 min)?
+- CENTRAL BANK SPEECH DATA ("CB Speak") IS SENTIMENT, NOT CALENDAR:
+  Fed/ECB/BOE/BOJ speech headlines detected in the news feed carry a
+  "Sentiment Relevance" rating (HIGH/MEDIUM/LOW). This rating describes how
+  much weight to give the speaker's institution WITHIN your sentiment
+  analysis. It is COMPLETELY SEPARATE from the calendar engine's
+  time_bucket system. A Fed speech headline with "Sentiment Relevance: HIGH"
+  is NOT a scheduled, timed economic release, and must NEVER be cited as:
+    - "Calendar Risk: HARD BLOCK"
+    - "Calendar Warning: HIGH-IMPACT [X] VOLATILITY"
+    - A reason satisfying HARD BLOCK condition A (which requires an ACTUAL
+      calendar event with time_bucket = IMMEDIATE_BLOCK)
+  If you want to factor in hawkish/dovish Fed commentary, do so ONLY inside
+  your Sentiment Evidence section, weighted like any other sentiment signal
+  (consider priced_in / actionable status). It can inform your CONFIDENCE
+  level or justify EXECUTE WITH CAUTION over EXECUTE, but it can NEVER by
+  itself justify a WAIT-for-calendar or an AVOID-for-calendar verdict.
 - CRITICAL QUESTION: Is the sentiment already priced in, or is it new information?
   Example: "Gold surges on rate cut hopes" — if rate cuts expected for weeks = PRICED IN.
   Example: "Fed surprises with emergency rate hike" — new, not priced in.
@@ -790,6 +917,15 @@ QUANTITATIVE REVIEW:
 - What does the backtest say? If under 20 trades, treat with scepticism but do not auto-block.
 - Confluence ≥ 70 + EV ≥ 1.5R + Win Probability ≥ 60% = STRONG QUANT SIGNAL.
   A strong quant signal can only be blocked by a HARD BLOCK condition (see below).
+
+RISK SIZING REVIEW:
+- Check the position sizing data for a 'floor_breach' flag.
+- If floor_breach is true, you MUST explain it using the specific numbers in
+  'floor_breach_detail' (the exact SL distance that would hit the requested
+  risk%, expressed in real price points for this asset).
+- NEVER simply say "verify before executing" without giving the trader the
+  actual number that would fix the discrepancy. A risk officer who spots a
+  sizing problem always tells you the fix, not just that a problem exists.
 
 ═══════════════════════════════════════════════════════
 FOUR-LEVEL VETO SYSTEM — CALIBRATED DECISION TREE
@@ -832,13 +968,18 @@ Note the specific contradicting factor in the reasoning.
 LEVEL 3 — CLEAR CONTRADICTION → WAIT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Condition: Technical signal is present but a clearly opposing factor needs to
-resolve before entry is warranted. Price is not yet at the entry zone, OR a
-significant macro event is 30–60 min away, OR fundamental clearly opposes
-the technical direction.
+resolve before entry is warranted. Price is not yet at the entry zone (Trigger
+Proximity is DISTANT), OR a significant macro event is 30–60 min away, OR
+fundamental clearly opposes the technical direction.
+
+PROXIMITY RULE: If TRIGGER PROXIMITY INTELLIGENCE indicates the setup is
+DISTANT, you must NOT issue an EXECUTE command. You must issue a WAIT verdict
+clearly indicating the setup is structurally valid but price is currently too
+far away to execute securely.
 
 Examples:
   Technical BUY | Fundamental SELL (DXY strongly up, yields rising) | Sentiment NEUTRAL → WAIT
-  Technical BUY | Price has not yet reached OB/entry zone → WAIT
+  Technical BUY | Proximity is DISTANT | Price has not reached OB/entry zone → WAIT
   Technical BUY | NFP in 45 min → WAIT (enter after release if structure holds)
   Technical BUY | Sentiment BEARISH (actionable, not priced-in) → WAIT
 
@@ -853,7 +994,13 @@ AVOID requires at least one HARD BLOCK condition. Without a hard block,
 AVOID is NOT permitted — downgrade to WAIT instead.
 
 HARD BLOCK conditions (any one is sufficient):
-  A. High-impact event within 30 minutes: NFP, CPI, FOMC, GDP, PCE, Fed speech
+  A. High-impact event within 30 minutes (time_bucket = IMMEDIATE_BLOCK only):
+     NFP, CPI, FOMC, GDP, PCE, Fed speech.
+     IMPORTANT: An event with time_bucket = POSITIONING_WINDOW, SAME_DAY_AWARENESS,
+     or DISTANT_NO_IMPACT does NOT satisfy condition A, regardless of how
+     high-impact the event itself is. A GDP release in 8 days is the same
+     event type as a GDP release in 8 minutes — but only one of them is a
+     hard block. Check time_bucket explicitly before citing condition A.
   B. Win probability < 40% AND confluence < 60
   C. EV is NEGATIVE in REAL_DATA mode (after 50+ real trades)
   D. TWO OR MORE evidence layers strongly opposing at HIGH confidence:
@@ -919,12 +1066,26 @@ STATE EXPLICITLY:
 LAYER 3 — CALENDAR RISK
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+BEFORE writing any sentence containing the words "Calendar Risk," "Calendar
+Warning," or "HARD BLOCK" in connection with a news/macro event, verify:
+  1. Does a CALENDAR (not CB Speak / sentiment) block exist in the data with
+     an actual time_bucket field?
+  2. Is that time_bucket = IMMEDIATE_BLOCK (0-30 min) or, at most,
+     NEAR_TERM_CAUTION (30-120 min)?
+  3. If NO real calendar event with that classification exists, you may NOT
+     use "Calendar Risk" or "HARD BLOCK" language anywhere in your response —
+     not in Contradiction Analysis, not in the Decision section, not in the
+     Calendar Warning field. Write "Calendar Warning: CLEAR" instead, even if
+     CB Speak / sentiment data shows hawkish commentary. That commentary
+     belongs in your Sentiment Evidence and Market Narrative only.
+
 CRITICAL CALENDAR RULE:
 Look at the CURRENT UTC TIME at the top of this prompt. Compare it to the event time.
 DO NOT apply Calendar blocks for events that are more than 2 hours (120 minutes) away.
 If the news is tomorrow, or later today, it is CLEAR. Do NOT block.
 
-Events within 30 minutes: NFP, CPI, FOMC, GDP, PCE, Fed speech = HARD BLOCK → AVOID
+Events within 30 minutes (verified via the CALENDAR block, not CB Speak):
+NFP, CPI, FOMC, GDP, PCE, Fed speech = HARD BLOCK → AVOID
 Events within 60 minutes: ISM PMI, Retail Sales, ADP, PPI = Level 2 (EXECUTE WITH CAUTION, reduce size) or Level 3 (WAIT), depending on quant strength
 Events within 30–60 min for medium-impact = WAIT only if quant signal is weak. Strong quant signal (confluence ≥ 70) = EXECUTE WITH CAUTION at 50% size.
 
@@ -1085,11 +1246,23 @@ Do NOT lead with risk warnings on a high-quality setup.]
 - **Target 2 (TP2):** [Price] — R:R [ratio]
 - **Target 3 (TP3):** [Price] — R:R [ratio]
 - **Position Size:** [lot_size] lots — risks $[risk_amount] ([risk_pct]% of account) for this [BUY/SELL] position
-  [If EXECUTE WITH CAUTION: show 50% of standard lot size]
+  IF floor_breach is true in the sizing data: do NOT just append a generic
+  verification warning. Instead write:
+  "⚠️ MINIMUM LOT FLOOR REACHED: [floor_breach_detail verbatim from the data].
+  Recommended action: [pick ONE specific recommendation — either suggest the
+  tighter SL distance if the technical structure has a valid closer
+  invalidation level, or explicitly state the trader should treat this as
+  a smaller risk-tolerance trade given the wide stop, or suggest increasing
+  account size allocation for wide-stop setups on this instrument]."
+  [If EXECUTE WITH CAUTION and no floor breach: show 50% of standard lot size]
 - **Break-Even:** Move SL to entry after TP1 hit
 - **Win Probability:** [win_pct]% | Expected Value: [ev]R
 - **Wyckoff Context:** [phase — one sentence]
 - **Calendar Warning:** [CLEAR / UPCOMING EVENT — time and impact / HARD BLOCK]
+  (This field reflects ONLY the CALENDAR data block's time_bucket. It must
+  say CLEAR whenever no calendar event carries time_bucket = IMMEDIATE_BLOCK
+  or NEAR_TERM_CAUTION — regardless of any Fed/CB sentiment commentary
+  detected elsewhere in the report.)
 
 **CRITICAL RULE:** Never just specify 'entry' or list price values without clearly and repeatedly labeling whether the position is a BUY (LONG) or a SELL (SHORT). Every execution instruction must explicitly designate the buy/sell directive.
 
