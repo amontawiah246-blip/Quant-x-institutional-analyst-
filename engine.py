@@ -3703,19 +3703,22 @@ def calc_full_risk_plan(
     be_price      = round(entry_mid + be_move_pts if tp1 and tp1 > entry_mid else entry_mid - be_move_pts, 6)
 
     return {
-        'entry_mid':       round(entry_mid, 6),
-        'lot_size':        lot_size,
-        'risk_amount_usd': round(risk_amount, 2),
-        'risk_pct':        sizing['actual_risk_pct'],
-        'sl_distance_pts': sizing['sl_distance_pts'],
-        'sl_in_pips':      sizing['sl_in_pips'],
-        'tp1_plan':        calc_rr(tp1),
-        'tp2_plan':        calc_rr(tp2),
-        'tp3_plan':        calc_rr(tp3),
-        'break_even_price': be_price,
-        'atr_vs_sl':       round(sizing['sl_distance_pts'] / atr, 2) if atr > 0 else None,
-        'note':            sizing['note'],
-        'warning':         'SL is less than 1x ATR — very tight stop, high chance of noise stop-out' if atr > 0 and sizing['sl_distance_pts'] < atr else None,
+        'entry_mid':         round(entry_mid, 6),
+        'lot_size':          lot_size,
+        'risk_amount_usd':   round(risk_amount, 2),
+        'risk_pct':          sizing['actual_risk_pct'],
+        'sl_distance_pts':   sizing['sl_distance_pts'],
+        'sl_in_pips':        sizing['sl_in_pips'],
+        'tp1_plan':          calc_rr(tp1),
+        'tp2_plan':          calc_rr(tp2),
+        'tp3_plan':          calc_rr(tp3),
+        'break_even_price':  be_price,
+        'atr_vs_sl':         round(sizing['sl_distance_pts'] / atr, 2) if atr > 0 else None,
+        'note':              sizing['note'],
+        'warning':           'SL is less than 1x ATR — very tight stop, high chance of noise stop-out' if atr > 0 and sizing['sl_distance_pts'] < atr else None,
+        'floor_breach':        sizing.get('floor_breach', False),
+        'floor_breach_detail': sizing.get('floor_breach_detail', None),
+        'raw_lot_size':        sizing.get('raw_lot_size', None),
     }
 
 

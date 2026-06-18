@@ -589,6 +589,11 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     block+=`  EV=${te.expected_value_r}R | ${te.verdict}\n`;
     block+=`  ${te.interpretation}\n`;
     block+=`  Kelly Full:${te.kelly_full_pct}% | Kelly Half:${te.kelly_half_pct}% (use half-Kelly for safety)\n`;
+    if (te.floor_breach && te.floor_breach_detail) {
+      block += `  ⚠️ MINIMUM LOT FLOOR BREACH: ${te.floor_breach_detail}\n`;
+    } else if (s.risk_plan && s.risk_plan.floor_breach && s.risk_plan.floor_breach_detail) {
+      block += `  ⚠️ MINIMUM LOT FLOOR BREACH: ${s.risk_plan.floor_breach_detail}\n`;
+    }
   }
   if(s.wyckoff_htf?.phase&&s.wyckoff_htf.phase!=='INSUFFICIENT DATA'){
     block+=`\nWYCKOFF CROSS-TF:\n`;
