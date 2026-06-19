@@ -4763,8 +4763,10 @@ def calc_trigger_proximity(current_price: float, entry_zone_low: float,
     }
 
 
-def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
+def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
+               live_mid_price=None, live_bid=None, live_ask=None, live_tick_epoch=None):
     result={}
+    has_live_price = live_mid_price is not None and live_mid_price > 0
     tf_order=['D1','4H','1H','15M','5M']
     avail=[tf for tf in tf_order if tf in candles_by_tf and len(candles_by_tf[tf])>20]
     if not avail: return {'error':'No valid timeframes provided'}
@@ -4853,7 +4855,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
 
         result[tf]={
             'atr':atr,'trend':trend,'trend_age':trend_age,'trend_stale':trend_stale,
-            'trend_raw':trend_raw,'ema_trend':ema_trend,'current_price':candles[-1]['close'],
+            'trend_raw':trend_raw,'ema_trend':ema_trend,'current_price':(live_mid_price if has_live_price and tf == etf else candles[-1]['close']),
             'confidence':tf_conf,
             'swing_highs':sh[-5:],'swing_lows':sl[-5:],'bos_choch':bos[-8:],
             'fvg_fresh':[f for f in fvgs if f['status']=='FRESH'][-5:],
@@ -5080,7 +5082,20 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0):
             for tf_name in avail
         },
         'session':         session,
-        'asset_price':     etf_candles[-1]['close'] if etf_candles else 0,
+        'asset_price':     (live_mid_price if has_live_price else (etf_candles[-1]['close'] if etf_candles else 0)),
+        'live_price_used':   has_live_price,
+        'live_mid_price':    live_mid_price if has_live_price else None,
+        'live_bid':          live_bid,
+        'live_ask':          live_ask,
+        'live_tick_epoch':   live_tick_epoch,
+        'candle_close_price': candles_by_tf.get(etf, [{}])[-1].get('close', None) if candles_by_tf.get(etf) else None,
+        'price_staleness_note': (
+            f'Live tick used: {live_mid_price} '
+            f'(candle close was {candles_by_tf.get(etf,[{}])[-1].get("close","?") if candles_by_tf.get(etf) else "?"} — '
+            f'difference: {abs(live_mid_price - candles_by_tf.get(etf,[{}])[-1].get("close",live_mid_price)):.2f} pts)'
+            if has_live_price else
+            'WARNING: No live tick available. current_price is from last completed candle close — may be up to 7 minutes stale.'
+        ),
         'ml_score':        ml_score,
         'calendar':        calendar,
         'cross_asset':     cross_asset,
@@ -5130,6 +5145,10 @@ def main():
                 data.get('asset', ''),
                 data.get('account_size', 10000),
                 data.get('risk_pct', 1.0),
+                live_mid_price=data.get('live_mid_price', None),
+                live_bid=data.get('live_bid', None),
+                live_ask=data.get('live_ask', None),
+                live_tick_epoch=data.get('live_tick_epoch', None),
             )
             print(json.dumps(result))
 

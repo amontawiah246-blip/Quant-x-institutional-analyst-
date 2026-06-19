@@ -15,9 +15,9 @@ const DERIV_SYMBOLS: Record<string, string> = {
   US30:'OTC_US30', NAS100:'OTC_US_TECH', STOXX50:'OTC_STOXX50'
 };
 
-// In-memory candle cache — prevents re-fetching same candles within 2 minutes
+// In-memory candle cache — prevents re-fetching same candles within 30 seconds
 const candleCache = new Map<string, { candles: Candle[], timestamp: number }>();
-const CACHE_TTL_MS = 120_000;
+const CACHE_TTL_MS = 30_000;
 
 async function fetchCachedCandles(symbol: string, granularity: number, count: number): Promise<Candle[]> {
   const key    = `${symbol}_${granularity}`;
@@ -86,6 +86,59 @@ function fetchDerivCandles(symbol:string, granularity:number, count=500): Promis
   });
 }
 
+/**
+ * fetchLiveTick — Gets the true live bid/ask and mid price for an asset.
+ *
+ * Unlike fetchDerivCandles(), this does NOT return candles — it returns
+ * the current tick (real-time price) from Deriv's WebSocket. This is used
+ * to override the stale "last candle close" that the engine uses as
+ * current_price, ensuring the analysis reflects where price ACTUALLY IS
+ * right now rather than where it was up to 7 minutes ago.
+ *
+ * Returns: { bid, ask, mid, epoch, symbol } or null on failure.
+ */
+function fetchLiveTick(symbol: string): Promise<{ bid: number; ask: number; mid: number; epoch: number; symbol: string } | null> {
+  return new Promise((resolve) => {
+    const ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=1089');
+    const timeout = setTimeout(() => { ws.terminate(); resolve(null); }, 8000);
+
+    ws.on('open', () => {
+      // Request a single tick (current price) — not historical candles
+      ws.send(JSON.stringify({ ticks: symbol, subscribe: 0 }));
+    });
+
+    ws.on('message', (raw: Buffer | string) => {
+      try {
+        const data = JSON.parse(raw.toString());
+        clearTimeout(timeout);
+        ws.close();
+
+        if (data.error || !data.tick) {
+          resolve(null);
+          return;
+        }
+
+        const tick = data.tick;
+        const bid  = parseFloat(tick.bid  ?? tick.quote ?? 0);
+        const ask  = parseFloat(tick.ask  ?? tick.quote ?? 0);
+        const mid  = ask > 0 && bid > 0 ? (bid + ask) / 2 : (tick.quote ? parseFloat(tick.quote) : 0);
+
+        resolve({
+          bid:    Math.round(bid  * 100000) / 100000,
+          ask:    Math.round(ask  * 100000) / 100000,
+          mid:    Math.round(mid  * 100000) / 100000,
+          epoch:  tick.epoch || Math.floor(Date.now() / 1000),
+          symbol: symbol,
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+
+    ws.on('error', () => { clearTimeout(timeout); resolve(null); });
+  });
+}
+
 // ─── Python engine caller ─────────────────────────────────────────────────────
 function runPythonOperation(payload: Record<string,any>): Promise<any> {
   return new Promise((resolve) => {
@@ -106,8 +159,27 @@ function runPythonOperation(payload: Record<string,any>): Promise<any> {
   });
 }
 
-function runPythonEngine(candlesByTF:Record<string,Candle[]>, asset:string, accountSize=10000, riskPct=1.0): Promise<any> {
-  return runPythonOperation({operation:'analyze', candles:candlesByTF, asset, account_size:accountSize, risk_pct:riskPct});
+function runPythonEngine(
+  candlesByTF: Record<string, Candle[]>,
+  asset: string,
+  accountSize = 10000,
+  riskPct = 1.0,
+  liveMidPrice?: number | null,
+  liveBid?: number | null,
+  liveAsk?: number | null,
+  liveTickEpoch?: number | null
+): Promise<any> {
+  return runPythonOperation({
+    operation: 'analyze',
+    candles: candlesByTF,
+    asset,
+    account_size: accountSize,
+    risk_pct: riskPct,
+    live_mid_price: liveMidPrice,
+    live_bid: liveBid,
+    live_ask: liveAsk,
+    live_tick_epoch: liveTickEpoch,
+  });
 }
 
 // ─── RSS NEWS FETCHER ─────────────────────────────────────────────────────────
@@ -632,6 +704,16 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
       const ageTxt = data.trend_age !== null ? `${data.trend_age} candles since defining BOS/CHoCH` : 'no structure event found';
       block += `  ${tf}: ${data.trend} (raw: ${data.raw_trend}, ${ageTxt})${staleFlag}\n`;
     });
+  }
+
+  if (s.price_staleness_note) {
+    block += `\nLIVE_PRICE_STATUS: ${s.price_staleness_note}\n`;
+    if (s.live_mid_price && s.candle_close_price) {
+      const drift = Math.abs(s.live_mid_price - s.candle_close_price);
+      if (drift > 1.0) {
+        block += `⚠️ PRICE DRIFT DETECTED: Live price (${s.live_mid_price}) differs from last candle close (${s.candle_close_price}) by ${drift.toFixed(2)} points. All zone/trigger distances have been recalculated using the live price.\n`;
+      }
+    }
   }
 
   if(s.calendar){
@@ -1228,6 +1310,25 @@ Do NOT lead with risk warnings on a high-quality setup.]
 ## EXECUTION PLAN
 [ALWAYS show this section — for ALL four verdicts]
 
+LIVE PRICE INTEGRITY CHECK:
+Before issuing any EXECUTE or EXECUTE WITH CAUTION verdict, check the
+LIVE_PRICE_STATUS block in the data:
+- If live_price_used = true: the current_price you are analyzing is a REAL
+  LIVE tick, accurate to within seconds. Entry zone proximity calculations
+  are trustworthy.
+- If live_price_used = false (or the block shows WARNING): current_price
+  is the last completed candle close and may be UP TO 7 MINUTES STALE on
+  the 5M timeframe. In this case:
+  1. Reduce confidence in any "price is inside the zone" claim
+  2. Add a explicit note to the trader: "PRICE DATA MAY BE STALE — verify
+     current price on your broker before executing"
+  3. Downgrade EXECUTE → EXECUTE WITH CAUTION if price drift is unknown
+  4. Do NOT issue EXECUTE if the live price status is unknown and the entry
+     zone is narrow (< 10 points wide for Gold)
+- If PRICE DRIFT DETECTED is shown: cite the drift amount in your Technical
+  Evidence section and recalculate whether price is still in the entry zone
+  using the live price, NOT the candle close.
+
 **CRITICAL ENTRY RULE:** 
 - For SCALPING mode, you MUST find and state the entry zone and triggers strictly on the lower 5-minute timeframe, not the higher timeframe.
 - For SWING mode, you MUST find and state the entry zone and triggers strictly on the 15-minute timeframe.
@@ -1339,6 +1440,25 @@ async function startServer() {
     });
   });
 
+  // v9 fix: Live price endpoint for dashboard instrument panel
+  app.get('/api/live-price', async (req, res) => {
+    const asset  = (req.query.asset as string || '').toUpperCase();
+    const symbol = DERIV_SYMBOLS[asset];
+    if (!symbol) return res.status(400).json({ error: 'Unknown asset' });
+
+    const tick = await fetchLiveTick(symbol);
+    if (!tick) return res.status(503).json({ error: 'Price unavailable' });
+
+    res.json({
+      asset,
+      bid:    tick.bid,
+      ask:    tick.ask,
+      mid:    tick.mid,
+      epoch:  tick.epoch,
+      change: 0,  // change% requires prior close
+    });
+  });
+
   // Signal performance summary endpoint
   app.get('/api/performance', async(req,res) => {
     try {
@@ -1426,9 +1546,31 @@ async function startServer() {
         htfTrend: 'CALCULATING', // engine not done yet — OpenRouter works from candles directly
       };
 
+      // v9 fix: Fetch LIVE tick price to override the stale candle close
+      // The last candle in any timeframe is a COMPLETED candle — its close
+      // can be up to 5 minutes old on 5M TF, compounded by the 2min cache.
+      // This single tick fetch is near-instant and gives the real current price.
+      const liveTick = derivSymbol ? await fetchLiveTick(derivSymbol) : null;
+      const liveMidPrice = liveTick?.mid ?? null;
+
+      if (liveTick) {
+        console.log(`Live tick for ${asset}: bid=${liveTick.bid} ask=${liveTick.ask} mid=${liveTick.mid}`);
+      } else {
+        console.warn(`Live tick unavailable for ${asset} — falling back to last candle close`);
+      }
+
       // Engine and news run in parallel — independent of each other
       const [engineResult, newsResult] = await Promise.allSettled([
-        runPythonEngine(candlesByTF, asset, userAccountSize, userRiskPct),
+        runPythonEngine(
+          candlesByTF,
+          asset,
+          userAccountSize,
+          userRiskPct,
+          liveMidPrice,
+          liveTick?.bid ?? null,
+          liveTick?.ask ?? null,
+          liveTick?.epoch ?? null
+        ),
         fetchRSSNews(asset),
       ]);
       const engineData = engineResult.status === 'fulfilled' ? engineResult.value : {error:'Engine failed'};

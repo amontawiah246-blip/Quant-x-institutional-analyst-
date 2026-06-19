@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { MARKETS, MarketCategory, TradingMode } from '../types';
 import { Activity, Target, Crosshair, BarChart3, Settings } from 'lucide-react';
@@ -15,6 +15,48 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
   
   const [result, setResult] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number; change: number }>>({});
+
+  // v9 fix: Fetch real live prices for the instrument panel
+  useEffect(() => {
+    const DERIV_SYMBOLS: Record<string, string> = {
+      XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD', USOIL: 'frxUSOIL',
+      XNGUSD: 'frxXNGUSD', BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD',
+      EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
+    };
+
+    const allAssets = Object.values(MARKETS).flat();
+    const priceUpdates: Record<string, { bid: number; ask: number; change: number }> = {};
+
+    const fetchPriceForAsset = async (asset: string) => {
+      const symbol = DERIV_SYMBOLS[asset];
+      if (!symbol) return;
+      try {
+        // Use server-side price endpoint to avoid CORS/WS from browser
+        const res = await fetch(`/api/live-price?asset=${asset}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.bid && data.ask) {
+          priceUpdates[asset] = {
+            bid:    data.bid,
+            ask:    data.ask,
+            change: data.change ?? 0,
+          };
+          setLivePrices(prev => ({ ...prev, [asset]: priceUpdates[asset] }));
+        }
+      } catch { /* silent fail — UI shows stale or blank */ }
+    };
+
+    // Fetch all visible assets on mount
+    allAssets.forEach(fetchPriceForAsset);
+
+    // Refresh every 30 seconds (not too aggressive, Deriv rate limits)
+    const interval = setInterval(() => {
+      allAssets.forEach(fetchPriceForAsset);
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, []);
 
   const handleExecute = async () => {
     setIsLoading(true);
@@ -107,13 +149,23 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
             <div className="flex flex-col gap-1">
               {MARKETS[activeCategory].map(asset => {
                 const isSelected = selectedAsset === asset;
-                let val = 0;
-                for (let i = 0; i < asset.length; i++) val += asset.charCodeAt(i);
                 
-                // Generating some dummy price numbers for visual simulation based on asset
-                const basePrice = (activeCategory === 'Forex') ? (val / 100) : (activeCategory === 'Crypto' ? val * 50 : val * 10);
-                const spread = basePrice * 0.0001;
-                const isUp = val % 2 === 0;
+                // v9 fix: Use live price tick if available, fallback gracefully to base prices
+                const liveData = livePrices[asset];
+                let bid      = liveData?.bid ?? null;
+                let ask      = liveData?.ask ?? null;
+                let isUp     = liveData ? liveData.change >= 0 : true;
+                const decimals = activeCategory === 'Forex' ? 4 : activeCategory === 'Crypto' ? 2 : 2;
+
+                if (!liveData) {
+                  let val = 0;
+                  for (let i = 0; i < asset.length; i++) val += asset.charCodeAt(i);
+                  const basePrice = (activeCategory === 'Forex') ? (val / 100) : (activeCategory === 'Crypto' ? val * 50 : val * 10);
+                  const spread = basePrice * 0.0001;
+                  bid = basePrice;
+                  ask = basePrice + spread;
+                  isUp = val % 2 === 0;
+                }
                 
                 return (
                   <button
@@ -128,11 +180,11 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
                        </span>
                     </div>
                     
-                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${isUp ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
-                      {basePrice.toFixed(activeCategory === 'Forex' ? 4 : 2)}
+                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${bid ? (isUp ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700') : 'bg-slate-100 text-slate-400'}`}>
+                      {bid ? bid.toFixed(decimals) : '—'}
                     </div>
-                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${isUp ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
-                      {(basePrice + spread).toFixed(activeCategory === 'Forex' ? 4 : 2)}
+                    <div className={`px-1 py-1.5 rounded-[4px] text-center text-xs font-mono font-medium tracking-tight ${ask ? (isUp ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700') : 'bg-slate-100 text-slate-400'}`}>
+                      {ask ? ask.toFixed(decimals) : '—'}
                     </div>
                   </button>
                 );
