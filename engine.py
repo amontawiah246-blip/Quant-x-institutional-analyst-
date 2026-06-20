@@ -520,8 +520,32 @@ def init_db():
             rsi_htf REAL, atr REAL, regime TEXT, session TEXT,
             outcome TEXT DEFAULT NULL, outcome_checked_at TEXT DEFAULT NULL,
             pnl_atr REAL DEFAULT NULL, exit_price REAL DEFAULT NULL,
-            bars_to_exit INTEGER DEFAULT NULL, notes TEXT DEFAULT NULL
+            bars_to_exit INTEGER DEFAULT NULL, notes TEXT DEFAULT NULL,
+            verdict TEXT DEFAULT 'EXECUTE',
+            current_price_at_signal REAL DEFAULT NULL,
+            win_probability_pct REAL DEFAULT NULL,
+            expected_value_r REAL DEFAULT NULL,
+            hard_block_reason TEXT DEFAULT NULL,
+            wait_reason TEXT DEFAULT NULL
         )''')
+        # v13: add columns to any pre-existing signals table from before this patch
+        # (SQLite requires ALTER TABLE for existing DBs — CREATE TABLE IF NOT EXISTS
+        # won't add new columns to an already-existing table)
+        existing_cols = [row[1] for row in c.execute("PRAGMA table_info(signals)").fetchall()]
+        new_cols = {
+            'verdict':                  "TEXT DEFAULT 'EXECUTE'",
+            'current_price_at_signal':  'REAL DEFAULT NULL',
+            'win_probability_pct':      'REAL DEFAULT NULL',
+            'expected_value_r':         'REAL DEFAULT NULL',
+            'hard_block_reason':        'TEXT DEFAULT NULL',
+            'wait_reason':              'TEXT DEFAULT NULL',
+        }
+        for col, coltype in new_cols.items():
+            if col not in existing_cols:
+                try:
+                    c.execute(f'ALTER TABLE signals ADD COLUMN {col} {coltype}')
+                except Exception:
+                    pass  # column likely already exists from a concurrent init
         c.execute('''CREATE TABLE IF NOT EXISTS asset_weights (
             asset TEXT PRIMARY KEY,
             w_structure REAL DEFAULT 20, w_liquidity REAL DEFAULT 15,
@@ -571,8 +595,17 @@ def init_db():
 
 
 def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl,
-                score, htf_trend, etf_trend, rsi_htf, atr, regime='', session=''):
-    """Save a new signal to database. Returns the signal ID."""
+                score, htf_trend, etf_trend, rsi_htf, atr, regime='', session='',
+                verdict='EXECUTE', current_price_at_signal=None,
+                win_probability_pct=None, expected_value_r=None,
+                hard_block_reason=None, wait_reason=None):
+    """Save a new signal to database. Returns the signal ID.
+
+    v13: Now accepts verdict-tracking fields so WAIT/AVOID verdicts can be
+    logged too, not just executed trades. For WAIT/AVOID, entry_low/sl/tp1
+    may be None (no active trade) — current_price_at_signal is stored
+    instead so outcome-checking can later compare what price actually did.
+    """
     try:
         init_db()
         conn = sqlite3.connect(DB_PATH)
@@ -580,11 +613,14 @@ def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl
         c.execute('''INSERT INTO signals
             (asset, mode, timestamp, direction, entry_low, entry_high,
              tp1, tp2, tp3, sl, confluence_score, htf_trend, etf_trend,
-             rsi_htf, atr, regime, session)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+             rsi_htf, atr, regime, session, verdict, current_price_at_signal,
+             win_probability_pct, expected_value_r, hard_block_reason, wait_reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (asset, mode, datetime.now(timezone.utc).isoformat(),
              direction, entry_low, entry_high, tp1, tp2, tp3, sl,
-             score, htf_trend, etf_trend, rsi_htf, atr, regime, session))
+             score, htf_trend, etf_trend, rsi_htf, atr, regime, session,
+             verdict, current_price_at_signal, win_probability_pct,
+             expected_value_r, hard_block_reason, wait_reason))
         signal_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -1021,6 +1057,169 @@ def check_and_update_outcomes(asset=None):
         }
 
 
+def check_wait_avoid_outcomes(asset=None, candles_by_tf=None, hours_lookback=48):
+    """
+    For WAIT/AVOID signals logged within the lookback window, check what
+    price actually did afterward. This answers the core question: was the
+    caution justified (price never reached the zone, or reversed away from
+    it) or was it a missed opportunity (price reached the stated entry zone
+    and would have hit TP1 before SL)?
+
+    This requires fresh candle data to be passed in (candles_by_tf) since
+    Python doesn't independently fetch market data — server.ts supplies it,
+    same pattern as run_engine().
+
+    Updates each checked row's `outcome` field to one of:
+      'CAUTION_JUSTIFIED'  — price never reached the stated zone, or moved
+                             away from it (WAIT/AVOID was the right call)
+      'MISSED_OPPORTUNITY' — price reached the zone and would have hit TP1
+                             before SL (the system was too cautious here)
+      'WOULD_HAVE_LOST'    — price reached the zone and would have hit SL
+                             before TP1 (the caution, in hindsight, also
+                             would have been the safer outcome even though
+                             the zone was reached)
+      'PENDING'            — not enough time/candles have passed yet to judge
+    """
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_lookback)).isoformat()
+        query = '''SELECT id, asset, mode, timestamp, direction, entry_low, entry_high,
+                          tp1, sl, verdict
+                   FROM signals
+                   WHERE verdict IN ('WAIT','AVOID')
+                     AND outcome IS NULL
+                     AND timestamp > ?'''
+        params = [cutoff]
+        if asset:
+            query += ' AND asset = ?'
+            params.append(asset)
+        rows = c.execute(query, params).fetchall()
+
+        results = []
+        for row in rows:
+            sig_id, sig_asset, mode, ts, direction, entry_low, entry_high, tp1, sl, verdict = row
+
+            # WAIT/AVOID without a stated entry zone (pure "no setup" AVOID)
+            # can't be judged the same way — mark as justified by default
+            # since there was no specific zone to have reached
+            if entry_low is None or tp1 is None or sl is None:
+                c.execute('UPDATE signals SET outcome=?, outcome_checked_at=? WHERE id=?',
+                          ('CAUTION_JUSTIFIED', datetime.now(timezone.utc).isoformat(), sig_id))
+                results.append({'id': sig_id, 'outcome': 'CAUTION_JUSTIFIED', 'note': 'No specific entry zone was stated.'})
+                continue
+
+            # Need candle data for this asset to check what happened after timestamp
+            tf_candles = (candles_by_tf or {}).get(sig_asset, {}).get(mode_to_tf(mode), [])
+            if not tf_candles:
+                results.append({'id': sig_id, 'outcome': 'PENDING', 'note': 'No candle data supplied for outcome check.'})
+                continue
+
+            sig_time = datetime.fromisoformat(ts)
+            post_candles = [c2 for c2 in tf_candles if datetime.fromtimestamp(c2['epoch'], tz=timezone.utc) > sig_time]
+
+            if len(post_candles) < 3:
+                results.append({'id': sig_id, 'outcome': 'PENDING', 'note': 'Not enough candles have passed yet.'})
+                continue
+
+            reached_zone = False
+            hit_tp1_first = False
+            hit_sl_first = False
+
+            is_long = direction == 'BUY' or direction == 'LONG'
+            zone_low, zone_high = min(entry_low, entry_high), max(entry_low, entry_high)
+
+            for pc in post_candles:
+                if not reached_zone:
+                    if pc['low'] <= zone_high and pc['high'] >= zone_low:
+                        reached_zone = True
+                if reached_zone:
+                    if is_long:
+                        if pc['low'] <= sl:
+                            hit_sl_first = True
+                            break
+                        if pc['high'] >= tp1:
+                            hit_tp1_first = True
+                            break
+                    else:
+                        if pc['high'] >= sl:
+                            hit_sl_first = True
+                            break
+                        if pc['low'] <= tp1:
+                            hit_tp1_first = True
+                            break
+
+            if not reached_zone:
+                outcome = 'CAUTION_JUSTIFIED'
+                note = 'Price never reached the stated entry zone.'
+            elif hit_tp1_first:
+                outcome = 'MISSED_OPPORTUNITY'
+                note = 'Price reached the entry zone and would have hit TP1 before SL.'
+            elif hit_sl_first:
+                outcome = 'WOULD_HAVE_LOST'
+                note = 'Price reached the entry zone but would have hit SL before TP1 — caution avoided a loss.'
+            else:
+                outcome = 'PENDING'
+                note = 'Price reached the zone but has not yet resolved toward TP1 or SL.'
+
+            if outcome != 'PENDING':
+                c.execute('UPDATE signals SET outcome=?, outcome_checked_at=? WHERE id=?',
+                          (outcome, datetime.now(timezone.utc).isoformat(), sig_id))
+
+            results.append({'id': sig_id, 'outcome': outcome, 'note': note})
+
+        conn.commit()
+        conn.close()
+        return {'checked': len(results), 'results': results}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def mode_to_tf(mode):
+    """Helper: maps 'scalp'/'swing' mode to its execution timeframe label."""
+    return '5M' if mode == 'scalp' else '1H'
+
+
+def export_signals_csv(asset=None, limit=1000):
+    """
+    Exports the full signal history (EXECUTE, EXECUTE WITH CAUTION, WAIT,
+    and AVOID — everything) as CSV text. This is what powers the downloadable
+    export so the full verdict history can be reviewed externally.
+    """
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        query = '''SELECT id, asset, mode, timestamp, verdict, direction,
+                          entry_low, entry_high, tp1, tp2, tp3, sl,
+                          confluence_score, win_probability_pct, expected_value_r,
+                          htf_trend, etf_trend, regime, session,
+                          hard_block_reason, wait_reason,
+                          outcome, outcome_checked_at, pnl_atr, exit_price, bars_to_exit
+                   FROM signals'''
+        params = []
+        if asset:
+            query += ' WHERE asset = ?'
+            params.append(asset)
+        query += ' ORDER BY timestamp DESC LIMIT ?'
+        params.append(limit)
+
+        rows = c.execute(query, params).fetchall()
+        col_names = [d[0] for d in c.description]
+        conn.close()
+
+        import io, csv as csv_module
+        output = io.StringIO()
+        writer = csv_module.writer(output)
+        writer.writerow(col_names)
+        writer.writerows(rows)
+        return output.getvalue()
+    except Exception as e:
+        return f'ERROR: {e}'
+
+
 def update_adaptive_weights(asset):
     """
     Recalculate per-asset confluence weights based on real outcome history.
@@ -1159,13 +1358,17 @@ def get_signal_dashboard(asset=None, limit=50):
         if asset:
             c.execute('''SELECT id, asset, mode, timestamp, direction,
                          entry_low, entry_high, tp1, sl, confluence_score,
-                         outcome, pnl_atr, exit_price, notes, regime, session
+                         outcome, pnl_atr, exit_price, notes, regime, session,
+                         verdict, current_price_at_signal, win_probability_pct,
+                         expected_value_r, hard_block_reason, wait_reason
                          FROM signals WHERE asset = ?
                          ORDER BY id DESC LIMIT ?''', (asset, limit))
         else:
             c.execute('''SELECT id, asset, mode, timestamp, direction,
                          entry_low, entry_high, tp1, sl, confluence_score,
-                         outcome, pnl_atr, exit_price, notes, regime, session
+                         outcome, pnl_atr, exit_price, notes, regime, session,
+                         verdict, current_price_at_signal, win_probability_pct,
+                         expected_value_r, hard_block_reason, wait_reason
                          FROM signals
                          ORDER BY id DESC LIMIT ?''', (limit,))
 
@@ -1196,22 +1399,28 @@ def get_signal_dashboard(asset=None, limit=50):
         signals = []
         for row in rows:
             signals.append({
-                'id':         row[0],
-                'asset':      row[1],
-                'mode':       row[2],
-                'timestamp':  row[3],
-                'direction':  row[4],
-                'entry_low':  row[5],
-                'entry_high': row[6],
-                'tp1':        row[7],
-                'sl':         row[8],
-                'score':      row[9],
-                'outcome':    row[10] or 'OPEN',
-                'pnl_atr':   row[11],
-                'exit_price': row[12],
-                'notes':      row[13],
-                'regime':     row[14],
-                'session':    row[15],
+                'id':                      row[0],
+                'asset':                   row[1],
+                'mode':                    row[2],
+                'timestamp':               row[3],
+                'direction':               row[4],
+                'entry_low':               row[5],
+                'entry_high':              row[6],
+                'tp1':                     row[7],
+                'sl':                      row[8],
+                'score':                   row[9],
+                'outcome':                 row[10] or 'OPEN',
+                'pnl_atr':                 row[11],
+                'exit_price':              row[12],
+                'notes':                   row[13],
+                'regime':                  row[14],
+                'session':                 row[15],
+                'verdict':                 row[16] or 'EXECUTE',
+                'current_price_at_signal': row[17],
+                'win_probability_pct':     row[18],
+                'expected_value_r':        row[19],
+                'hard_block_reason':       row[20],
+                'wait_reason':             row[21],
             })
 
         # Fetch daily performance
@@ -3939,6 +4148,283 @@ def detect_liquidity(candles, swing_highs, swing_lows, atr):
     }
 
 
+def detect_inducement(candles: list, atr: float, major_swing_highs: list,
+                       major_swing_lows: list, minor_lookback: int = 2) -> dict:
+    """
+    INDUCEMENT DETECTOR
+    ══════════════════════════════════════════════════════════
+    Inducement = a MINOR, internal swing point (a small local high/low
+    INSIDE a larger range) that gets engineered and swept FIRST, before
+    price moves to sweep the MAJOR liquidity pool. This traps early/
+    premature entries on the minor swing, whose stop-losses then add fuel
+    to the real institutional move toward the major pool.
+
+    This is structurally different from the sweep+displacement pattern,
+    which only looks at MAJOR swing sweeps. Inducement specifically
+    requires finding a SMALLER, tighter swing that sits BETWEEN current
+    price and a major liquidity pool, and confirming it gets swept on the
+    way to (or instead of stopping at) the major level.
+
+    Sequence this function looks for:
+      1. A minor swing point exists between recent price action and a
+         major swing high/low
+      2. That minor swing gets swept (price wicks through, closes back)
+      3. Displacement continues TOWARD the major pool afterward — this
+         confirms the minor sweep was inducement, not the real reversal
+
+    Returns:
+      - inducement_detected: bool
+      - minor_level: the minor swing price that was used as inducement
+      - major_target: the major pool this inducement was feeding into
+      - sequence_confirmed: bool — True if displacement continued toward
+        the major level after the minor sweep (confirms real inducement,
+        not just two unrelated sweeps)
+      - description: human-readable explanation
+    """
+    result = {
+        'inducement_detected': False,
+        'direction':           None,
+        'minor_level':         None,
+        'major_target':        None,
+        'sequence_confirmed':  False,
+        'description':         'No inducement pattern detected.',
+    }
+
+    if not candles or atr <= 0 or len(candles) < 20:
+        return result
+
+    # Detect MINOR swings using a tighter window than the major structural swings
+    minor_highs, minor_lows = detect_swings(candles, left=minor_lookback, right=minor_lookback)
+
+    total_candles = len(candles)
+    lookback_window = min(30, total_candles - 1)  # only consider recent action
+
+    def find_candle_index_by_epoch(epoch):
+        for idx, c in enumerate(candles):
+            if c.get('epoch') == epoch:
+                return idx
+        return None
+
+    # ── Check BEARISH inducement: minor swing HIGH swept before a move down
+    #    toward a major swing LOW (SSL pool) ──────────────────────────────────
+    recent_minor_highs = [h for h in minor_highs if h['index'] >= total_candles - lookback_window]
+    recent_minor_highs.sort(key=lambda h: h['index'], reverse=True)
+
+    for minor in recent_minor_highs:
+        m_idx = minor['index']
+        # Was this minor high swept (price wicked above, closed back below)?
+        swept = False
+        sweep_candle_idx = None
+        for j in range(m_idx + 1, min(m_idx + 15, total_candles)):
+            c = candles[j]
+            if c['high'] > minor['price'] and c['close'] < minor['price']:
+                swept = True
+                sweep_candle_idx = j
+                break
+            if c['close'] > minor['price'] * 1.002:  # decisively broke above, not a sweep
+                break
+        if not swept:
+            continue
+
+        # Is there a major swing LOW (SSL pool) further down that this could be feeding?
+        candidate_major_lows = [l for l in major_swing_lows if l['index'] < m_idx]
+        if not candidate_major_lows:
+            continue
+        nearest_major_low = max(candidate_major_lows, key=lambda l: l['index'])
+
+        # Confirm sequence: after the minor sweep, did price actually displace
+        # DOWN toward that major low (not just chop)?
+        sequence_confirmed = False
+        if sweep_candle_idx is not None and sweep_candle_idx + 3 < total_candles:
+            post_sweep_low = min(candles[k]['low'] for k in range(sweep_candle_idx, min(sweep_candle_idx + 10, total_candles)))
+            if post_sweep_low < minor['price'] - atr * 0.5:
+                sequence_confirmed = True
+
+        result['inducement_detected'] = True
+        result['direction']           = 'BEARISH'  # inducement trapped longs, real move is down
+        result['minor_level']         = minor['price']
+        result['major_target']        = nearest_major_low['price']
+        result['sequence_confirmed']  = sequence_confirmed
+        result['description'] = (
+            f"BEARISH INDUCEMENT {'CONFIRMED' if sequence_confirmed else 'SUSPECTED'}: "
+            f"Minor swing high at {minor['price']} was swept (trapping late longs), "
+            f"feeding liquidity toward the major SSL pool at {nearest_major_low['price']}. "
+            f"{'Displacement toward the major pool confirmed the sequence.' if sequence_confirmed else 'Awaiting confirmation that price displaces toward the major pool.'}"
+        )
+        return result
+
+    # ── Check BULLISH inducement: minor swing LOW swept before a move up
+    #    toward a major swing HIGH (BSL pool) ──────────────────────────────────
+    recent_minor_lows = [l for l in minor_lows if l['index'] >= total_candles - lookback_window]
+    recent_minor_lows.sort(key=lambda l: l['index'], reverse=True)
+
+    for minor in recent_minor_lows:
+        m_idx = minor['index']
+        swept = False
+        sweep_candle_idx = None
+        for j in range(m_idx + 1, min(m_idx + 15, total_candles)):
+            c = candles[j]
+            if c['low'] < minor['price'] and c['close'] > minor['price']:
+                swept = True
+                sweep_candle_idx = j
+                break
+            if c['close'] < minor['price'] * 0.998:
+                break
+        if not swept:
+            continue
+
+        candidate_major_highs = [h for h in major_swing_highs if h['index'] < m_idx]
+        if not candidate_major_highs:
+            continue
+        nearest_major_high = max(candidate_major_highs, key=lambda h: h['index'])
+
+        sequence_confirmed = False
+        if sweep_candle_idx is not None and sweep_candle_idx + 3 < total_candles:
+            post_sweep_high = max(candles[k]['high'] for k in range(sweep_candle_idx, min(sweep_candle_idx + 10, total_candles)))
+            if post_sweep_high > minor['price'] + atr * 0.5:
+                sequence_confirmed = True
+
+        result['inducement_detected'] = True
+        result['direction']           = 'BULLISH'  # inducement trapped shorts, real move is up
+        result['minor_level']         = minor['price']
+        result['major_target']        = nearest_major_high['price']
+        result['sequence_confirmed']  = sequence_confirmed
+        result['description'] = (
+            f"BULLISH INDUCEMENT {'CONFIRMED' if sequence_confirmed else 'SUSPECTED'}: "
+            f"Minor swing low at {minor['price']} was swept (trapping late shorts), "
+            f"feeding liquidity toward the major BSL pool at {nearest_major_high['price']}. "
+            f"{'Displacement toward the major pool confirmed the sequence.' if sequence_confirmed else 'Awaiting confirmation that price displaces toward the major pool.'}"
+        )
+        return result
+
+    return result
+
+
+def detect_sweep_displacement(liquidity_data: dict, candles: list, atr: float,
+                                fvgs: list, lookback_candles: int = 8) -> dict:
+    """
+    SWEEP + DISPLACEMENT PATTERN DETECTOR
+    ══════════════════════════════════════════════════════════
+    Professional SMC/ICT concept: when price sweeps a known liquidity level
+    (stop-hunting late entries) and then displaces violently AWAY from it,
+    this signals institutional absorption — "smart money flipped sides."
+    The FVGs left behind during the displacement become the next
+    high-probability entry zone, NOT a level to fade.
+
+    Your engine already computes the raw sweep data (sweep_strength_atr,
+    displacement_atr, quality) inside detect_liquidity(). This function
+    takes that data and explicitly names the pattern, so the AI treats it
+    with the same significance a real trader would — instead of reporting
+    it as generic "counter-trend momentum."
+
+    Returns:
+      - pattern_detected: bool
+      - direction: 'BULLISH_FLIP' | 'BEARISH_FLIP' | 'NONE'
+      - sweep_level: the swept price level
+      - sweep_quality: HIGH/MEDIUM/LOW (from existing detect_liquidity logic)
+      - displacement_candles_ago: how recently this happened
+      - fresh_fvgs_from_displacement: FVGs formed during/after the sweep,
+        which are the actual zones a trader would target — NOT older FVGs
+      - description: human-readable summary for the AI
+    """
+    result = {
+        'pattern_detected':             False,
+        'direction':                    'NONE',
+        'sweep_level':                  None,
+        'sweep_quality':                None,
+        'displacement_candles_ago':     None,
+        'fresh_fvgs_from_displacement': [],
+        'description':                  'No recent sweep+displacement pattern detected.',
+    }
+
+    if not candles or atr <= 0:
+        return result
+
+    total_candles = len(candles)
+
+    # Check most recent HIGH-quality sweeps from existing liquidity data
+    swept_ssl = liquidity_data.get('swept_ssl', [])  # sell-side liquidity swept = bullish flip
+    swept_bsl = liquidity_data.get('swept_bsl', [])  # buy-side liquidity swept = bearish flip
+
+    candidates = []
+    for s in swept_ssl:
+        candidates.append({**s, '_direction': 'BULLISH_FLIP'})
+    for s in swept_bsl:
+        candidates.append({**s, '_direction': 'BEARISH_FLIP'})
+
+    if not candidates:
+        return result
+
+    # Find the sweep epoch's candle index to measure recency
+    def find_candle_index_by_epoch(epoch):
+        for idx, c in enumerate(candles):
+            if c.get('epoch') == epoch:
+                return idx
+        return None
+
+    # Sort candidates by recency (most recent sweep first) — only consider
+    # sweeps within the lookback window, and only HIGH/MEDIUM quality
+    best = None
+    best_age = 9999
+    for cand in candidates:
+        if cand.get('sweep_quality') not in ('HIGH', 'MEDIUM'):
+            continue
+        idx = find_candle_index_by_epoch(cand.get('epoch'))
+        if idx is None:
+            continue
+        age = (total_candles - 1) - idx
+        if age <= lookback_candles and age < best_age:
+            best_age = age
+            best = cand
+
+    if best is None:
+        return result
+
+    result['pattern_detected']         = True
+    result['direction']                = best['_direction']
+    result['sweep_level']              = best['price']
+    result['sweep_quality']            = best['sweep_quality']
+    result['displacement_candles_ago'] = best_age
+
+    # ── Find fresh FVGs formed AT OR AFTER the sweep candle ──────────────────
+    sweep_idx = find_candle_index_by_epoch(best.get('epoch'))
+    target_direction = 'BULL' if best['_direction'] == 'BULLISH_FLIP' else 'BEAR'
+
+    fresh_from_sweep = [
+        fvg for fvg in fvgs
+        if fvg.get('direction') == target_direction
+        and fvg.get('status') == 'FRESH'
+        and fvg.get('index', -1) >= (sweep_idx if sweep_idx is not None else 0)
+    ]
+    # Sort by recency (most recent first) — these are the zones that
+    # actually matter, not older FVGs from before the sweep
+    fresh_from_sweep.sort(key=lambda f: f.get('index', 0), reverse=True)
+    result['fresh_fvgs_from_displacement'] = fresh_from_sweep[:3]
+
+    quality_txt = best['sweep_quality']
+    dir_txt = 'bullish (swept sell-side liquidity, then displaced UP)' if best['_direction'] == 'BULLISH_FLIP' \
+        else 'bearish (swept buy-side liquidity, then displaced DOWN)'
+
+    zone_txt = ''
+    if fresh_from_sweep:
+        nearest_fresh = fresh_from_sweep[0]
+        zone_txt = (f' Fresh FVG left behind by this displacement: '
+                    f'{nearest_fresh["bottom"]}-{nearest_fresh["top"]}. '
+                    f'This is the institutionally-relevant zone — prioritize it '
+                    f'over any older, more distant FVG from a previous swing.')
+
+    result['description'] = (
+        f'★ SWEEP + DISPLACEMENT DETECTED ({quality_txt} quality) ★: '
+        f'Price swept the liquidity level at {best["price"]} '
+        f'{best_age} candle(s) ago, then displaced {dir_txt}. '
+        f'This is a smart-money signature, NOT a random counter-trend move — '
+        f'it suggests institutional positioning flipped at this level.'
+        f'{zone_txt}'
+    )
+
+    return result
+
+
 def calc_premium_discount(candles, swing_highs, swing_lows):
     if not swing_highs or not swing_lows:
         return {'status':'INSUFFICIENT DATA','percentage':None}
@@ -3986,6 +4472,72 @@ def calc_session(latest_epoch):
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — BACKTESTING
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def wilson_score_interval(wins: int, total: int, confidence: float = 0.95) -> dict:
+    """
+    Wilson score interval — the standard, statistically correct way to bound
+    a win rate estimate from a small sample, replacing the previous flat
+    20% haircut (win_rate * 0.80) which carried no real information about
+    sample-size uncertainty.
+
+    Unlike a flat haircut, this interval naturally widens for small samples
+    and narrows as the sample grows — exactly the honest behavior you'd want.
+
+    Returns the lower and upper bound of the true win rate, at the given
+    confidence level, along with a single "conservative" point estimate
+    (the lower bound) suitable for use anywhere the old flat-haircut number
+    was previously used.
+    """
+    if total <= 0:
+        return {
+            'wins': 0, 'total': 0,
+            'raw_win_rate_pct': 0.0,
+            'wilson_lower_pct': 0.0,
+            'wilson_upper_pct': 0.0,
+            'conservative_win_rate_pct': 0.0,
+            'confidence_note': 'No trades — no estimate possible.',
+        }
+
+    # z-score for the given confidence level (1.96 for 95%, standard default)
+    z_table = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}
+    z = z_table.get(confidence, 1.96)
+
+    p_hat = wins / total
+    n = total
+
+    denominator = 1 + (z**2) / n
+    center = (p_hat + (z**2) / (2*n)) / denominator
+    margin = (z * ((p_hat*(1-p_hat)/n + (z**2)/(4*n**2)) ** 0.5)) / denominator
+
+    lower = max(0.0, center - margin)
+    upper = min(1.0, center + margin)
+
+    # Honest sample-size note — tells the trader directly how much to trust this
+    if total < 15:
+        reliability = 'VERY LOW — sample too small for statistical confidence'
+    elif total < 30:
+        reliability = 'LOW — directional signal only, not yet statistically reliable'
+    elif total < 100:
+        reliability = 'MODERATE — meaningful but still building statistical confidence'
+    else:
+        reliability = 'GOOD — sample large enough for reasonable confidence'
+
+    return {
+        'wins':                     wins,
+        'total':                    total,
+        'raw_win_rate_pct':         round(p_hat * 100, 1),
+        'wilson_lower_pct':         round(lower * 100, 1),
+        'wilson_upper_pct':         round(upper * 100, 1),
+        'conservative_win_rate_pct': round(lower * 100, 1),  # use this instead of the old flat haircut
+        'interval_width_pct':       round((upper - lower) * 100, 1),
+        'sample_reliability':       reliability,
+        'confidence_note': (
+            f'With {total} trades ({wins} wins), the TRUE win rate is estimated to be '
+            f'between {round(lower*100,1)}% and {round(upper*100,1)}% at {int(confidence*100)}% confidence. '
+            f'Raw observed rate: {round(p_hat*100,1)}%. Reliability: {reliability}.'
+        ),
+    }
+
 
 def run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs):
     if len(candles)<50: return {'status':'INSUFFICIENT DATA','trades':0}
@@ -4059,11 +4611,16 @@ def run_backtest(candles, atr, swing_highs, swing_lows, bos_events, fvgs, obs):
         'wins':            len(wins),
         'losses':          len(losses),
         'entry_breakdown': {'ob': ob_entries, 'fvg': fvg_entries, 'bos_fallback': bos_entries},
-        'win_rate_pct':wr,'win_rate_adjusted_pct':round(wr*0.80,1),
+        'win_rate_pct':       wr,
+        'wilson_interval':    wilson_score_interval(len(wins), len(trades)),
+        # v12: 'win_rate_adjusted_pct' kept for backward compatibility with any
+        # existing display code, but now sourced from the REAL Wilson lower
+        # bound instead of a flat, uninformative 20% haircut.
+        'win_rate_adjusted_pct': wilson_score_interval(len(wins), len(trades))['conservative_win_rate_pct'],
         'avg_win_atr':aw,'avg_loss_atr':al,'expectancy_atr':exp,'profit_factor':pf,
         'recent_trades':trades[-5:],
         'verdict':'EDGE CONFIRMED' if exp>0.2 and wr>=45 else 'MARGINAL EDGE' if exp>0 else 'NO EDGE DETECTED',
-        'backtest_note':'Entry at BOS candle close. Real slippage not modelled. Adjusted win rate applies 20% haircut.',
+        'backtest_note':'Entry at BOS candle close. Real slippage not modelled. Adjusted win rate now uses a Wilson score interval (95% confidence lower bound) instead of a flat haircut — this widens automatically for small samples and narrows as more trades accumulate.',
     }
 
 
@@ -4231,6 +4788,44 @@ def detect_pullback_setup(htf_data: dict, etf_data: dict,
 
     target_fvgs = [z for z in htf_fvgs if z.get('direction') == ('BULL' if is_dip_buy else 'BEAR')]
     target_obs  = [z for z in htf_obs  if z.get('direction') == ('BULL' if is_dip_buy else 'BEAR')]
+
+    # v10 fix: If a fresh sweep+displacement pattern was just detected on the
+    # ETF, its resulting FVGs take ABSOLUTE PRIORITY over any other zone,
+    # regardless of raw ATR distance. An old FVG from a prior swing can be
+    # geometrically "nearer" to price than the FVGs a recent sweep just
+    # created, but the recent ones are what actually matters — this is
+    # exactly the bug that caused the engine to reference a stale zone
+    # (4134.93-4146.14) while a real trader correctly used a fresh zone
+    # (4155-4157) created moments earlier by the same sweep.
+    sweep_pattern = etf_data.get('sweep_displacement', {})
+    if sweep_pattern.get('pattern_detected') and sweep_pattern.get('fresh_fvgs_from_displacement'):
+        matches_direction = (
+            (is_dip_buy and sweep_pattern.get('direction') == 'BULLISH_FLIP') or
+            (not is_dip_buy and sweep_pattern.get('direction') == 'BEARISH_FLIP')
+        )
+        if matches_direction:
+            priority_fvg = sweep_pattern['fresh_fvgs_from_displacement'][0]
+            htf_zone = {
+                'type':            'FVG',
+                'top':             priority_fvg.get('top'),
+                'bottom':          priority_fvg.get('bottom'),
+                'mid':             round((priority_fvg.get('top', 0) + priority_fvg.get('bottom', 0)) / 2, 6),
+                'dist_atr':        round(abs(etf_data.get('current_price', 0) - (priority_fvg.get('top', 0) + priority_fvg.get('bottom', 0)) / 2) / (etf_data.get('atr', 0) or 1), 2),
+                'direction':       priority_fvg.get('direction'),
+                'source':          'POST_SWEEP_DISPLACEMENT',  # flag so the description below can credit this correctly
+            }
+            result['htf_zone'] = htf_zone
+            result['pattern_type'] = 'DIP_BUY' if is_dip_buy else 'RALLY_SELL'
+            result['stage'] = 'IN_ZONE' if (htf_zone['bottom'] <= etf_data.get('current_price', 0) <= htf_zone['top']) else 'APPROACHING_ZONE'
+            result['confidence'] = 70  # post-sweep FVGs carry high institutional confidence
+            result['bonus_points'] = 25
+            result['kill_htf_filter'] = True
+            result['description'] = (
+                f'PRIORITIZED ZONE FROM SWEEP+DISPLACEMENT: {sweep_pattern.get("description", "")} '
+                f'Using this fresh zone ({htf_zone["bottom"]}-{htf_zone["top"]}) instead of any older, '
+                f'more distant FVG — this is the institutionally relevant level.'
+            )
+            return result
 
     # Find the nearest unmitigated HTF zone relative to current price
     htf_zone = None
@@ -4806,6 +5401,29 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         fvgs=detect_fvg(candles,atr)
         obs=detect_order_blocks(candles,bos,atr)
         liq=detect_liquidity(candles,sh,sl,atr)
+        # v10: Named sweep+displacement pattern detection
+        if tf == etf:
+            sweep_pattern = detect_sweep_displacement(
+                liquidity_data = liq,
+                candles        = candles,
+                atr            = atr,
+                fvgs           = fvgs,
+                lookback_candles = 8,
+            )
+        else:
+            sweep_pattern = {'pattern_detected': False}
+
+        # v12: Real inducement detection — minor swing sweep feeding a major pool
+        if tf == etf:
+            inducement_pattern = detect_inducement(
+                candles           = candles,
+                atr               = atr,
+                major_swing_highs = sh,
+                major_swing_lows  = sl,
+                minor_lookback    = 2,
+            )
+        else:
+            inducement_pattern = {'inducement_detected': False}
         pd=calc_premium_discount(candles,sh,sl)
         regime=classify_market_regime(candles,atr)
         vol_profile=calc_volume_profile(candles)
@@ -4862,7 +5480,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
             'fvg_mitigated':[f for f in fvgs if f['status']=='MITIGATED'][-3:],
             'ob_fresh':[o for o in obs if o['status']=='FRESH'][-5:],
             'ob_mitigated':[o for o in obs if o['status']=='MITIGATED'][-3:],
-            'liquidity':liq,'premium_discount':pd,'indicators':indicators,
+            'liquidity':liq,'sweep_displacement': sweep_pattern,'inducement':inducement_pattern,'premium_discount':pd,'indicators':indicators,
             'regime':regime,'volume_profile':vol_profile,'backtest':backtest,
             'wyckoff':wyckoff,
             'elliott':elliott,
@@ -5110,6 +5728,8 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         'wyckoff_htf':     htf_wyckoff,
         'wyckoff_etf':     etf_wyckoff,
         'wyckoff_aligned': wyckoff_aligned,
+        'sweep_displacement_pattern': result.get(etf, {}).get('sweep_displacement', {'pattern_detected': False}),
+        'inducement_pattern': result.get(etf, {}).get('inducement', {'inducement_detected': False}),
         'pullback_pattern':   pullback_pattern,
         'pullback_stage':     pullback_stage,
         'trigger_proximity':  trigger_proximity,
@@ -5157,6 +5777,19 @@ def main():
             result = check_and_update_outcomes(asset)
             print(json.dumps(result))
 
+        elif operation == 'check_wait_avoid_outcomes':
+            asset = data.get('asset', None)
+            candles_by_tf = data.get('candles_by_tf', {})
+            hours = data.get('hours_lookback', 48)
+            result = check_wait_avoid_outcomes(asset, candles_by_tf, hours)
+            print(json.dumps(result))
+
+        elif operation == 'export_signals_csv':
+            asset = data.get('asset', None)
+            limit = data.get('limit', 1000)
+            csv_text = export_signals_csv(asset, limit)
+            print(json.dumps({'csv': csv_text}))
+
         elif operation == 'get_dashboard':
             asset = data.get('asset', None)
             limit = data.get('limit', 50)
@@ -5182,6 +5815,12 @@ def main():
                 atr        = sig.get('atr'),
                 regime     = sig.get('regime', ''),
                 session    = sig.get('session', ''),
+                verdict                  = sig.get('verdict', 'EXECUTE'),
+                current_price_at_signal  = sig.get('current_price_at_signal'),
+                win_probability_pct      = sig.get('win_probability_pct'),
+                expected_value_r         = sig.get('expected_value_r'),
+                hard_block_reason        = sig.get('hard_block_reason'),
+                wait_reason              = sig.get('wait_reason'),
             )
             print(json.dumps({'signal_id': signal_id, 'status': 'saved' if signal_id else 'failed'}))
 

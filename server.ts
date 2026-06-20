@@ -689,6 +689,15 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     block += `  Filter Override: ${pb.kill_htf_filter ? 'YES — HTF/ETF conflict cap removed' : 'NO'}\n`;
   }
   
+  if(s.inducement_pattern?.inducement_detected){
+    const ind = s.inducement_pattern;
+    block += `\nINDUCEMENT_PATTERN:\n`;
+    block += `  Direction: ${ind.direction} | Sequence Confirmed: ${ind.sequence_confirmed}\n`;
+    block += `  Minor Level (traps premature entries): ${ind.minor_level}\n`;
+    block += `  Major Target Pool: ${ind.major_target}\n`;
+    block += `  ${ind.description}\n`;
+  }
+  
   if (s.trigger_proximity) {
     const prox = s.trigger_proximity;
     block += `\nTRIGGER PROXIMITY INTELLIGENCE:\n`;
@@ -779,6 +788,10 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     if(d.backtest?.status==='COMPLETE'){
       const bt=d.backtest;
       block+=`BACKTEST: WR=${bt.win_rate_pct}%(adj:${bt.win_rate_adjusted_pct}%) PF=${bt.profit_factor} Exp=${bt.expectancy_atr}ATR | ${bt.verdict}\n`;
+      if (bt.wilson_interval) {
+        const wi = bt.wilson_interval;
+        block += `  Statistical Confidence: True win rate likely between ${wi.wilson_lower_pct}%-${wi.wilson_upper_pct}% (n=${wi.total}). Reliability: ${wi.sample_reliability}\n`;
+      }
     }
     if(d.wyckoff && d.wyckoff.phase !== 'INSUFFICIENT DATA'){
       const w=d.wyckoff;
@@ -920,6 +933,27 @@ TECHNICAL REVIEW:
 - Are multiple timeframes confirming or conflicting?
 - Do Fibonacci retracement levels align with OB/FVG entry zones?
 - Is there a wave extension? If yes, note as risk but do NOT auto-block.
+- INDUCEMENT (minor sweep feeding a major pool):
+  Check the INDUCEMENT_PATTERN block. If present:
+  - This identifies a SMALLER, internal swing that was swept BEFORE a move
+    toward a MAJOR liquidity pool — the classic mechanism by which "the big
+    move" actually starts. Early entries on the minor level's reversal get
+    trapped and stopped out, and that liquidity fuels the real move.
+  - If sequence_confirmed = true: the real move toward the major_target is
+    CONFIRMED in progress — treat the direction stated as a higher-confidence
+    signal than a standalone major sweep alone, since the FULL sequence
+    (minor trap → major target) has played out exactly as institutional
+    price action predicts.
+  - If sequence_confirmed = false (SUSPECTED only): the minor sweep happened
+    but displacement toward the major pool hasn't been confirmed yet. Treat
+    this as an early-stage signal — note it, but do not treat it with the
+    same confidence as a confirmed sequence.
+  - Do NOT confuse inducement with the sweep+displacement pattern — they
+    are related but distinct. Sweep+displacement describes a MAJOR level
+    sweep with strong displacement. Inducement describes the SMALLER trap
+    that often happens first, feeding the larger move. When both are present
+    together, this is the strongest possible structural confirmation
+    available — state this explicitly.
 
 FUNDAMENTAL REVIEW:
 - Are any economic events imminent? Use the event's time_bucket, NOT your own
@@ -1004,6 +1038,16 @@ QUANTITATIVE REVIEW:
 - What does the backtest say? If under 20 trades, treat with scepticism but do not auto-block.
 - Confluence ≥ 70 + EV ≥ 1.5R + Win Probability ≥ 60% = STRONG QUANT SIGNAL.
   A strong quant signal can only be blocked by a HARD BLOCK condition (see below).
+- WIN RATE STATISTICAL HONESTY:
+  - Never present the raw backtest win rate (e.g. "77.8%") as if it were a
+    reliable known quantity. Always reference the Wilson confidence range
+    (e.g. "the true win rate is likely between X% and Y%, with only n trades
+    this remains a LOW/MODERATE/GOOD reliability estimate").
+  - If sample_reliability is "VERY LOW" or "LOW", explicitly state that the
+    quantitative edge is not yet statistically proven, regardless of how
+    favorable the raw numbers look. This is not a reason to AVOID by itself,
+    but it must temper confidence language — say "a promising but unconfirmed
+    edge," not "a confirmed 77.8% win rate."
 
 RISK SIZING REVIEW:
 - Check the position sizing data for a 'floor_breach' flag.
@@ -1478,6 +1522,62 @@ async function startServer() {
     catch(e:any){ res.status(500).json({error:e.message}); }
   });
 
+  app.post('/api/check-wait-avoid-outcomes', async(req,res)=>{
+    try {
+      const asset = req.body.asset || null;
+      const candles_by_tf: any = {};
+      
+      if (asset) {
+        const symbol = DERIV_SYMBOLS[asset];
+        if (symbol) {
+          const c5M = await fetchDerivCandles(symbol, 300, 100);
+          const c1H = await fetchDerivCandles(symbol, 3600, 100);
+          candles_by_tf[asset] = {
+            '5M': c5M || [],
+            '1H': c1H || [],
+          };
+        }
+      } else {
+        for (const [ast, symbol] of Object.entries(DERIV_SYMBOLS)) {
+          const c5M = await fetchDerivCandles(symbol, 300, 100);
+          const c1H = await fetchDerivCandles(symbol, 3600, 100);
+          candles_by_tf[ast] = {
+            '5M': c5M || [],
+            '1H': c1H || [],
+          };
+        }
+      }
+
+      const result = await runPythonOperation({
+        operation: 'check_wait_avoid_outcomes',
+        asset,
+        candles_by_tf,
+        hours_lookback: req.body.hours_lookback || 48
+      });
+      res.json(result);
+    }
+    catch(e:any){ res.status(500).json({error:e.message}); }
+  });
+
+  app.get('/api/export-signals', async(req,res)=>{
+    try {
+      const asset  = req.query.asset as string | undefined;
+      const limit  = parseInt(req.query.limit as string || '2000');
+      const result = await runPythonOperation({
+        operation: 'export_signals_csv',
+        asset:     asset || null,
+        limit,
+      });
+      if (result && result.csv) {
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename=signals_export_${asset || 'all'}_${Date.now()}.csv`);
+        res.send(result.csv);
+      } else {
+        res.status(500).json({error: 'Failed to generate CSV export'});
+      }
+    } catch(e:any){ res.status(500).json({error:e.message}); }
+  });
+
   app.get('/api/dashboard', async(req,res)=>{
     try { res.json(await runPythonOperation({operation:'get_dashboard',asset:req.query.asset||null,limit:parseInt(req.query.limit as string||'50')})); }
     catch(e:any){ res.status(500).json({error:e.message}); }
@@ -1820,8 +1920,7 @@ Respond ONLY with this JSON (no markdown):
         if(jsonBlockMatch) {
           try {
             const parsed = JSON.parse(jsonBlockMatch[1]);
-            if(parsed.direction && parsed.direction !== 'NEUTRAL' &&
-               parsed.entry_low && parsed.sl && parsed.tp1) {
+            if(parsed.direction) {
               signalData = parsed;
             }
           } catch { /* fall through to regex */ }
@@ -1842,50 +1941,98 @@ Respond ONLY with this JSON (no markdown):
           const tp2        = tp2Match ? parseFloat(tp2Match[1].replace(/,/g,'')) : null;
           const tp3Match   = responseText.match(/\*\*Target 3[^:]*:\*\*[^\d]*([\d,]+\.?\d*)/i);
           const tp3        = tp3Match ? parseFloat(tp3Match[1].replace(/,/g,'')) : null;
-          if(direction !== 'NEUTRAL' && entryLow && sl && tp1) {
-            signalData = {direction, entry_low:entryLow, entry_high:entryHigh||entryLow,
-                          sl, tp1, tp2:tp2||null, tp3:tp3||null,
-                          score: summary.ml_score?.score || null};
-          }
+
+          // v13: ALWAYS build signalData, even for WAIT/AVOID with no active
+          // trade — this is the fix for the confirmed gap where only
+          // EXECUTE/EXECUTE WITH CAUTION verdicts were ever being logged.
+          const verdictMatch = responseText.match(/VERDICT:\s*(EXECUTE WITH CAUTION|EXECUTE|WAIT|AVOID)/i);
+          const detectedVerdict = verdictMatch ? verdictMatch[1].toUpperCase().replace(/\s+/g, '_') : 'UNKNOWN';
+
+          const hardBlockMatch = responseText.match(/HARD BLOCK[^:]*:?\s*([^\n]+)/i);
+          const waitReasonMatch = responseText.match(/ENTRY TRIGGER:\s*([^\n]+)/i);
+
+          signalData = {
+            direction:   direction !== 'NEUTRAL' ? direction : (summary.ml_score?.direction || 'NEUTRAL'),
+            entry_low:   entryLow  || null,
+            entry_high:  entryHigh || entryLow || null,
+            sl:          sl  || null,
+            tp1:         tp1 || null,
+            tp2:         tp2 || null,
+            tp3:         tp3 || null,
+            score:                summary.ml_score?.score || null,
+            verdict:              detectedVerdict,
+            current_price_at_signal: etfData.current_price || null,
+            win_probability_pct:  summary.win_probability?.win_pct || null,
+            expected_value_r:     summary.trade_expectancy?.expected_value_r || null,
+            hard_block_reason:    hardBlockMatch ? hardBlockMatch[1].trim().slice(0, 300) : null,
+            wait_reason:          waitReasonMatch ? waitReasonMatch[1].trim().slice(0, 300) : null,
+          };
+        } else {
+          // If parsed from JSON block, let's verify or add fields!
+          const verdictMatch = responseText.match(/VERDICT:\s*(EXECUTE WITH CAUTION|EXECUTE|WAIT|AVOID)/i);
+          const detectedVerdict = verdictMatch ? verdictMatch[1].toUpperCase().replace(/\s+/g, '_') : (signalData.verdict || 'UNKNOWN');
+          const hardBlockMatch = responseText.match(/HARD BLOCK[^:]*:?\s*([^\n]+)/i);
+          const waitReasonMatch = responseText.match(/ENTRY TRIGGER:\s*([^\n]+)/i);
+
+          signalData = {
+            direction:   signalData.direction || 'NEUTRAL',
+            entry_low:   signalData.entry_low || null,
+            entry_high:  signalData.entry_high || signalData.entry_low || null,
+            sl:          signalData.sl || null,
+            tp1:         signalData.tp1 || null,
+            tp2:         signalData.tp2 || null,
+            tp3:         signalData.tp3 || null,
+            score:                signalData.score || summary.ml_score?.score || null,
+            verdict:              detectedVerdict,
+            current_price_at_signal: etfData.current_price || null,
+            win_probability_pct:  summary.win_probability?.win_pct || null,
+            expected_value_r:     summary.trade_expectancy?.expected_value_r || null,
+            hard_block_reason:    hardBlockMatch ? hardBlockMatch[1].trim().slice(0, 300) : null,
+            wait_reason:          waitReasonMatch ? waitReasonMatch[1].trim().slice(0, 300) : null,
+          };
         }
 
         if(signalData) {
-          // FIXED: Position size MUST be recalculated from Gemini's ACTUAL entry/SL,
-          // never trusted as text Gemini wrote itself.
-          const recalc = await runPythonOperation({
-            operation: 'recalc_position_size',
-            position: {
-              asset,
-              entry_low: signalData.entry_low,
-              entry_high: signalData.entry_high,
-              sl: signalData.sl,
-              account_size: parseFloat(accountSize) || 10000,
-              risk_pct: parseFloat(riskPct) || 1.0,
-            }
-          });
+          let recalc = null;
+          if (signalData.entry_low && signalData.sl && signalData.tp1 &&
+              (signalData.verdict === 'EXECUTE' || signalData.verdict === 'EXECUTE_WITH_CAUTION')) {
+            // FIXED: Position size MUST be recalculated from Gemini's ACTUAL entry/SL,
+            // never trusted as text Gemini wrote itself. Only applies to actual trades.
+            recalc = await runPythonOperation({
+              operation: 'recalc_position_size',
+              position: {
+                asset,
+                entry_low: signalData.entry_low,
+                entry_high: signalData.entry_high,
+                sl: signalData.sl,
+                account_size: parseFloat(accountSize) || 10000,
+                risk_pct: parseFloat(riskPct) || 1.0,
+              }
+            });
 
-          if (recalc && !recalc.error) {
-            // Overwrite whatever lot size / risk text Gemini wrote with the verified number
-            const correctedLine = `- **Position Size:** ${recalc.lot_size} lots — risks $${recalc.risk_amount_usd} (${recalc.risk_pct_actual}% of account)`;
-            responseText = responseText.replace(
-              /- \*\*Position Size:\*\*[^\n]*/i,
-              correctedLine
-            );
-            if (recalc.mismatch_warning) {
+            if (recalc && !recalc.error) {
+              // Overwrite whatever lot size / risk text Gemini wrote with the verified number
+              const correctedLine = `- **Position Size:** ${recalc.lot_size} lots — risks $${recalc.risk_amount_usd} (${recalc.risk_pct_actual}% of account)`;
               responseText = responseText.replace(
-                correctedLine,
-                `${correctedLine}\n  ⚠️ *${recalc.mismatch_warning}*`
+                /- \*\*Position Size:\*\*[^\n]*/i,
+                correctedLine
+              );
+              if (recalc.mismatch_warning) {
+                responseText = responseText.replace(
+                  correctedLine,
+                  `${correctedLine}\n  ⚠️ *${recalc.mismatch_warning}*`
+                );
+              }
+              // Store the verified figures for the signal save
+              signalData.lot_size = recalc.lot_size;
+              signalData.risk_amount_usd = recalc.risk_amount_usd;
+            } else {
+              // If recalculation fails, do not silently trust Gemini's number — flag it
+              responseText = responseText.replace(
+                /- \*\*Position Size:\*\*[^\n]*/i,
+                `- **Position Size:** ⚠️ Could not verify — recalculate manually before trading. Risk = ${riskPct || 1}% of $${accountSize || 10000} account, SL distance = |entry − invalidation|.`
               );
             }
-            // Store the verified figures for the signal save
-            signalData.lot_size = recalc.lot_size;
-            signalData.risk_amount_usd = recalc.risk_amount_usd;
-          } else {
-            // If recalculation fails, do not silently trust Gemini's number — flag it
-            responseText = responseText.replace(
-              /- \*\*Position Size:\*\*[^\n]*/i,
-              `- **Position Size:** ⚠️ Could not verify — recalculate manually before trading. Risk = ${riskPct || 1}% of $${accountSize || 10000} account, SL distance = |entry − invalidation|.`
-            );
           }
 
           const sr = await runPythonOperation({operation:'save_signal', signal:{
@@ -1899,9 +2046,9 @@ Respond ONLY with this JSON (no markdown):
             session:    summary.session?.session || '',
           }});
           if(sr?.signal_id) {
-            // Remove the JSON block from the displayed response
             responseText = responseText.replace(/SIGNAL_JSON_START[\s\S]*?SIGNAL_JSON_END/g, '').trim();
-            responseText += `\n\n---\n> 📊 **Signal #${sr.signal_id} recorded** — outcome tracked automatically.`;
+            const verdictLabel = signalData.verdict.replace(/_/g, ' ');
+            responseText += `\n\n---\n> 📊 **Signal #${sr.signal_id} recorded (${verdictLabel})** — outcome tracked automatically.`;
           }
         } else {
           // Clean up JSON block even if not saved

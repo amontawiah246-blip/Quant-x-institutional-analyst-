@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { MARKETS, MarketCategory, TradingMode } from '../types';
 import { Activity, Target, Crosshair, BarChart3, Settings } from 'lucide-react';
 import { AnalysisResult } from './AnalysisResult';
+import { SignalsLogger } from './SignalsLogger';
 
 interface DashboardProps {
   onAnalyze: (asset: string, mode: TradingMode, imageBase64?: string, accountSize?: number, riskPct?: number) => Promise<string>;
@@ -16,6 +17,7 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
   const [result, setResult] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [livePrices, setLivePrices] = useState<Record<string, { bid: number; ask: number; change: number }>>({});
+  const [lastAnalysisCompletedAt, setLastAnalysisCompletedAt] = useState<number>(0);
 
   // v9 fix: Fetch real live prices for the instrument panel
   useEffect(() => {
@@ -64,8 +66,10 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
     try {
       const data = await onAnalyze(selectedAsset, mode, undefined, 10000, 1.0);
       setResult(data);
+      setLastAnalysisCompletedAt(Date.now());
     } catch (err: any) {
       setResult(`**SYSTEM ERROR**\n\nFailed to complete analysis.\n\n\`${err.message}\``);
+      setLastAnalysisCompletedAt(Date.now());
     } finally {
       setIsLoading(false);
     }
@@ -237,6 +241,12 @@ export function Dashboard({ onAnalyze }: DashboardProps) {
            </div>
         </motion.div>
       </div>
+
+      {/* Signals Ledger Logging Workspace (WAIT/AVOID Tracking & Analytics Auditing) */}
+      <SignalsLogger 
+        currentAsset={selectedAsset} 
+        lastAnalysisCompletedAt={lastAnalysisCompletedAt} 
+      />
 
       <style dangerouslySetInnerHTML={{__html: `
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
