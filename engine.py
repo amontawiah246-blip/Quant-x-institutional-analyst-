@@ -394,6 +394,10 @@ def build_technical_evidence(tf_results: dict, htf: str, etf: str) -> dict:
         return {
             'timeframe':       label,
             'trend':           data.get('trend', 'NEUTRAL'),
+            'trend_age':       data.get('trend_age'),
+            'trend_stale':     data.get('trend_stale', False),
+            'trend_raw':       data.get('trend_raw', 'NEUTRAL'),
+            'staleness_threshold_used': data.get('staleness_threshold_used'),
             'ema_trend':       data.get('ema_trend', 'NEUTRAL'),
             'current_price':   data.get('current_price', 0),
             'atr':             data.get('atr', 0),
@@ -594,38 +598,153 @@ def init_db():
         print(f'ERROR: Could not initialize database: {e}', file=sys.stderr)
 
 
+def _zones_match(entry_low_a, entry_high_a, sl_a, tp1_a,
+                  entry_low_b, entry_high_b, sl_b, tp1_b, tolerance_pct=0.15):
+    """
+    Compares two signal setups (entry zone, SL, TP1) and returns True if
+    they're close enough to be considered "the same trade idea" rather than
+    a genuinely new setup. Tolerance is expressed as a percentage of price,
+    since absolute point tolerances don't scale across assets (Gold moves
+    in dollars, BTC moves in hundreds of dollars).
+
+    Returns True (same setup) only if ALL of entry, SL, and TP1 are within
+    tolerance — a meaningfully moved SL or TP, even with the same entry,
+    means the underlying analysis materially changed and should count as
+    a new signal.
+    """
+    def close_enough(a, b, ref_price):
+        if a is None or b is None:
+            return a == b  # both None = match, one None = no match
+        if ref_price == 0:
+            return a == b
+        return abs(a - b) / ref_price <= (tolerance_pct / 100)
+
+    ref = entry_low_a or entry_low_b or 1
+    entry_match = close_enough(entry_low_a, entry_low_b, ref) and close_enough(entry_high_a, entry_high_b, ref)
+    sl_match    = close_enough(sl_a, sl_b, ref)
+    tp1_match   = close_enough(tp1_a, tp1_b, ref)
+
+    return entry_match and sl_match and tp1_match
+
+
+def _find_open_signal(asset, mode):
+    """
+    Returns the most recent OPEN signal (outcome IS NULL) for this asset+mode,
+    or None. "Open" uses the exact same definition your existing
+    check_and_update_outcomes() function already relies on, so this stays
+    consistent with how outcomes are tracked elsewhere in the system.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        row = c.execute('''SELECT id, entry_low, entry_high, sl, tp1, verdict, notes
+                           FROM signals
+                           WHERE asset=? AND mode=? AND outcome IS NULL
+                           AND verdict IN ('EXECUTE', 'EXECUTE_WITH_CAUTION', 'EXECUTE WITH CAUTION')
+                           AND entry_low IS NOT NULL AND sl IS NOT NULL AND tp1 IS NOT NULL
+                           ORDER BY id DESC LIMIT 1''', (asset, mode)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            'id': row[0], 'entry_low': row[1], 'entry_high': row[2],
+            'sl': row[3], 'tp1': row[4], 'verdict': row[5], 'notes': row[6],
+        }
+    except Exception:
+        return None
+
+
 def save_signal(asset, mode, direction, entry_low, entry_high, tp1, tp2, tp3, sl,
                 score, htf_trend, etf_trend, rsi_htf, atr, regime='', session='',
                 verdict='EXECUTE', current_price_at_signal=None,
                 win_probability_pct=None, expected_value_r=None,
-                hard_block_reason=None, wait_reason=None):
-    """Save a new signal to database. Returns the signal ID.
+                hard_block_reason=None, wait_reason=None, notes=None):
+    """Save a new signal to database. Returns the signal ID or a status dictionary.
 
     v13: Now accepts verdict-tracking fields so WAIT/AVOID verdicts can be
     logged too, not just executed trades. For WAIT/AVOID, entry_low/sl/tp1
     may be None (no active trade) — current_price_at_signal is stored
     instead so outcome-checking can later compare what price actually did.
+
+    v14: Before inserting, checks for an OPEN signal (outcome IS NULL) on
+    this same asset+mode. If found and the new setup is functionally
+    identical (same entry/SL/TP1 within tolerance), this call does NOT
+    create a duplicate row — it instead re-confirms the existing one and
+    returns its existing ID. If found but the new setup is meaningfully
+    different, the OLD open signal is marked 'SUPERSEDED' (not WIN/LOSS —
+    it just stopped being the live idea) before the new one is inserted,
+    so the ledger always shows a clean, explained trail instead of orphaned
+    duplicate or contradictory open rows.
     """
     try:
         init_db()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+
+        # v14: Only run duplicate/supersede logic for actual trades
+        # (EXECUTE / EXECUTE WITH CAUTION) — WAIT/AVOID rows have no
+        # entry/SL/TP to compare and should just log independently every
+        # time, since each WAIT/AVOID is its own observation in time, not
+        # a position that can be "open."
+        is_active_trade = entry_low is not None and sl is not None and tp1 is not None and verdict in ('EXECUTE', 'EXECUTE_WITH_CAUTION', 'EXECUTE WITH CAUTION')
+
+        superseded_id = None
+        if is_active_trade:
+            existing = _find_open_signal(asset, mode)
+            if existing:
+                same_setup = _zones_match(
+                    existing['entry_low'], existing['entry_high'], existing['sl'], existing['tp1'],
+                    entry_low, entry_high, sl, tp1,
+                )
+                if same_setup:
+                    # Re-confirmation, not a new signal — update notes/timestamp, return existing ID
+                    now = datetime.now(timezone.utc).isoformat()
+                    prior_notes = existing.get('notes') or ''
+                    reconfirm_count = 1
+                    if 'Re-confirmed' in prior_notes:
+                        try:
+                            reconfirm_count = int(prior_notes.split('Re-confirmed ')[1].split(' time')[0]) + 1
+                        except (IndexError, ValueError):
+                            reconfirm_count = 2
+                    else:
+                        reconfirm_count = 2  # this confirmation is the 2nd observation of the same setup
+                    new_notes = f'Re-confirmed {reconfirm_count} times (last: {now}). Setup unchanged since first detection.'
+                    c.execute('UPDATE signals SET notes=? WHERE id=?', (new_notes, existing['id']))
+                    conn.commit()
+                    conn.close()
+                    return {'id': existing['id'], 'was_reconfirmation': True, 'superseded_id': None}
+                else:
+                    # Genuinely new setup — close out the old open row as SUPERSEDED,
+                    # not as a win/loss it never actually achieved
+                    now = datetime.now(timezone.utc).isoformat()
+                    c.execute('''UPDATE signals SET outcome='SUPERSEDED', outcome_checked_at=?,
+                                 notes=? WHERE id=?''',
+                              (now, f'Superseded by a new signal at {now} before TP/SL resolved.', existing['id']))
+                    superseded_id = existing['id']
+
+        final_notes = notes
+        if not final_notes and superseded_id:
+            final_notes = f"Supersedes signal #{superseded_id}"
+
         c.execute('''INSERT INTO signals
             (asset, mode, timestamp, direction, entry_low, entry_high,
              tp1, tp2, tp3, sl, confluence_score, htf_trend, etf_trend,
              rsi_htf, atr, regime, session, verdict, current_price_at_signal,
-             win_probability_pct, expected_value_r, hard_block_reason, wait_reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+             win_probability_pct, expected_value_r, hard_block_reason, wait_reason,
+             notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (asset, mode, datetime.now(timezone.utc).isoformat(),
              direction, entry_low, entry_high, tp1, tp2, tp3, sl,
              score, htf_trend, etf_trend, rsi_htf, atr, regime, session,
              verdict, current_price_at_signal, win_probability_pct,
-             expected_value_r, hard_block_reason, wait_reason))
+             expected_value_r, hard_block_reason, wait_reason, final_notes))
         signal_id = c.lastrowid
         conn.commit()
         conn.close()
-        return signal_id
+        return {'id': signal_id, 'was_reconfirmation': False, 'superseded_id': superseded_id}
     except Exception as e:
+        try: conn.close()
+        except: pass
         return None
 
 
@@ -5388,7 +5507,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         # more generous tolerance since one HTF candle represents much more
         # real time than one LTF candle of the same count.
         _staleness_map = {
-            '4H': 30, '1H': 35, '15M': 40, '5M': 45, '1M': 50,
+            '4H': 18, '1H': 24, '15M': 40, '5M': 45, '1M': 50,
             'D1': 20, 'W1': 15,
         }
         _staleness = _staleness_map.get(tf, None)  # None → auto 40% of window
@@ -5398,6 +5517,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         trend_age       = bos_result['trend_age']
         trend_stale     = bos_result['trend_stale']
         trend_raw       = bos_result['raw_trend']
+        staleness_threshold_used = bos_result.get('staleness_threshold_used')
         fvgs=detect_fvg(candles,atr)
         obs=detect_order_blocks(candles,bos,atr)
         liq=detect_liquidity(candles,sh,sl,atr)
@@ -5473,7 +5593,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
 
         result[tf]={
             'atr':atr,'trend':trend,'trend_age':trend_age,'trend_stale':trend_stale,
-            'trend_raw':trend_raw,'ema_trend':ema_trend,'current_price':(live_mid_price if has_live_price and tf == etf else candles[-1]['close']),
+            'trend_raw':trend_raw,'staleness_threshold_used':staleness_threshold_used,'ema_trend':ema_trend,'current_price':(live_mid_price if has_live_price and tf == etf else candles[-1]['close']),
             'confidence':tf_conf,
             'swing_highs':sh[-5:],'swing_lows':sl[-5:],'bos_choch':bos[-8:],
             'fvg_fresh':[f for f in fvgs if f['status']=='FRESH'][-5:],
@@ -5798,7 +5918,7 @@ def main():
 
         elif operation == 'save_signal':
             sig = data.get('signal', {})
-            signal_id = save_signal(
+            save_result = save_signal(
                 asset      = sig.get('asset', ''),
                 mode       = sig.get('mode', ''),
                 direction  = sig.get('direction', ''),
@@ -5822,7 +5942,16 @@ def main():
                 hard_block_reason        = sig.get('hard_block_reason'),
                 wait_reason              = sig.get('wait_reason'),
             )
-            print(json.dumps({'signal_id': signal_id, 'status': 'saved' if signal_id else 'failed'}))
+            if isinstance(save_result, dict):
+                print(json.dumps({
+                    'signal_id':          save_result.get('id'),
+                    'was_reconfirmation': save_result.get('was_reconfirmation', False),
+                    'superseded_id':      save_result.get('superseded_id'),
+                    'status': 'saved' if save_result.get('id') else 'failed',
+                }))
+            else:
+                # backward compatibility if save_signal ever returns a bare int
+                print(json.dumps({'signal_id': save_result, 'status': 'saved' if save_result else 'failed'}))
 
         elif operation == 'create_thesis':
             sig = data.get('thesis', {})

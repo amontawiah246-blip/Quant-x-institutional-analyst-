@@ -564,14 +564,22 @@ function formatEngineResults(engineData:any): string {
     const te = s.technical_evidence;
     block += `\nTECHNICAL EVIDENCE PACKAGE:\n`;
     block += `  MTF Alignment: ${te.all_tf_alignment} | Bull TFs:[${te.bullish_timeframes?.join(',')||'none'}] Bear TFs:[${te.bearish_timeframes?.join(',')||'none'}]\n`;
+    const formatTrend = (t: any) => {
+      if (t.trend_age !== undefined && t.trend_age !== null && t.staleness_threshold_used) {
+        const pct = Math.round((t.trend_age / t.staleness_threshold_used) * 100);
+        return `${t.trend} [age:${t.trend_age}c since defining BOS/CHoCH (${pct}% of staleness budget used)]`;
+      }
+      return t.trend;
+    };
+
     if(te.htf_summary){
       const h = te.htf_summary;
-      block += `  HTF(${h.timeframe}): Trend=${h.trend} EMA=${h.ema_trend} RSI=${h.rsi}[${h.rsi_zone}] Regime=${h.regime} OBs=${h.fresh_obs} FVGs=${h.fresh_fvgs} P/D=${h.pd_status}@${h.pd_pct}%\n`;
+      block += `  HTF(${h.timeframe}): Trend=${formatTrend(h)} EMA=${h.ema_trend} RSI=${h.rsi}[${h.rsi_zone}] Regime=${h.regime} OBs=${h.fresh_obs} FVGs=${h.fresh_fvgs} P/D=${h.pd_status}@${h.pd_pct}%\n`;
       if(h.wyckoff_phase) block += `  HTF Wyckoff: ${h.wyckoff_phase} (${h.wyckoff_bias}, ${h.wyckoff_conf}% conf)\n`;
     }
     if(te.etf_summary){
       const e = te.etf_summary;
-      block += `  ETF(${e.timeframe}): Trend=${e.trend} EMA=${e.ema_trend} RSI=${e.rsi}[${e.rsi_zone}] Regime=${e.regime} P/D=${e.pd_status}@${e.pd_pct}%\n`;
+      block += `  ETF(${e.timeframe}): Trend=${formatTrend(e)} EMA=${e.ema_trend} RSI=${e.rsi}[${e.rsi_zone}] Regime=${e.regime} P/D=${e.pd_status}@${e.pd_pct}%\n`;
     }
   }
 
@@ -897,11 +905,11 @@ Review each package and ask:
 
 TECHNICAL REVIEW:
 - Is structure aligned across timeframes? Or mixed and contradictory?
-- BEFORE citing an HTF/LTF "conflict," check the TREND_STALENESS_CHECK block:
-    - If either timeframe's trend_age is large relative to its own typical
-      structure cycle (a rough guide: HTF trend_age > 30 H4 candles ≈ 5 days
-      of no new structure, LTF trend_age > 40 candles on 5M ≈ 3+ hours of no
-      new structure), treat that timeframe's trend label with skepticism.
+- READ the inline [age:...] bracket attached to the Trend= label BEFORE forming any directional narrative:
+    - If either timeframe's trend_age is large relative to its staleness budget
+      (Thresholds: 18 candles on 4H, 24 candles on 1H), treat that timeframe's trend label with skepticism.
+    - If a trend label shows it has used 90%+ of its staleness budget, treat the structure 
+      as exhausted and highly suspicious EVEN BEFORE it formally decays to NEUTRAL.
       A trend label backed by an old, unrefreshed BOS/CHoCH is weaker
       evidence than one backed by a recent event, even if both are
       technically "BULLISH" or "BEARISH."
@@ -2048,7 +2056,13 @@ Respond ONLY with this JSON (no markdown):
           if(sr?.signal_id) {
             responseText = responseText.replace(/SIGNAL_JSON_START[\s\S]*?SIGNAL_JSON_END/g, '').trim();
             const verdictLabel = signalData.verdict.replace(/_/g, ' ');
-            responseText += `\n\n---\n> 📊 **Signal #${sr.signal_id} recorded (${verdictLabel})** — outcome tracked automatically.`;
+            if (sr.was_reconfirmation) {
+              responseText += `\n\n---\n> 🔁 **Signal #${sr.signal_id} re-confirmed** — this setup is unchanged from your last check. No duplicate entry created.`;
+            } else if (sr.superseded_id) {
+              responseText += `\n\n---\n> 📊 **Signal #${sr.signal_id} recorded (${verdictLabel})** — supersedes signal #${sr.superseded_id}, which was still open. #${sr.superseded_id} marked SUPERSEDED, not won/lost.`;
+            } else {
+              responseText += `\n\n---\n> 📊 **Signal #${sr.signal_id} recorded (${verdictLabel})** — outcome tracked automatically.`;
+            }
           }
         } else {
           // Clean up JSON block even if not saved

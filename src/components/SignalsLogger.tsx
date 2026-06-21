@@ -124,6 +124,8 @@ export function SignalsLogger({ currentAsset, onRefreshTriggered, lastAnalysisCo
         return 'bg-emerald-500/15 text-emerald-700 border-emerald-300';
       case 'LOSS':
         return 'bg-red-500/15 text-red-700 border-red-300';
+      case 'SUPERSEDED':
+        return 'bg-amber-500/15 text-amber-700 border-amber-305';
       case 'CAUTION_JUSTIFIED':
         return 'bg-teal-500/15 text-teal-700 border-teal-300';
       case 'MISSED_OPPORTUNITY':
@@ -244,6 +246,11 @@ export function SignalsLogger({ currentAsset, onRefreshTriggered, lastAnalysisCo
                       <Clock className="w-3 h-3 text-slate-300" />
                       <span>{formatTimestamp(sig.timestamp)}</span>
                     </div>
+                    {sig.notes && (
+                      <div className="text-[10pt] text-slate-500 italic mt-1.5 max-w-[220px] truncate" title={sig.notes}>
+                        {sig.notes}
+                      </div>
+                    )}
                   </td>
 
                   {/* Verdict Badge */}
