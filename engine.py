@@ -592,6 +592,27 @@ def init_db():
         c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_active_thesis_asset_mode
             ON active_thesis(asset, mode)
             WHERE status = 'ACTIVE' ''')
+            
+        # v16: extend active_thesis with zone-refinement and proximity tracking
+        existing_thesis_cols = [row[1] for row in c.execute("PRAGMA table_info(active_thesis)").fetchall()]
+        new_thesis_cols = {
+            'original_entry_low':       'REAL DEFAULT NULL',   # the FIRST zone ever set — never overwritten
+            'original_entry_high':      'REAL DEFAULT NULL',
+            'zone_source':              "TEXT DEFAULT 'OB'",    # 'OB' | 'FVG' | 'IFVG' — what kind of zone is currently active
+            'zone_refined_count':       'INTEGER DEFAULT 0',    # how many times the trigger zone has been refined to a fresher FVG/iFVG
+            'closest_approach_price':   'REAL DEFAULT NULL',    # closest price has come to the CURRENT zone, ever
+            'closest_approach_atr':     'REAL DEFAULT NULL',    # that distance expressed in ATR units
+            'closest_approach_at':      'TEXT DEFAULT NULL',    # timestamp of the closest approach
+            'near_miss_count':          'INTEGER DEFAULT 0',    # how many times price approached within tolerance then reversed away
+            'last_checked_at':          'TEXT DEFAULT NULL',
+            'last_checked_price':       'REAL DEFAULT NULL',
+        }
+        for col, coltype in new_thesis_cols.items():
+            if col not in existing_thesis_cols:
+                try:
+                    c.execute(f'ALTER TABLE active_thesis ADD COLUMN {col} {coltype}')
+                except Exception:
+                    pass
         conn.commit()
         conn.close()
     except Exception as e:
@@ -781,14 +802,18 @@ def get_active_thesis(asset, mode):
 
 def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend,
                    entry_low, entry_high, sl, tp1, tp2, tp3,
-                   invalidation_price, invalidation_reason, structural_anchor):
-    """Creates a new active thesis. Invalidates any prior active thesis for this asset+mode first."""
+                   invalidation_price, invalidation_reason, structural_anchor,
+                   zone_source='OB'):
+    """Creates a new active thesis. Invalidates any prior active thesis for this asset+mode first.
+
+    v16: also seeds original_entry_low/high (a permanent record of the FIRST
+    zone, even if later refined to a fresher FVG/iFVG) and zone_source.
+    """
     try:
         init_db()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         now = datetime.now(timezone.utc).isoformat()
-        # Invalidate any existing active thesis for this asset+mode (replaced by new one)
         c.execute('''UPDATE active_thesis SET status='REPLACED',
                      invalidated_at=?, invalidated_reason='New thesis superseded this one'
                      WHERE asset=? AND mode=? AND status='ACTIVE' ''', (now, asset, mode))
@@ -796,12 +821,16 @@ def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend
             (asset, mode, direction, status, created_at, updated_at,
              confluence_score, htf_trend, etf_trend,
              entry_low, entry_high, sl, tp1, tp2, tp3,
-             invalidation_price, invalidation_reason, structural_anchor, times_confirmed)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)''',
+             invalidation_price, invalidation_reason, structural_anchor, times_confirmed,
+             original_entry_low, original_entry_high, zone_source, zone_refined_count,
+             last_checked_at, last_checked_price)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,0,?,?)''',
             (asset, mode, direction, 'ACTIVE', now, now,
              confluence_score, htf_trend, etf_trend,
              entry_low, entry_high, sl, tp1, tp2, tp3,
-             invalidation_price, invalidation_reason, structural_anchor))
+             invalidation_price, invalidation_reason, structural_anchor,
+             entry_low, entry_high, zone_source,
+             now, None))
         thesis_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -884,6 +913,166 @@ def check_thesis_invalidation(thesis, current_price, etf_data, htf_data):
 
     return False, None
 
+
+def track_zone_proximity(thesis, current_price, atr, near_miss_threshold_atr=0.5):
+    """
+    v16: Tracks how close price has come to the thesis's CURRENT zone over
+    its lifetime — even when price never actually touches it. Updates the
+    active_thesis row with the closest approach ever recorded, and detects
+    a "near miss" (price approached within tolerance, then moved away again
+    without tagging the zone) so this can be reported honestly instead of
+    silently doing nothing.
+
+    This does not invalidate or change the thesis — it only records history
+    so the trader (and the AI) can say something accurate like "price came
+    within 0.3 ATR of the zone twice and reversed both times" instead of a
+    flat, uninformative "still waiting."
+
+    Returns a dict describing what happened on THIS check (not the full
+    history) — the caller decides whether to surface it.
+    """
+    entry_low  = thesis.get('entry_low')
+    entry_high = thesis.get('entry_high')
+    if entry_low is None or entry_high is None or atr is None or atr <= 0:
+        return {'event': 'NONE'}
+
+    zone_mid = (entry_low + entry_high) / 2
+    distance = abs(current_price - zone_mid)
+    distance_atr = distance / atr
+
+    prior_closest_atr = thesis.get('closest_approach_atr')
+    is_new_closest = prior_closest_atr is None or distance_atr < prior_closest_atr
+
+    in_zone = entry_low <= current_price <= entry_high
+
+    event = 'NONE'
+    if in_zone:
+        event = 'TAGGED'
+    elif is_new_closest and distance_atr <= near_miss_threshold_atr:
+        event = 'NEAR_MISS'
+    elif is_new_closest:
+        event = 'NEW_CLOSEST_NOT_YET_NEAR'
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+
+        update_fields = ['last_checked_at=?', 'last_checked_price=?']
+        update_values = [now, current_price]
+
+        if is_new_closest:
+            update_fields += ['closest_approach_price=?', 'closest_approach_atr=?', 'closest_approach_at=?']
+            update_values += [current_price, round(distance_atr, 3), now]
+
+        if event == 'NEAR_MISS':
+            update_fields.append('near_miss_count=near_miss_count+1')
+
+        update_values.append(thesis['id'])
+        c.execute(f'''UPDATE active_thesis SET {", ".join(update_fields)} WHERE id=?''', update_values)
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    return {
+        'event':         event,
+        'distance_atr':  round(distance_atr, 3),
+        'in_zone':       in_zone,
+        'is_new_closest': is_new_closest,
+    }
+
+def refine_thesis_zone(thesis, etf_data, htf_data, atr, max_refine_distance_atr=1.0):
+    """
+    v16: If price approached the thesis's ORIGINAL zone (OB or older FVG) but
+    didn't tag it, and a FRESHER, smaller FVG or iFVG has since formed at or
+    near that same area, this updates the thesis's ACTIVE entry trigger zone
+    to the fresher one — without creating a new thesis, without resetting
+    times_confirmed, and without changing the direction or invalidation level.
+
+    This mirrors real discretionary trading judgment: "I was watching the big
+    OB at 4283-4301, but it just left a small FVG at 4297-4299 and reversed
+    from there instead — that's my real trigger now," while the underlying
+    thesis (bullish bias, invalidation below 4268) stays exactly the same.
+
+    Only refines toward a zone that is:
+      1. The same direction as the thesis (BULL FVG for a bullish thesis, etc.)
+      2. Fresh (status == 'FRESH', i.e. unmitigated)
+      3. Within max_refine_distance_atr of the ORIGINAL zone (so this never
+         drifts the trigger somewhere unrelated — it only sharpens locally)
+      4. Smaller/more local than the original zone, OR closer to current price
+         than the original zone (a genuine refinement, not a random swap)
+
+    Returns the updated thesis dict if a refinement was made, or the
+    original thesis dict unchanged if no qualifying fresher zone was found.
+    """
+    direction = thesis['direction']
+    orig_low  = thesis.get('original_entry_low',  thesis.get('entry_low'))
+    orig_high = thesis.get('original_entry_high', thesis.get('entry_high'))
+    if orig_low is None or orig_high is None or atr is None or atr <= 0:
+        return thesis
+
+    orig_mid = (orig_low + orig_high) / 2
+    target_fvg_direction = 'BULL' if direction == 'BULLISH' else 'BEAR'
+
+    # Search BOTH the HTF and ETF fresh FVG lists — an iFVG forming on the
+    # execution timeframe right at the HTF zone is exactly the case described
+    candidate_fvgs = []
+    for src_data, src_label in [(htf_data, 'HTF'), (etf_data, 'ETF')]:
+        for fvg in src_data.get('fvg_fresh', []):
+            if fvg.get('direction') != target_fvg_direction:
+                continue
+            fvg_mid = (fvg.get('top', 0) + fvg.get('bottom', 0)) / 2
+            dist_from_orig_atr = abs(fvg_mid - orig_mid) / atr
+            if dist_from_orig_atr <= max_refine_distance_atr:
+                candidate_fvgs.append({
+                    'top': fvg.get('top'), 'bottom': fvg.get('bottom'),
+                    'mid': fvg_mid, 'dist_from_orig_atr': dist_from_orig_atr,
+                    'source': src_label,
+                })
+
+    if not candidate_fvgs:
+        return thesis  # no qualifying fresher zone — leave thesis exactly as is
+
+    # Prefer the candidate closest to the ORIGINAL zone (most locally relevant,
+    # least likely to be an unrelated coincidence elsewhere on the chart)
+    best = min(candidate_fvgs, key=lambda f: f['dist_from_orig_atr'])
+
+    # Only actually refine if this is a genuinely different zone from the
+    # current active one (avoid no-op "refinements" that just reassert the
+    # same numbers and inflate zone_refined_count for no reason)
+    current_low, current_high = thesis.get('entry_low'), thesis.get('entry_high')
+    already_same = (current_low is not None and abs(best['bottom'] - current_low) < atr * 0.05
+                     and current_high is not None and abs(best['top'] - current_high) < atr * 0.05)
+    if already_same:
+        return thesis
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute('''UPDATE active_thesis SET entry_low=?, entry_high=?, zone_source=?,
+                     zone_refined_count=zone_refined_count+1, updated_at=? WHERE id=?''',
+                  (best['bottom'], best['top'],
+                   f"FVG_REFINED_FROM_{best['source']}", now, thesis['id']))
+        conn.commit()
+        conn.close()
+    except Exception:
+        return thesis
+
+    thesis = dict(thesis)
+    thesis['entry_low']  = best['bottom']
+    thesis['entry_high'] = best['top']
+    thesis['zone_source'] = f"FVG_REFINED_FROM_{best['source']}"
+    thesis['zone_refined_count'] = thesis.get('zone_refined_count', 0) + 1
+    thesis['_refinement_note'] = (
+        f"Original zone {orig_low}-{orig_high} was approached but not tagged. "
+        f"A fresher {target_fvg_direction} FVG formed at {best['bottom']}-{best['top']} "
+        f"({best['dist_from_orig_atr']:.2f} ATR from the original zone, on {best['source']}). "
+        f"Trigger zone refined to this fresher level — thesis direction and "
+        f"invalidation unchanged."
+    )
+    return thesis
 
 def fetch_current_price_deriv(asset):
     """
@@ -4206,6 +4395,279 @@ def detect_fvg(candles, atr):
     return fvgs
 
 
+def classify_fvg_fill_quality(fvg: dict, candles: list, atr: float) -> dict:
+    """
+    FVG FILL-QUALITY CLASSIFIER
+    ══════════════════════════════════════════════════════════
+    The existing FRESH/MITIGATED status only tells you whether price's
+    CLOSE ever traded back inside the gap — it does not distinguish between
+    fundamentally different market behaviors:
+
+      'NEVER_RETURNED'   — Price has not come back to the gap at all since
+                            it formed. Still a valid, untested zone.
+      'CLEAN_RETEST'      — Price wicked into the gap, showed real rejection
+                            (a reaction candle with meaningful range/close
+                            back in the breakout direction), and continued.
+                            This is the highest-quality, most tradeable case.
+      'SINGLE_CANDLE_KISS' — Only the immediate next 1-2 candles touched the
+                            gap edge before continuation resumed — a brief
+                            tag, not a real test. Lower reliability than a
+                            clean retest but still meaningful.
+      'PASSED_THROUGH'    — Price traded straight through the ENTIRE gap
+                            (closed beyond the far side) without showing any
+                            rejection — "like water," exactly as described.
+                            This gap should be treated as ALREADY CONSUMED —
+                            do not wait for a retest entry here; it's not coming.
+      'CHOPPED_THROUGH'   — Price entered the gap and spent several candles
+                            inside it without a clean directional resolution
+                            either way (indecision, not rejection). Lower
+                            confidence than a clean retest, but not yet dead.
+
+    Returns the classification plus supporting detail so the AI can make an
+    informed choice about whether THIS specific gap is worth waiting on.
+    """
+    direction = fvg.get('direction')
+    top, bottom = fvg.get('top'), fvg.get('bottom')
+    fvg_idx = fvg.get('index', 0)
+    gap_size = top - bottom if top and bottom else 0
+
+    if top is None or bottom is None or atr <= 0:
+        return {'fill_quality': 'UNKNOWN', 'description': 'Insufficient data.'}
+
+    post_candles = candles[fvg_idx + 1:]
+    if not post_candles:
+        return {'fill_quality': 'NEVER_RETURNED', 'description': 'FVG just formed — no subsequent candles yet.'}
+
+    # Find the first candle that touches the gap at all
+    first_touch_idx = None
+    for k, c in enumerate(post_candles):
+        if c['high'] >= bottom and c['low'] <= top:
+            first_touch_idx = k
+            break
+
+    if first_touch_idx is None:
+        return {
+            'fill_quality': 'NEVER_RETURNED',
+            'description': f'Price has not returned to this {direction} FVG ({bottom}-{top}) since it formed. Still untested.',
+        }
+
+    # Check if price passed CLEANLY THROUGH the entire gap with a close
+    # beyond the far side, with little/no rejection — the "water" case
+    touch_candle = post_candles[first_touch_idx]
+    if direction == 'BULL':
+        passed_through = touch_candle['close'] < bottom  # closed below the ENTIRE gap
+    else:
+        passed_through = touch_candle['close'] > top      # closed above the ENTIRE gap
+
+    if passed_through:
+        return {
+            'fill_quality': 'PASSED_THROUGH',
+            'description': (
+                f'Price traded straight through this {direction} FVG ({bottom}-{top}) '
+                f'with a close beyond the far side — no rejection shown. Treat this gap as '
+                f'ALREADY CONSUMED. Do not wait for a retest entry here; it already passed through.'
+            ),
+        }
+
+    # Check how many subsequent candles stayed inside/interacting with the
+    # gap before resolving — distinguishes a quick kiss from a slow chop
+    interacting_candles = 0
+    resolved_idx = None
+    resolution_direction = None
+    for k in range(first_touch_idx, min(first_touch_idx + 10, len(post_candles))):
+        c = post_candles[k]
+        still_touching = c['high'] >= bottom and c['low'] <= top
+        if still_touching:
+            interacting_candles += 1
+        else:
+            resolved_idx = k
+            if direction == 'BULL' and c['close'] > top:
+                resolution_direction = 'CONTINUED'
+            elif direction == 'BEAR' and c['close'] < bottom:
+                resolution_direction = 'CONTINUED'
+            else:
+                resolution_direction = 'REVERSED'
+            break
+
+    if resolved_idx is None:
+        return {
+            'fill_quality': 'CHOPPED_THROUGH',
+            'description': (
+                f'Price has been inside this {direction} FVG ({bottom}-{top}) for '
+                f'{interacting_candles}+ candles without a clean resolution — indecision, '
+                f'not a clear rejection. Lower confidence than a clean retest.'
+            ),
+        }
+
+    # ── Evaluate rejection quality at the resolution candle ───────────────────
+    resolution_candle = post_candles[resolved_idx]
+    rejection_range = abs(resolution_candle['high'] - resolution_candle['low'])
+    rejection_strength_atr = rejection_range / atr if atr else 0
+    body = abs(resolution_candle['close'] - resolution_candle['open'])
+    body_ratio = body / rejection_range if rejection_range > 0 else 0
+
+    if resolution_direction == 'CONTINUED':
+        if interacting_candles <= 1 and rejection_strength_atr >= 0.5 and body_ratio >= 0.4:
+            return {
+                'fill_quality': 'CLEAN_RETEST',
+                'description': (
+                    f'Price tagged this {direction} FVG ({bottom}-{top}), showed a strong '
+                    f'rejection candle ({rejection_strength_atr:.2f} ATR range, '
+                    f'{body_ratio*100:.0f}% body), and continued in the breakout direction. '
+                    f'High-quality retest — this supports an entry here.'
+                ),
+            }
+        elif interacting_candles <= 1:
+            return {
+                'fill_quality': 'SINGLE_CANDLE_KISS',
+                'description': (
+                    f'Price briefly tagged this {direction} FVG ({bottom}-{top}) for only '
+                    f'{interacting_candles + 1} candle(s) before continuing — a quick kiss, '
+                    f'not a fully developed retest. Moderate confidence only; the gap was '
+                    f'barely tested before the move resumed.'
+                ),
+            }
+        else:
+            return {
+                'fill_quality': 'CLEAN_RETEST',
+                'description': (
+                    f'Price spent {interacting_candles} candle(s) inside this {direction} FVG '
+                    f'({bottom}-{top}) before continuing — a developed retest with eventual '
+                    f'continuation in the original direction.'
+                ),
+            }
+    else:
+        return {
+            'fill_quality': 'CHOPPED_THROUGH',
+            'description': (
+                f'Price entered this {direction} FVG ({bottom}-{top}) but reversed AGAINST '
+                f'the expected breakout direction — this gap did NOT hold as expected. '
+                f'Treat the original directional bias from this gap with real skepticism.'
+            ),
+        }
+
+
+def evaluate_ltf_confirmation(etf_data: dict, candles: list, atr: float,
+                               thesis_direction: str, target_zone: dict) -> dict:
+    """
+    MULTI-TRIGGER LTF CONFIRMATION ENGINE
+    ══════════════════════════════════════════════════════════
+    Checks SEVERAL independent confirmation types in parallel, rather than
+    gating entry on a single rigid trigger (e.g. "must be an FVG retest").
+    A real trader doesn't insist on one specific pattern — they take
+    whatever valid, high-quality confirmation the market actually offers.
+
+    Checked trigger types, in no particular priority (best available wins):
+      1. FVG_CLEAN_RETEST    — uses classify_fvg_fill_quality(), only counts
+                                CLEAN_RETEST or well-resolved SINGLE_CANDLE_KISS
+      2. ORDER_BLOCK_RETEST   — price tagged a fresh OB and showed rejection,
+                                independent of any FVG being present at all
+      3. STRUCTURAL_CHOCH     — a clean CHoCH formed at/near the target zone
+                                with NO FVG or OB required — pure price action
+      4. SWEEP_DISPLACEMENT   — reuses the v10 pattern if active (liquidity
+                                sweep + strong displacement is itself a valid,
+                                independent confirmation type)
+      5. POLARITY_FLIP_RETEST — reuses the v17 pattern if a flipped level is
+                                being retested and held
+
+    Returns the BEST available confirmation (by quality, not by which type
+    happened to be checked first), or NONE if nothing has confirmed yet —
+    but critically, "nothing confirmed" only happens when NONE of the five
+    independent checks fired, not just because one specific type (e.g. FVG)
+    didn't.
+    """
+    confirmations_found = []
+
+    direction_tag = 'BULL' if thesis_direction == 'BULLISH' else 'BEAR'
+    fvgs = etf_data.get('fvg_fresh', []) + etf_data.get('fvg_mitigated', [])
+    obs  = etf_data.get('ob_fresh', [])
+    bos_choch = etf_data.get('bos_choch', [])
+
+    # ── Check 1: FVG retest quality ───────────────────────────────────────────
+    for fvg in fvgs:
+        if fvg.get('direction') != direction_tag:
+            continue
+        quality = classify_fvg_fill_quality(fvg, candles, atr)
+        if quality['fill_quality'] in ('CLEAN_RETEST', 'SINGLE_CANDLE_KISS'):
+            score = 85 if quality['fill_quality'] == 'CLEAN_RETEST' else 65
+            confirmations_found.append({
+                'type': 'FVG_RETEST', 'quality_score': score,
+                'detail': quality['description'],
+                'fill_quality': quality['fill_quality'],
+            })
+
+    # ── Check 2: Order block retest ───────────────────────────────────────────
+    for ob in obs:
+        if ob.get('direction') != direction_tag:
+            continue
+        if ob.get('status') == 'MITIGATED' and ob.get('touch_count', 0) >= 1:
+            confirmations_found.append({
+                'type': 'ORDER_BLOCK_RETEST', 'quality_score': 75,
+                'detail': f"Order block ({ob.get('low')}-{ob.get('high')}) retested with {ob.get('touch_count')} touch(es).",
+            })
+
+    # ── Check 3: Pure structural CHoCH, no FVG/OB required ────────────────────
+    reversal_type = 'CHoCH_BULL' if thesis_direction == 'BULLISH' else 'CHoCH_BEAR'
+    recent_choch = [e for e in bos_choch[-3:] if reversal_type in e.get('type', '')]
+    if recent_choch:
+        confirmations_found.append({
+            'type': 'STRUCTURAL_CHOCH', 'quality_score': 70,
+            'detail': f"Clean {reversal_type} at {recent_choch[-1].get('price')} — pure price-action confirmation, no FVG/OB required.",
+        })
+
+    # ── Check 4: Sweep + displacement (reuse v10 pattern if present) ─────────
+    sweep_pattern = etf_data.get('sweep_displacement', {})
+    if sweep_pattern.get('pattern_detected'):
+        matches = (thesis_direction == 'BULLISH' and sweep_pattern.get('direction') == 'BULLISH_FLIP') or \
+                  (thesis_direction == 'BEARISH' and sweep_pattern.get('direction') == 'BEARISH_FLIP')
+        if matches:
+            quality_map = {'HIGH': 90, 'MEDIUM': 70}
+            confirmations_found.append({
+                'type': 'SWEEP_DISPLACEMENT', 'quality_score': quality_map.get(sweep_pattern.get('sweep_quality'), 60),
+                'detail': sweep_pattern.get('description', ''),
+            })
+
+    # ── Check 5: Polarity flip retest held (reuse v17 pattern if present) ────
+    polarity = etf_data.get('polarity_flip', {})
+    if polarity.get('flip_detected') and polarity.get('retest_status') == 'RETESTED_AND_HELD':
+        new_role_matches = (thesis_direction == 'BULLISH' and polarity.get('new_role') == 'SUPPORT') or \
+                            (thesis_direction == 'BEARISH' and polarity.get('new_role') == 'RESISTANCE')
+        if new_role_matches:
+            confirmations_found.append({
+                'type': 'POLARITY_FLIP_RETEST', 'quality_score': 80,
+                'detail': polarity.get('description', ''),
+            })
+
+    if not confirmations_found:
+        return {
+            'confirmed':        False,
+            'confirmation_type': None,
+            'quality_score':    0,
+            'description': (
+                'No confirmation type has fired yet (checked: FVG retest, order block '
+                'retest, structural CHoCH, sweep+displacement, polarity flip retest). '
+                'This does not mean an FVG specifically failed — it means NONE of the '
+                'independent confirmation paths have triggered. Continue monitoring; '
+                'do not force an entry without at least one of these confirming.'
+            ),
+        }
+
+    best = max(confirmations_found, key=lambda c: c['quality_score'])
+    all_types = ', '.join(c['type'] for c in confirmations_found)
+
+    return {
+        'confirmed':         True,
+        'confirmation_type': best['type'],
+        'quality_score':     best['quality_score'],
+        'description':       best['detail'],
+        'all_triggered_types': all_types,
+        'note': (
+            f"Confirmation via {best['type']} (quality {best['quality_score']}/100)."
+            + (f" Other types also present: {all_types}." if len(confirmations_found) > 1 else "")
+        ),
+    }
+
+
 def detect_order_blocks(candles, bos_events, atr):
     obs, min_imp = [], atr*1.5 if atr>0 else 0
     for event in bos_events:
@@ -4266,6 +4728,148 @@ def detect_liquidity(candles, swing_highs, swing_lows, atr):
         'equal_highs':eqh[:3],'equal_lows':eql[:3]
     }
 
+
+def detect_polarity_flip(candles: list, swing_highs: list, swing_lows: list,
+                          atr: float, current_price: float,
+                          lookback_candles: int = 60) -> dict:
+    """
+    SUPPORT/RESISTANCE POLARITY FLIP DETECTOR
+    ══════════════════════════════════════════════════════════
+    Core SMC/ICT concept: when price DECISIVELY CLOSES THROUGH a structural
+    swing level (not just wicks through it), that level's role flips:
+      - A broken swing LOW (former support) becomes a new RESISTANCE level
+      - A broken swing HIGH (former resistance) becomes a new SUPPORT level
+    Price very often returns to retest the FLIPPED level from the other side
+    before continuing in the breakout direction — this is the "broken
+    support retested as resistance" pattern you're describing.
+
+    This is DIFFERENT from a liquidity sweep (v10/v12): a sweep is a wick
+    that goes through and reverses (a trap). A polarity flip requires a
+    decisive CLOSE through the level, confirming the break is real — then
+    watches for a retest of that same level from the new side.
+
+    Returns the most relevant active flipped level (closest unretested one
+    to current price), with retest status, so the AI can tell the trader
+    "watch for a retest of former support-now-resistance at X" the same way
+    a real trader would mark it.
+    """
+    result = {
+        'flip_detected':       False,
+        'flipped_level':       None,
+        'original_role':       None,   # 'SUPPORT' or 'RESISTANCE'
+        'new_role':            None,
+        'broken_at_index':     None,
+        'retest_status':       'NONE',  # 'AWAITING_RETEST' | 'RETESTING_NOW' | 'RETESTED_AND_HELD' | 'RETESTED_AND_FAILED'
+        'distance_to_level_atr': None,
+        'description':         'No active polarity flip detected.',
+    }
+
+    if not candles or atr <= 0 or len(candles) < 10:
+        return result
+
+    total = len(candles)
+    recent_start = max(0, total - lookback_candles)
+    candidates = []
+
+    # ── Check swing LOWS that got decisively broken (support → resistance) ───
+    for sw in swing_lows:
+        if sw['index'] < recent_start:
+            continue
+        level = sw['price']
+        broken_idx = None
+        for j in range(sw['index'] + 1, total):
+            c = candles[j]
+            # Decisive close BELOW the level (not just a wick) confirms the break
+            if c['close'] < level - (atr * 0.05):
+                broken_idx = j
+                break
+        if broken_idx is None:
+            continue  # never decisively broken — still acting as support, not a flip candidate
+
+        # Check what's happened since the break: has price come back to retest
+        # the level from BELOW (since it's now resistance)?
+        retest_status = 'AWAITING_RETEST'
+        post_break = candles[broken_idx + 1:]
+        for k, c in enumerate(post_break):
+            touched = c['high'] >= level - (atr * 0.1) and c['low'] <= level + (atr * 0.1)
+            if touched:
+                # Did price hold below (confirming resistance) or close back above (flip failed)?
+                if c['close'] > level:
+                    retest_status = 'RETESTED_AND_FAILED'  # broke back above — flip didn't hold
+                else:
+                    retest_status = 'RETESTED_AND_HELD' if k < len(post_break) - 3 else 'RETESTING_NOW'
+                break
+
+        candidates.append({
+            'level': level, 'original_role': 'SUPPORT', 'new_role': 'RESISTANCE',
+            'broken_at_index': broken_idx, 'retest_status': retest_status,
+            'distance_atr': abs(current_price - level) / atr,
+        })
+
+    # ── Check swing HIGHS that got decisively broken (resistance → support) ──
+    for sw in swing_highs:
+        if sw['index'] < recent_start:
+            continue
+        level = sw['price']
+        broken_idx = None
+        for j in range(sw['index'] + 1, total):
+            c = candles[j]
+            if c['close'] > level + (atr * 0.05):
+                broken_idx = j
+                break
+        if broken_idx is None:
+            continue
+
+        retest_status = 'AWAITING_RETEST'
+        post_break = candles[broken_idx + 1:]
+        for k, c in enumerate(post_break):
+            touched = c['low'] <= level + (atr * 0.1) and c['high'] >= level - (atr * 0.1)
+            if touched:
+                if c['close'] < level:
+                    retest_status = 'RETESTED_AND_FAILED'
+                else:
+                    retest_status = 'RETESTED_AND_HELD' if k < len(post_break) - 3 else 'RETESTING_NOW'
+                break
+
+        candidates.append({
+            'level': level, 'original_role': 'RESISTANCE', 'new_role': 'SUPPORT',
+            'broken_at_index': broken_idx, 'retest_status': retest_status,
+            'distance_atr': abs(current_price - level) / atr,
+        })
+
+    if not candidates:
+        return result
+
+    # Prioritize: an active, not-yet-resolved retest closest to current price
+    # is the most actionable — prefer AWAITING_RETEST/RETESTING_NOW over
+    # already-resolved outcomes, then sort by proximity
+    active_statuses = ('AWAITING_RETEST', 'RETESTING_NOW')
+    active_candidates = [c for c in candidates if c['retest_status'] in active_statuses]
+    pool = active_candidates if active_candidates else candidates
+    best = min(pool, key=lambda c: c['distance_atr'])
+
+    result['flip_detected']         = True
+    result['flipped_level']         = best['level']
+    result['original_role']         = best['original_role']
+    result['new_role']              = best['new_role']
+    result['broken_at_index']       = best['broken_at_index']
+    result['retest_status']         = best['retest_status']
+    result['distance_to_level_atr'] = round(best['distance_atr'], 2)
+
+    status_explainer = {
+        'AWAITING_RETEST':     f"Price has not yet returned to retest this level since the break.",
+        'RETESTING_NOW':       f"Price is CURRENTLY retesting this level right now.",
+        'RETESTED_AND_HELD':   f"Price already retested this level and it HELD in its new role — confirms the flip.",
+        'RETESTED_AND_FAILED': f"Price retested this level but closed back through it — the flip did NOT hold; treat the original role as still in play.",
+    }
+
+    result['description'] = (
+        f"POLARITY FLIP: Former {best['original_role']} at {best['level']} was decisively broken "
+        f"and has flipped to {best['new_role']}. {status_explainer[best['retest_status']]} "
+        f"Currently {best['distance_atr']:.2f} ATR from this level."
+    )
+
+    return result
 
 def detect_inducement(candles: list, atr: float, major_swing_highs: list,
                        major_swing_lows: list, minor_lookback: int = 2) -> dict:
@@ -5521,6 +6125,14 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         fvgs=detect_fvg(candles,atr)
         obs=detect_order_blocks(candles,bos,atr)
         liq=detect_liquidity(candles,sh,sl,atr)
+        polarity_flip = detect_polarity_flip(
+            candles        = candles,
+            swing_highs    = sh,
+            swing_lows     = sl,
+            atr            = atr,
+            current_price  = candles[-1]['close'] if candles else 0,
+            lookback_candles = 60,
+        )
         # v10: Named sweep+displacement pattern detection
         if tf == etf:
             sweep_pattern = detect_sweep_displacement(
@@ -5600,7 +6212,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
             'fvg_mitigated':[f for f in fvgs if f['status']=='MITIGATED'][-3:],
             'ob_fresh':[o for o in obs if o['status']=='FRESH'][-5:],
             'ob_mitigated':[o for o in obs if o['status']=='MITIGATED'][-3:],
-            'liquidity':liq,'sweep_displacement': sweep_pattern,'inducement':inducement_pattern,'premium_discount':pd,'indicators':indicators,
+            'liquidity':liq,'polarity_flip':polarity_flip,'sweep_displacement': sweep_pattern,'inducement':inducement_pattern,'premium_discount':pd,'indicators':indicators,
             'regime':regime,'volume_profile':vol_profile,'backtest':backtest,
             'wyckoff':wyckoff,
             'elliott':elliott,
@@ -5650,31 +6262,51 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
     etf_regime       = result.get(etf, {}).get('regime', {}).get('regime', 'UNKNOWN')
     rsi_htf          = result.get(htf, {}).get('indicators', {}).get('rsi', {}).get('value')
     
-    # ── THESIS PERSISTENCE LAYER ───────────────────────────────────────────────
-    # Prevents "analysis jitter" — checks for an existing active thesis before
-    # treating this as a fresh independent decision.
+    # ── v16: STATEFUL THESIS TRACKING ────────────────────────────────────────
+    # Before finalizing this run's direction/zone/verdict, check whether an
+    # active thesis already exists for this asset+mode. If so, this run's
+    # job is to CHECK that thesis (confirm, refine, or invalidate it) — NOT
+    # to silently compute a brand-new, possibly contradictory one from scratch.
     mode_label = 'SCALPING MODE' if etf in ('5M', '15M') and htf in ('4H', '1H') else 'SWING MODE'
-    active_thesis = get_active_thesis(asset, mode_label)
-    thesis_status = 'NONE'
-    thesis_invalidation_reason = None
+    existing_thesis = get_active_thesis(asset, mode_label)
+    thesis_status_note = None
+    current_etf_price = result.get(etf, {}).get('current_price', 0)
+    etf_atr = result.get(etf, {}).get('atr', 0)
 
-    if active_thesis:
-        current_price_check = result.get(etf, {}).get('current_price', 0)
-        is_invalid, inval_reason = check_thesis_invalidation(
-            active_thesis, current_price_check,
+    if existing_thesis:
+        is_invalidated, inval_reason = check_thesis_invalidation(
+            existing_thesis, current_etf_price,
             result.get(etf, {}), result.get(htf, {})
         )
-        if is_invalid:
-            invalidate_thesis(active_thesis['id'], inval_reason)
-            thesis_status = 'INVALIDATED_THIS_RUN'
-            thesis_invalidation_reason = inval_reason
-            active_thesis = None  # cleared — a new thesis may now form
+        if is_invalidated:
+            invalidate_thesis(existing_thesis['id'], inval_reason)
+            thesis_status_note = f'PRIOR THESIS INVALIDATED: {inval_reason}. Forming a fresh, independent thesis below.'
+            existing_thesis = None  # fall through to fresh thesis formation below
         else:
-            confirm_thesis(active_thesis['id'], confluence_score)
-            thesis_status = 'ACTIVE_CONFIRMED'
-    else:
-        thesis_status = 'NONE'
-    # ── END THESIS PERSISTENCE LAYER ───────────────────────────────────────────
+            # Thesis survives — track proximity and attempt zone refinement
+            proximity_result = track_zone_proximity(existing_thesis, current_etf_price, etf_atr)
+            existing_thesis = refine_thesis_zone(
+                existing_thesis, result.get(etf, {}), result.get(htf, {}), etf_atr
+            )
+            confirm_thesis(existing_thesis['id'])
+
+            proximity_note = ''
+            if proximity_result['event'] == 'NEAR_MISS':
+                proximity_note = (f" Price approached within {proximity_result['distance_atr']} ATR "
+                                  f"of the zone and moved away again without tagging it "
+                                  f"(near-miss #{existing_thesis.get('near_miss_count', 0) + 1}).")
+            elif proximity_result['event'] == 'TAGGED':
+                proximity_note = ' Price is now INSIDE the zone.'
+
+            refinement_note = existing_thesis.get('_refinement_note', '')
+
+            thesis_status_note = (
+                f'ACTIVE THESIS CONFIRMED (#{existing_thesis["id"]}, confirmed '
+                f'{existing_thesis.get("times_confirmed", 1)} times since '
+                f'{existing_thesis.get("created_at", "unknown")}). '
+                f'Direction: {existing_thesis["direction"]}. No structural invalidation detected.'
+                f'{proximity_note} {refinement_note}'
+            )
 
     win_probability  = calc_win_probability(
         confluence_score, asset, etf_regime, session.get('session','UNKNOWN'),
@@ -5774,15 +6406,60 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         direction       = etf_trend_for_ev,
     )
 
+    # v16: If an existing thesis survived this check, ITS zone/direction/SL
+    # take priority over whatever this run's fresh calculation would have produced.
+    if existing_thesis:
+        direction          = existing_thesis['direction']
+        approx_entry_low   = existing_thesis['entry_low']
+        approx_entry_high  = existing_thesis['entry_high']
+        sl_val             = existing_thesis['sl']
+        tp1_val            = existing_thesis['tp1']
+        tp2_val            = existing_thesis['tp2']
+        tp3_val            = existing_thesis['tp3']
+        invalidation_price = existing_thesis.get('invalidation_price', sl_val)
+    else:
+        direction          = etf_trend_for_ev
+        sl_val             = etf_price_for_ev - etf_atr_for_ev * 1.5 if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * 1.5
+        tp1_val            = etf_price_for_ev - etf_atr_for_ev * tp1_rr if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp1_rr
+        tp2_val            = etf_price_for_ev - etf_atr_for_ev * tp2_rr if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp2_rr
+        tp3_val            = etf_price_for_ev - etf_atr_for_ev * tp3_rr if direction == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp3_rr
+        invalidation_price = sl_val
+
+        new_thesis_id = create_thesis(
+            asset=asset, mode=mode_label, direction=direction,
+            confluence_score=confluence_score if 'confluence_score' in dir() else None,
+            htf_trend=result.get(htf, {}).get('trend', 'NEUTRAL'),
+            etf_trend=result.get(etf, {}).get('trend', 'NEUTRAL'),
+            entry_low=approx_entry_low, entry_high=approx_entry_high, sl=sl_val,
+            tp1=tp1_val, tp2=tp2_val, tp3=tp3_val,
+            invalidation_price=invalidation_price, invalidation_reason='Initial stop-loss level',
+            structural_anchor=f'{htf} structure', zone_source='OB',
+        )
+        thesis_status_note = f'NEW THESIS FORMED (#{new_thesis_id}). No prior active thesis existed for this asset/mode.'
+
+    # v18: Multi-trigger LTF confirmation — checks FVG retest quality, OB
+    # retest, structural CHoCH, sweep+displacement, and polarity-flip retest
+    # IN PARALLEL, returning whichever valid confirmation actually fired.
+    # This must run AFTER the ETF's fvg_fresh/ob_fresh/bos_choch/
+    # sweep_displacement/polarity_flip fields are already populated.
+    thesis_dir_for_confirmation = existing_thesis['direction'] if existing_thesis else direction
+    ltf_confirmation = evaluate_ltf_confirmation(
+        etf_data           = result.get(etf, {}),
+        candles            = candles_by_tf.get(etf, []),
+        atr                = result.get(etf, {}).get('atr', 0),
+        thesis_direction   = thesis_dir_for_confirmation,
+        target_zone        = {'low': approx_entry_low, 'high': approx_entry_high} if 'approx_entry_low' in locals() or 'approx_entry_low' in globals() else {},
+    )
+
     # Full risk plan with user's actual account size
     risk_plan = calc_full_risk_plan(
         asset=asset,
         entry_low=approx_entry_low,
         entry_high=approx_entry_high,
-        sl=etf_price_for_ev - etf_atr_for_ev * 1.5 if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * 1.5,
-        tp1=etf_price_for_ev - etf_atr_for_ev * tp1_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp1_rr,
-        tp2=etf_price_for_ev - etf_atr_for_ev * tp2_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp2_rr,
-        tp3=etf_price_for_ev - etf_atr_for_ev * tp3_rr if etf_trend_for_ev == 'BEARISH' else etf_price_for_ev + etf_atr_for_ev * tp3_rr,
+        sl=sl_val,
+        tp1=tp1_val,
+        tp2=tp2_val,
+        tp3=tp3_val,
         atr=etf_atr_for_ev,
         account_size=account_size,
         risk_pct=risk_pct,
@@ -5797,13 +6474,6 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         ml_score  = ml_score,
         backtest  = htf_backtest,
     )
-
-    result_summary_thesis = {
-        'thesis_status': thesis_status,                          # NONE | ACTIVE_CONFIRMED | INVALIDATED_THIS_RUN
-        'active_thesis': active_thesis,                           # full thesis dict or None
-        'thesis_invalidation_reason': thesis_invalidation_reason, # reason if invalidated this run
-        'mode_label': mode_label,
-    }
 
     result['_summary'] = {
         'htf':             htf,
@@ -5841,18 +6511,20 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         'event_positioning': event_positioning,
         'win_probability': win_probability,
         'trade_expectancy':trade_expectancy,
-        'thesis_status':   thesis_status,
-        'active_thesis':   active_thesis,
-        'thesis_invalidation_reason': thesis_invalidation_reason,
+        'thesis_status_note': thesis_status_note,
+        'active_thesis_id':   existing_thesis['id'] if existing_thesis else (new_thesis_id if 'new_thesis_id' in dir() else None),
         'mode_label':      mode_label,
         'wyckoff_htf':     htf_wyckoff,
         'wyckoff_etf':     etf_wyckoff,
         'wyckoff_aligned': wyckoff_aligned,
         'sweep_displacement_pattern': result.get(etf, {}).get('sweep_displacement', {'pattern_detected': False}),
         'inducement_pattern': result.get(etf, {}).get('inducement', {'inducement_detected': False}),
+        'htf_polarity_flip': result.get(htf, {}).get('polarity_flip', {'flip_detected': False}),
+        'etf_polarity_flip': result.get(etf, {}).get('polarity_flip', {'flip_detected': False}),
         'pullback_pattern':   pullback_pattern,
         'pullback_stage':     pullback_stage,
         'trigger_proximity':  trigger_proximity,
+        'ltf_confirmation':   ltf_confirmation,
         'risk_plan':       risk_plan,
         'libs_available':  {
             'numpy': HAS_NUMPY, 'talib': HAS_TALIB,

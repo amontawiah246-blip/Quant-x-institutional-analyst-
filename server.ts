@@ -559,6 +559,10 @@ function formatEngineResults(engineData:any): string {
     if(fi.macro_context?.primary_drivers) block += `  PRIMARY DRIVERS: ${fi.macro_context.primary_drivers.join(', ')}\n`;
   }
 
+  if (s.thesis_status_note) {
+    block += `\n🔒 THESIS STATUS: ${s.thesis_status_note}\n`;
+  }
+
   // Technical Evidence Package
   if(s.technical_evidence){
     const te = s.technical_evidence;
@@ -706,6 +710,30 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     block += `  ${ind.description}\n`;
   }
   
+  const renderPolarityFlip = (pf: any, label: string) => {
+    if (!pf?.flip_detected) return '';
+    return `\n${label}_POLARITY_FLIP:\n` +
+      `  Former ${pf.original_role} at ${pf.flipped_level} → now ${pf.new_role}\n` +
+      `  Retest Status: ${pf.retest_status} | Distance: ${pf.distance_to_level_atr} ATR\n` +
+      `  ${pf.description}\n`;
+  };
+  block += renderPolarityFlip(s.htf_polarity_flip, 'HTF');
+  block += renderPolarityFlip(s.etf_polarity_flip, 'ETF');
+
+  if (s.ltf_confirmation) {
+    const lc = s.ltf_confirmation;
+    block += `\nLTF_CONFIRMATION_ENGINE:\n`;
+    if (lc.confirmed) {
+      block += `  ✅ CONFIRMED via ${lc.confirmation_type} (quality ${lc.quality_score}/100)\n`;
+      block += `  ${lc.description}\n`;
+      if (lc.all_triggered_types && lc.all_triggered_types !== lc.confirmation_type) {
+        block += `  Other confirming signals also present: ${lc.all_triggered_types}\n`;
+      }
+    } else {
+      block += `  ⏳ NOT YET CONFIRMED: ${lc.description}\n`;
+    }
+  }
+
   if (s.trigger_proximity) {
     const prox = s.trigger_proximity;
     block += `\nTRIGGER PROXIMITY INTELLIGENCE:\n`;
@@ -916,6 +944,29 @@ TECHNICAL REVIEW:
     - If a timeframe shows is_stale = true, its trend has already decayed to
       NEUTRAL — treat it as NEUTRAL, not as the opposite extreme of whatever
       it used to be. A decayed-to-NEUTRAL HTF does NOT create a conflict with
+      a trending ETF.
+
+THESIS CONTINUITY (v16):
+Check the 🔒 THESIS STATUS line before writing your Market Narrative.
+- "NEW THESIS FORMED": This is a fresh, independent read — proceed normally.
+- "ACTIVE THESIS CONFIRMED": A prior thesis from an earlier check survived
+  structural invalidation. Your job THIS run is to report PROGRESS toward
+  that same thesis, not to silently form a contradictory new one. If the
+  note mentions a near-miss, state it explicitly ("price has now approached
+  the zone twice without tagging it"). If it mentions zone refinement,
+  explain to the trader that the broad thesis is unchanged but the precise
+  trigger zone has sharpened to a fresher, more local FVG/iFVG — and state
+  BOTH the original zone and the refined zone so the trader understands why
+  the number changed without the underlying idea changing.
+- "PRIOR THESIS INVALIDATED": State plainly why the previous idea is dead
+  (the specific structural reason given) before presenting the fresh thesis
+  that follows. This is the ONLY case where a direction flip from a prior
+  signal is appropriate — and it must always be explained, never silent.
+- NEVER produce a verdict whose direction contradicts an still-ACTIVE
+  thesis. If your fresh technical read seems to disagree with an active
+  thesis that hasn't been structurally invalidated, trust the thesis
+  continuity system over a momentary fresh read — this is precisely the
+  discipline that prevents flip-flopping on small, noisy price wobbles.
       a clearly-trending LTF; it simply means the HTF currently has no fresh
       directional conviction.
     - A genuine, actionable HTF/LTF conflict requires BOTH timeframes to have
@@ -962,6 +1013,56 @@ TECHNICAL REVIEW:
     that often happens first, feeding the larger move. When both are present
     together, this is the strongest possible structural confirmation
     available — state this explicitly.
+
+SUPPORT/RESISTANCE POLARITY FLIP (v17):
+Check the HTF_POLARITY_FLIP and ETF_POLARITY_FLIP blocks. If present:
+- A broken support level becomes resistance; a broken resistance level
+  becomes support. This is DIFFERENT from a liquidity sweep — a sweep is a
+  wick-and-reject (a trap), while a polarity flip requires price to have
+  CLOSED decisively through the level, confirming a genuine structural
+  change, not a fakeout.
+- retest_status = AWAITING_RETEST or RETESTING_NOW: this is a live, watchable
+  level. If price is heading back toward it, mention this explicitly as a
+  potential entry zone IN THE DIRECTION OF THE BREAK (e.g. former support
+  now resistance → watch for a bearish reaction on retest, not a bullish one).
+- retest_status = RETESTED_AND_HELD: this CONFIRMS the flip — treat the new
+  role as structurally validated, increasing confidence in continuation past
+  this level.
+- retest_status = RETESTED_AND_FAILED: the flip did NOT hold. Do not treat
+  the new role as valid — revert to treating this level in its ORIGINAL
+  role, and note this explicitly as a sign the original structure may still
+  be intact despite the apparent break.
+- A polarity flip with an active retest in progress, especially when it
+  aligns with the thesis direction (v16) or sits inside a pullback zone
+  (v4), is a strong confluence factor — cite it as supporting evidence
+  when present, the same way you would a fresh OB or FVG.
+
+LTF CONFIRMATION — MULTIPLE VALID TRIGGER TYPES (v18):
+Check the LTF_CONFIRMATION_ENGINE block before writing your entry trigger.
+- This engine checks FIVE independent confirmation paths every time: FVG
+  retest quality, order block retest, structural CHoCH (no FVG/OB needed),
+  sweep+displacement, and polarity-flip retest. It reports whichever one
+  actually fired, with a quality score — NOT a single rigid "must be an FVG"
+  requirement.
+- NEVER write entry trigger language that implies an FVG retest is the ONLY
+  valid confirmation. If confirmation_type is STRUCTURAL_CHOCH,
+  SWEEP_DISPLACEMENT, ORDER_BLOCK_RETEST, or POLARITY_FLIP_RETEST, treat it
+  as fully legitimate — these are not lesser substitutes for an FVG retest,
+  they are equally valid trigger types in their own right.
+- If confirmed = false, do NOT say "waiting for FVG retest" if no FVG is
+  even present near the zone — say "waiting for ANY of: FVG retest, OB
+  retest, structural CHoCH, sweep+displacement, or polarity-flip retest" so
+  the trader understands multiple paths to confirmation exist, not one.
+- When checking FVG-specific confirmation, reference the fill_quality
+  explicitly. If a nearby FVG's fill_quality is PASSED_THROUGH, explicitly
+  tell the trader this gap is CONSUMED and will not offer a retest entry —
+  redirect their attention to whatever other confirmation type might still
+  be developing, rather than asking them to keep waiting on a gap that
+  already proved it won't be retested.
+- A SINGLE_CANDLE_KISS fill_quality is real but lower-confidence than
+  CLEAN_RETEST — if this is the only confirmation present, consider
+  recommending EXECUTE WITH CAUTION rather than full EXECUTE, citing the
+  brief/incomplete nature of the test.
 
 FUNDAMENTAL REVIEW:
 - Are any economic events imminent? Use the event's time_bucket, NOT your own
@@ -1916,6 +2017,8 @@ Respond ONLY with this JSON (no markdown):
 
       // 7. Auto-save signal — uses structured JSON block from Gemini (reliable)
       // Falls back to regex if JSON block is missing
+      let summaryCard = '';
+      let numberMismatchDetected = false;
       try {
         const summary    = engineData?._summary || {};
         const etfData    = engineData?.[summary.etf] || {};
@@ -1932,6 +2035,35 @@ Respond ONLY with this JSON (no markdown):
               signalData = parsed;
             }
           } catch { /* fall through to regex */ }
+        }
+
+        // v15: VERIFY the AI's self-reported numbers against the engine's
+        // actual computed values. The AI is asked to copy these into its
+        // JSON block, but nothing previously checked that it copied them
+        // correctly. This overwrites any AI-reported score/win_probability/
+        // expected_value with the engine's real numbers, and flags it if
+        // there was a meaningful mismatch (useful for catching AI drift).
+        if (signalData) {
+          const engineConfluence = summary.ml_score?.score ?? null;
+          const engineWinPct     = summary.win_probability?.win_pct ?? null;
+          const engineEV         = summary.trade_expectancy?.expected_value_r ?? null;
+
+          const mismatchCheck = (aiVal: number | null | undefined, engineVal: number | null, label: string) => {
+            if (aiVal != null && engineVal != null && Math.abs(aiVal - engineVal) > Math.max(1, Math.abs(engineVal) * 0.05)) {
+              console.warn(`v15 MISMATCH: AI reported ${label}=${aiVal}, engine computed ${label}=${engineVal}. Using engine value.`);
+              numberMismatchDetected = true;
+            }
+          };
+          mismatchCheck(signalData.score,            engineConfluence, 'confluence');
+          mismatchCheck(signalData.win_probability,  engineWinPct,     'win_probability');
+          mismatchCheck(signalData.expected_value,   engineEV,         'expected_value');
+
+          // Always overwrite with the engine's real numbers — the AI's copy
+          // is never used for anything downstream after this point, only
+          // the verified engine values are.
+          if (engineConfluence != null) signalData.score            = engineConfluence;
+          if (engineWinPct     != null) signalData.win_probability  = engineWinPct;
+          if (engineEV         != null) signalData.expected_value   = engineEV;
         }
 
         // Fallback: regex parsing (handles cases where AI skips the JSON block)
@@ -2000,6 +2132,71 @@ Respond ONLY with this JSON (no markdown):
           };
         }
 
+        // v15: Build a compact confidence summary card using ONLY real,
+        // engine-computed numbers (summary.win_probability, summary.ml_score,
+        // summary.trade_expectancy) — never the AI's self-reported JSON copy.
+        const realConfluence   = summary.ml_score?.score ?? null;
+        const realWinPct       = summary.win_probability?.win_pct ?? null;
+        const realEV           = summary.trade_expectancy?.expected_value_r ?? null;
+        const realVerdict      = signalData?.verdict || 'UNKNOWN';
+        const realDirection    = signalData?.direction || 'NEUTRAL';
+
+        const verdictEmoji: Record<string, string> = {
+          'EXECUTE':              '🟢',
+          'EXECUTE_WITH_CAUTION': '🟡',
+          'WAIT':                 '🔵',
+          'AVOID':                '🔴',
+        };
+        const verdictLabel2 = realVerdict.replace(/_/g, ' ');
+        const emoji = verdictEmoji[realVerdict] || '⚪';
+
+        let confidenceBucket = 'UNKNOWN';
+        if (realWinPct !== null) {
+          if (realWinPct >= 65) confidenceBucket = 'STRONG';
+          else if (realWinPct >= 50) confidenceBucket = 'MODERATE';
+          else if (realWinPct >= 35) confidenceBucket = 'WEAK';
+          else confidenceBucket = 'VERY WEAK';
+        }
+
+        const sampleSize = summary.backtest?.wilson_interval?.total ?? null;
+        const reliability = summary.backtest?.wilson_interval?.sample_reliability ?? null;
+
+        let glowingHeader = '';
+        if (realVerdict.startsWith('EXECUTE') || realVerdict === 'WAIT' || realVerdict === 'AVOID') { // To ensure we always output something if it's actionable
+          if (realDirection === 'BULLISH') {
+            glowingHeader = `<div class="relative mb-6 p-[2px] rounded-2xl bg-gradient-to-r from-emerald-400 via-emerald-500 to-teal-500 animate-pulse shadow-[0_0_30px_rgba(16,185,129,0.5)]">
+  <div class="flex items-center justify-center gap-3 bg-slate-900 rounded-2xl py-4 px-6">
+    <span class="text-emerald-400 animate-bounce text-2xl">⬆️</span>
+    <span class="text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 to-teal-300 text-3xl font-black uppercase tracking-[0.2em] drop-shadow-[0_0_10px_rgba(52,211,153,0.8)]">BUY SIGNAL</span>
+  </div>
+</div>\n\n`;
+          } else if (realDirection === 'BEARISH') {
+            glowingHeader = `<div class="relative mb-6 p-[2px] rounded-2xl bg-gradient-to-r from-rose-400 via-red-500 to-orange-500 animate-pulse shadow-[0_0_30px_rgba(244,63,94,0.5)]">
+  <div class="flex items-center justify-center gap-3 bg-slate-900 rounded-2xl py-4 px-6">
+    <span class="text-rose-400 animate-bounce text-2xl">⬇️</span>
+    <span class="text-transparent bg-clip-text bg-gradient-to-r from-rose-300 to-orange-300 text-3xl font-black uppercase tracking-[0.2em] drop-shadow-[0_0_10px_rgba(251,113,133,0.8)]">SELL SIGNAL</span>
+  </div>
+</div>\n\n`;
+          }
+        }
+
+        summaryCard = glowingHeader + `## ${emoji} ${verdictLabel2}`;
+        if (realDirection !== 'NEUTRAL') summaryCard += ` — ${realDirection}`;
+        summaryCard += `\n\n`;
+        summaryCard += `| Metric | Value |\n|---|---|\n`;
+        summaryCard += `| Confidence | ${realWinPct !== null ? realWinPct + '%' : 'N/A'} (${confidenceBucket}) |\n`;
+        summaryCard += `| Confluence Score | ${realConfluence !== null ? realConfluence + '/100' : 'N/A'} |\n`;
+        summaryCard += `| Expected Value | ${realEV !== null ? realEV + 'R' : 'N/A'} |\n`;
+        if (sampleSize !== null) {
+          summaryCard += `| Statistical Reliability | ${reliability} (n=${sampleSize}) |\n`;
+        }
+        if (signalData?.entry_low) {
+          summaryCard += `| Entry Zone | ${signalData.entry_low} - ${signalData.entry_high} |\n`;
+          summaryCard += `| Stop Loss | ${signalData.sl} |\n`;
+          summaryCard += `| Target 1 | ${signalData.tp1} |\n`;
+        }
+        summaryCard += `\n---\n\n`;
+
         if(signalData) {
           let recalc = null;
           if (signalData.entry_low && signalData.sl && signalData.tp1 &&
@@ -2053,6 +2250,9 @@ Respond ONLY with this JSON (no markdown):
             regime:     etfData.regime?.regime || '',
             session:    summary.session?.session || '',
           }});
+          if (numberMismatchDetected) {
+            responseText += `\n\n> ⚠️ **Data integrity check:** The AI's self-reported confidence numbers didn't match the engine's calculated values — the engine's real numbers were used instead. This has been logged for review.`;
+          }
           if(sr?.signal_id) {
             responseText = responseText.replace(/SIGNAL_JSON_START[\s\S]*?SIGNAL_JSON_END/g, '').trim();
             const verdictLabel = signalData.verdict.replace(/_/g, ' ');
@@ -2102,7 +2302,9 @@ Respond ONLY with this JSON (no markdown):
       
       if (openRouterReasoning) {
         const quotedReasoning = openRouterReasoning.replace(/\n/g, '\n> ');
-        responseText = `### 🧠 Quant Reasoning Step (Preliminary AI)\n> *Context generated before execution analysis:*\n>\n> ${quotedReasoning}\n\n---\n\n` + responseText;
+        responseText = summaryCard + `### 🧠 Quant Reasoning Step (Preliminary AI)\n> *Context generated before execution analysis:*\n>\n> ${quotedReasoning}\n\n---\n\n` + responseText;
+      } else if (summaryCard) {
+        responseText = summaryCard + responseText;
       }
       
       responseText += `\n\n---\n*${aiFooter}*`;
