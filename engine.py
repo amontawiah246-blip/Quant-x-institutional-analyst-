@@ -613,6 +613,22 @@ def init_db():
                     c.execute(f'ALTER TABLE active_thesis ADD COLUMN {col} {coltype}')
                 except Exception:
                     pass
+
+        # v16.1: lock confidence/EV at thesis CREATION time, separate from
+        # whatever this run's fresh recalculation produces
+        existing_thesis_cols_v161 = [row[1] for row in c.execute("PRAGMA table_info(active_thesis)").fetchall()]
+        new_thesis_cols_v161 = {
+            'locked_win_probability': 'REAL DEFAULT NULL',
+            'locked_expected_value':  'REAL DEFAULT NULL',
+            'locked_confluence':      'REAL DEFAULT NULL',
+            'locked_at':              'TEXT DEFAULT NULL',
+        }
+        for col, coltype in new_thesis_cols_v161.items():
+            if col not in existing_thesis_cols_v161:
+                try:
+                    c.execute(f'ALTER TABLE active_thesis ADD COLUMN {col} {coltype}')
+                except Exception:
+                    pass
         conn.commit()
         conn.close()
     except Exception as e:
@@ -803,7 +819,7 @@ def get_active_thesis(asset, mode):
 def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend,
                    entry_low, entry_high, sl, tp1, tp2, tp3,
                    invalidation_price, invalidation_reason, structural_anchor,
-                   zone_source='OB'):
+                   zone_source='OB', win_probability=None, expected_value=None):
     """Creates a new active thesis. Invalidates any prior active thesis for this asset+mode first.
 
     v16: also seeds original_entry_low/high (a permanent record of the FIRST
@@ -823,14 +839,16 @@ def create_thesis(asset, mode, direction, confluence_score, htf_trend, etf_trend
              entry_low, entry_high, sl, tp1, tp2, tp3,
              invalidation_price, invalidation_reason, structural_anchor, times_confirmed,
              original_entry_low, original_entry_high, zone_source, zone_refined_count,
-             last_checked_at, last_checked_price)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,0,?,?)''',
+             last_checked_at, last_checked_price,
+             locked_win_probability, locked_expected_value, locked_confluence, locked_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,0,?,?,?,?,?,?)''',
             (asset, mode, direction, 'ACTIVE', now, now,
              confluence_score, htf_trend, etf_trend,
              entry_low, entry_high, sl, tp1, tp2, tp3,
              invalidation_price, invalidation_reason, structural_anchor,
              entry_low, entry_high, zone_source,
-             now, None))
+             now, None,
+             win_probability, expected_value, confluence_score, now))
         thesis_id = c.lastrowid
         conn.commit()
         conn.close()
@@ -6267,11 +6285,25 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
     # active thesis already exists for this asset+mode. If so, this run's
     # job is to CHECK that thesis (confirm, refine, or invalidate it) — NOT
     # to silently compute a brand-new, possibly contradictory one from scratch.
+    # v16.1: Calculate this run's FRESH numbers first — these represent
+    # "what does a contextless read say right now" and are ALWAYS computed,
+    # but they are no longer the only number reported once a thesis exists.
+    fresh_win_probability = calc_win_probability(
+        confluence_score, asset, etf_regime, session.get('session','UNKNOWN'),
+        rsi_htf, real_outcomes,
+        pullback_stage=pullback_stage,
+        pullback_type=pullback_type,
+    )
+    fresh_confluence = confluence_score
+
     mode_label = 'SCALPING MODE' if etf in ('5M', '15M') and htf in ('4H', '1H') else 'SWING MODE'
     existing_thesis = get_active_thesis(asset, mode_label)
     thesis_status_note = None
     current_etf_price = result.get(etf, {}).get('current_price', 0)
     etf_atr = result.get(etf, {}).get('atr', 0)
+    reported_win_probability = fresh_win_probability
+    reported_confluence = fresh_confluence
+    confidence_drift_note = None
 
     if existing_thesis:
         is_invalidated, inval_reason = check_thesis_invalidation(
@@ -6289,6 +6321,26 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
                 existing_thesis, result.get(etf, {}), result.get(htf, {}), etf_atr
             )
             confirm_thesis(existing_thesis['id'])
+
+            # v16.1: THIS is the actual fix — use the LOCKED numbers from
+            # when the thesis was formed, not this run's fresh recalculation.
+            locked_wp = existing_thesis.get('locked_win_probability')
+            locked_ev_placeholder = existing_thesis.get('locked_expected_value')
+            locked_conf = existing_thesis.get('locked_confluence')
+
+            if locked_wp is not None:
+                reported_win_probability = {'win_pct': locked_wp, 'mode': 'LOCKED_AT_THESIS_FORMATION'}
+                reported_confluence = locked_conf
+                # Surface drift as information, never as a silent verdict-flipper
+                fresh_wp_val = fresh_win_probability.get('win_pct') if isinstance(fresh_win_probability, dict) else None
+                if fresh_wp_val is not None and abs(fresh_wp_val - locked_wp) > 10:
+                    confidence_drift_note = (
+                        f'Note: a fresh contextless recalculation this instant would show '
+                        f'{fresh_wp_val}% win probability (vs the {locked_wp}% locked when this '
+                        f'thesis formed) — a {abs(fresh_wp_val - locked_wp):.0f}-point drift. '
+                        f'Reporting the LOCKED number for consistency; large drift may indicate '
+                        f'changing conditions worth a manual review.'
+                    )
 
             proximity_note = ''
             if proximity_result['event'] == 'NEAR_MISS':
@@ -6308,12 +6360,8 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
                 f'{proximity_note} {refinement_note}'
             )
 
-    win_probability  = calc_win_probability(
-        confluence_score, asset, etf_regime, session.get('session','UNKNOWN'),
-        rsi_htf, real_outcomes,
-        pullback_stage=pullback_stage,
-        pullback_type=pullback_type,
-    )
+    win_probability = reported_win_probability
+    confluence_score = reported_confluence if reported_confluence is not None else confluence_score
 
     # Trade Expectancy Engine — calculate actual R:R from engine data
     # Uses nearest SSL/BSL as TP targets and ATR-based SL estimate
@@ -6368,6 +6416,20 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         f"EV calculated using TP1={round(tp1_rr,2)}R, TP2={round(tp2_rr,2)}R, TP3={round(tp3_rr,2)}R "
         f"({'from nearest liquidity pool — tight targets reduce EV even at high win probability' if trade_expectancy['rr_source']=='LIQUIDITY' else 'using default RR — no liquidity target found nearby'})"
     )
+
+    # v16.1: backfill the locked EV now that it's available — only for a
+    # THIS-RUN new thesis (existing confirmed theses already have their
+    # locked EV from when THEY were created, and must not be overwritten)
+    if 'new_thesis_id' in locals() and new_thesis_id:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('UPDATE active_thesis SET locked_expected_value=? WHERE id=?',
+                      (trade_expectancy.get('expected_value_r'), new_thesis_id))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
     # Cross-timeframe Wyckoff alignment
     avail_set = set(avail)
@@ -6427,13 +6489,15 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
 
         new_thesis_id = create_thesis(
             asset=asset, mode=mode_label, direction=direction,
-            confluence_score=confluence_score if 'confluence_score' in dir() else None,
+            confluence_score=fresh_confluence,
             htf_trend=result.get(htf, {}).get('trend', 'NEUTRAL'),
             etf_trend=result.get(etf, {}).get('trend', 'NEUTRAL'),
             entry_low=approx_entry_low, entry_high=approx_entry_high, sl=sl_val,
             tp1=tp1_val, tp2=tp2_val, tp3=tp3_val,
             invalidation_price=invalidation_price, invalidation_reason='Initial stop-loss level',
             structural_anchor=f'{htf} structure', zone_source='OB',
+            win_probability=fresh_win_probability.get('win_pct') if isinstance(fresh_win_probability, dict) else None,
+            expected_value=None,  # filled in below once trade_expectancy is computed, via CHANGE 5
         )
         thesis_status_note = f'NEW THESIS FORMED (#{new_thesis_id}). No prior active thesis existed for this asset/mode.'
 
@@ -6512,7 +6576,9 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         'win_probability': win_probability,
         'trade_expectancy':trade_expectancy,
         'thesis_status_note': thesis_status_note,
-        'active_thesis_id':   existing_thesis['id'] if existing_thesis else (new_thesis_id if 'new_thesis_id' in dir() else None),
+        'confidence_drift_note': confidence_drift_note,
+        'fresh_win_probability_unlocked': fresh_win_probability.get('win_pct') if isinstance(fresh_win_probability, dict) else None,
+        'active_thesis_id':   existing_thesis['id'] if existing_thesis else (new_thesis_id if 'new_thesis_id' in locals() else None),
         'mode_label':      mode_label,
         'wyckoff_htf':     htf_wyckoff,
         'wyckoff_etf':     etf_wyckoff,

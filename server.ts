@@ -563,6 +563,10 @@ function formatEngineResults(engineData:any): string {
     block += `\n🔒 THESIS STATUS: ${s.thesis_status_note}\n`;
   }
 
+  if (s.confidence_drift_note) {
+    block += `\n⚠️ CONFIDENCE DRIFT: ${s.confidence_drift_note}\n`;
+  }
+
   // Technical Evidence Package
   if(s.technical_evidence){
     const te = s.technical_evidence;
@@ -967,6 +971,28 @@ Check the 🔒 THESIS STATUS line before writing your Market Narrative.
   thesis that hasn't been structurally invalidated, trust the thesis
   continuity system over a momentary fresh read — this is precisely the
   discipline that prevents flip-flopping on small, noisy price wobbles.
+
+LOCKED VS FRESH CONFIDENCE (v16.1):
+When an active thesis is CONFIRMED (not new), the win probability and
+confluence score you are given are the LOCKED values from when the thesis
+was originally formed — NOT a fresh recalculation. This is deliberate: it
+prevents reporting wildly different confidence/EV numbers every few minutes
+for the same underlying locked thesis, which is not how a real trader's
+conviction works.
+- If a CONFIDENCE DRIFT note is present, mention it briefly as context
+  ("worth noting, a fresh read right now would show meaningfully different
+  confidence — X points different — though we continue tracking the
+  original locked thesis") but do NOT let it override your verdict on its
+  own. Large drift is informational, not an automatic invalidation trigger
+  — only the deterministic rules in check_thesis_invalidation() (stop
+  breach, ETF CHoCH against the thesis, HTF trend flip) can do that.
+- The Calendar/Hard-Block check (CPI, NFP, FOMC etc.) is the ONE thing that
+  SHOULD be evaluated fresh every time, regardless of thesis lock state —
+  real, scheduled, time-sensitive events are genuine new information, not
+  measurement noise. A hard block can correctly flip EXECUTE WITH CAUTION
+  to AVOID even on a fully-locked, unchanged thesis. When this happens,
+  state clearly: "the underlying thesis is unchanged; this is a TIMING
+  pause due to [event], not a reversal of the trade idea."
       a clearly-trending LTF; it simply means the HTF currently has no fresh
       directional conviction.
     - A genuine, actionable HTF/LTF conflict requires BOTH timeframes to have
