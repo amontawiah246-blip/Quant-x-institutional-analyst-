@@ -1,33 +1,33 @@
-export type MarketCategory = 'Futures' | 'Crypto' | 'Metals' | 'Forex';
+export type Asset = 'BTC/USD' | 'ETH/USD' | 'SOL/USD' | 'EUR/USD' | 'GBP/USD' | 'XAU/USD' | 'SPY' | 'QQQ';
 
-export const MARKETS: Record<MarketCategory, string[]> = {
-  Futures: ['US30', 'NAS100', 'STOXX50', 'BOOM1000', 'CRASH1000', 'VOL75'],
-  Crypto:  ['BTCUSD', 'ETHUSD', 'SOLUSD', 'BNBUSD'],
-  Metals:  ['XAUUSD', 'XAGUSD', 'USOIL', 'XNGUSD'],
-  Forex:   ['EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'AUDUSD', 'USDCAD'],
-};
+export type SignalVerdict = 'BUY' | 'SELL' | 'WAIT' | 'CAUTION';
 
-export const DERIV_SYMBOLS: Record<string, string> = {
-  EURUSD: 'frxEURUSD', GBPUSD: 'frxGBPUSD', USDJPY: 'frxUSDJPY',
-  USDCHF: 'frxUSDCHF', AUDUSD: 'frxAUDUSD', USDCAD: 'frxUSDCAD',
-  XAUUSD: 'frxXAUUSD', XAGUSD: 'frxXAGUSD', USOIL: 'frxUSOIL', XNGUSD: 'frxXNGUSD',
-  BTCUSD: 'cryBTCUSD', ETHUSD: 'cryETHUSD', SOLUSD: 'crySOLUSD', BNBUSD: 'cryBNBUSD',
-  BOOM1000: 'BOOM1000', CRASH1000: 'CRASH1000', VOL75: 'R_75',
-  US30: 'US30', NAS100: 'NAS100', STOXX50: 'STOXX50'
-};
-
-export type TradingMode = 'SCALPING MODE' | 'SWING MODE';
-
-export interface AnalysisRequest {
-  asset: string;
-  mode:  TradingMode;
-  image?: string;
+export interface ConsensusBreakdown {
+  orderBookImbalance: number; // e.g., +24%
+  interbankConsensus: string; // "Bullish 62%"
+  covarianceAlpha: number; // e.g., 0.85
+  sessionPoc: number; // volume-at-price point
+  liveRiskStatus: string; // "Nominal" | "Elevated" | "Extreme"
 }
 
-export interface CandleData {
-  epoch: number;
-  open:  number;
-  high:  number;
-  low:   number;
-  close: number;
+export interface TradingSignal {
+  id: string;
+  timestamp: string;
+  asset: Asset;
+  price: number;
+  change24h: number;
+  verdict: SignalVerdict;
+  strength: number; // 0 to 100
+  timeframe: string; // "M5" | "M15" | "H1" | "H4" | "D1"
+  logic: string; // Markdown summary of AI reasoning
+  metrics: ConsensusBreakdown;
+  userPromptUsed?: string;
+}
+
+export interface SignalHistoryItem {
+  timestamp: string;
+  asset: Asset;
+  price: number;
+  verdict: SignalVerdict;
+  profit?: number; // calculated simulated profit
 }

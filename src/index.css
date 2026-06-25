@@ -1,18 +1,61 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap');
 @import "tailwindcss";
-@plugin "@tailwindcss/typography";
 
-@theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
-  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-}
+@layer utilities {
+  .glassmorphism {
+    background: rgba(30, 20, 50, 0.55);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  
+  .glassmorphism-glow-orange {
+    box-shadow: 0 8px 32px rgba(255, 107, 53, 0.15), inset 0 0 12px rgba(255, 107, 53, 0.05);
+  }
 
-@layer base {
-  body {
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    @apply bg-slate-50 text-slate-800;
+  .glassmorphism-glow-purple {
+    box-shadow: 0 8px 32px rgba(110, 50, 200, 0.25), inset 0 0 12px rgba(110, 50, 200, 0.08);
+  }
+
+  .neon-text-orange {
+    text-shadow: 0 0 8px rgba(255, 107, 53, 0.6);
+  }
+
+  .neon-text-purple {
+    text-shadow: 0 0 12px rgba(138, 43, 226, 0.7);
+  }
+
+  .neon-border-orange {
+    border-color: #FF6B35;
+    box-shadow: 0 0 20px rgba(255, 107, 53, 0.45);
+  }
+
+  .neon-border-purple {
+    border-color: #8A2BE2;
+    box-shadow: 0 0 20px rgba(138, 43, 226, 0.45);
   }
 }
 
+/* Custom keyframes & custom scrollbar */
+@keyframes orb-float {
+  0%, 100% {
+    transform: translateY(0px) scale(1);
+    filter: drop-shadow(0 0 30px rgba(138, 43, 226, 0.6));
+  }
+  50% {
+    transform: translateY(-10px) scale(1.05);
+    filter: drop-shadow(0 0 45px rgba(255, 69, 0, 0.7));
+  }
+}
+
+.animate-orb-float {
+  animation: orb-float 6s ease-in-out infinite;
+}
+
+/* Custom fonts */
+.font-space {
+  font-family: 'Space Grotesk', sans-serif;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}

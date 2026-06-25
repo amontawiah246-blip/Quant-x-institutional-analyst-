@@ -1,39 +1,19 @@
-import React, { useState } from 'react';
-import { TradingMode } from './types';
-import { LandingPage } from './components/LandingPage';
-import { Dashboard } from './components/Dashboard';
+import { useState } from 'react';
+import LandingPage from './components/LandingPage.tsx';
+import Dashboard from './components/Dashboard.tsx';
 
-export default function App() {
-  const [hasStarted, setHasStarted] = useState(false);
+function App() {
+  const [view, setView] = useState<'landing' | 'dashboard'>('landing');
 
-  const handleAnalyze = async (
-    asset: string,
-    mode: TradingMode,
-    imageBase64?: string,
-    accountSize?: number,
-    riskPct?: number
-  ) => {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
-    const response = await fetch('/api/analyze', {
-      signal: controller.signal,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ asset, mode, image: imageBase64, accountSize, riskPct }),
-    });
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error || 'Failed to analyze');
-    }
-    clearTimeout(timeoutId);
-    const data = await response.json();
-    return data;
-  };
-
-  if (!hasStarted) {
-    return <LandingPage onStart={() => setHasStarted(true)} />;
-  }
-
-  return <Dashboard onAnalyze={handleAnalyze} />;
+  return (
+    <div className="h-full bg-[#0B0A11] text-[#E2E8F0] selection:bg-purple-900/50">
+      {view === 'landing' ? (
+        <LandingPage onEnter={() => setView('dashboard')} />
+      ) : (
+        <Dashboard onBackToLanding={() => setView('landing')} />
+      )}
+    </div>
+  );
 }
 
+export default App;
