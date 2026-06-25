@@ -27,24 +27,24 @@ export function AIConfidenceHeatmap({ selectedAsset, onAssetChange }: ExtraModul
   };
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative overflow-hidden h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-blue-500 to-indigo-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative overflow-hidden h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-orange-600" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Flame className="w-4 h-4 text-orange-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">AI Confidence Heatmap</h3>
+          <Flame className="w-4 h-4 text-orange-500 animate-pulse" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">AI Confidence Heatmap</h3>
         </div>
-        <span className="text-[9px] font-mono bg-orange-500/10 text-orange-300 px-2 py-0.5 rounded border border-orange-500/20 uppercase tracking-widest font-bold">Consensus Matrix</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2.5 py-0.5 rounded border border-orange-200 uppercase font-bold">Consensus Matrix</span>
       </div>
 
-      <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-        Cross-timeframe neural networks outputting real-time direction certainty score. Select cells to focus asset.
+      <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+        Cross-timeframe neural networks outputting real-time direction certainty scores. Select rows to swap instruments.
       </p>
 
       <div className="grid grid-cols-[70px_1fr] gap-2 items-center">
         {/* Header row */}
         <div />
-        <div className="grid grid-cols-5 gap-1.5 text-center text-[10px] font-mono font-bold text-zinc-500">
+        <div className="grid grid-cols-5 gap-1.5 text-center text-[10px] font-mono font-bold text-slate-400">
           {timeframes.map(tf => <div key={tf}>{tf}</div>)}
         </div>
 
@@ -55,22 +55,22 @@ export function AIConfidenceHeatmap({ selectedAsset, onAssetChange }: ExtraModul
             <React.Fragment key={asset}>
               <button 
                 onClick={() => onAssetChange?.(asset)}
-                className={`text-[11px] font-mono font-bold text-left px-1 py-1.5 rounded transition-all hover:bg-white/5 ${isSelectedAsset ? 'text-blue-400' : 'text-zinc-400'}`}
+                className={`text-[11px] font-mono font-black text-left px-1.5 py-1.5 rounded transition-all hover:bg-slate-50 cursor-pointer ${isSelectedAsset ? 'text-orange-600 bg-orange-50/40' : 'text-slate-600'}`}
               >
                 {asset}
               </button>
               <div className="grid grid-cols-5 gap-1.5">
                 {timeframes.map(tf => {
                   const conf = getConfidence(asset, tf);
-                  let bg = 'bg-rose-500/10 text-rose-400 border-rose-500/20';
-                  if (conf >= 78) bg = 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40 shadow-[0_0_15px_rgba(16,185,129,0.15)]';
-                  else if (conf >= 60) bg = 'bg-blue-500/15 text-blue-300 border-blue-500/20';
-                  else if (conf >= 50) bg = 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+                  let bg = 'bg-rose-50 text-rose-700 border-rose-100';
+                  if (conf >= 78) bg = 'bg-emerald-50 text-emerald-700 border-emerald-100';
+                  else if (conf >= 60) bg = 'bg-orange-50 text-orange-700 border-orange-100';
+                  else if (conf >= 50) bg = 'bg-amber-50 text-amber-700 border-amber-100';
 
                   return (
                     <div 
                       key={tf}
-                      className={`text-[10px] font-mono font-bold py-2 rounded-lg border flex flex-col items-center justify-center cursor-pointer transition-all hover:scale-105 ${bg}`}
+                      className={`text-[10px] font-mono font-bold py-2 rounded-lg border flex flex-col items-center justify-center cursor-pointer transition-all hover:scale-[1.03] ${bg}`}
                       onClick={() => onAssetChange?.(asset)}
                     >
                       <span>{conf}%</span>
@@ -109,43 +109,43 @@ export function MultiTimeframeAlignment({ selectedAsset }: ExtraModuleProps) {
   const isFullyAligned = avgStrength > 75;
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl h-full relative overflow-hidden">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-indigo-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm h-full relative overflow-hidden text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-orange-600" />
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <Layers className="w-4 h-4 text-purple-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Multi-Timeframe Alignment</h3>
+          <Layers className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Multi-Timeframe Alignment</h3>
         </div>
-        <div className={`px-2 py-0.5 rounded border text-[9px] font-mono font-bold uppercase tracking-wider ${isFullyAligned ? 'bg-purple-500/20 border-purple-500/30 text-purple-300 animate-pulse' : 'bg-zinc-800 border-zinc-700 text-zinc-500'}`}>
+        <div className={`px-2.5 py-0.5 rounded border text-[9px] font-mono font-bold uppercase tracking-wider ${isFullyAligned ? 'bg-orange-50 border-orange-200 text-orange-700 animate-pulse' : 'bg-slate-100 border-slate-200 text-slate-500'}`}>
           {isFullyAligned ? '🚨 ALIGNED HIGH-BIAS' : 'MIXED BIAS'}
         </div>
       </div>
 
-      <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-        Aggregates market structure bias across 5 separate timeframes. High alignment values indicate low risk.
+      <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+        Aggregates structural market bias across 5 separate timeframes. High alignment values indicate clear trends.
       </p>
 
-      <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-2.5">
         {tfs.map((tf, idx) => {
           const strengthVal = strengths[idx];
           const isBullish = strengthVal > 50;
           return (
-            <div key={tf.name} className="bg-white/[0.01] border border-white/5 p-2.5 rounded-xl flex items-center justify-between">
+            <div key={tf.name} className="bg-slate-50/55 border border-slate-200/60 p-2.5 rounded-xl flex items-center justify-between">
               <div>
-                <div className="text-[11px] font-bold text-zinc-300 font-mono">{tf.name}</div>
-                <div className="flex items-center gap-2 mt-1 text-[10px]">
-                  <span className={`font-semibold ${isBullish ? 'text-emerald-400' : 'text-rose-400'}`}>
+                <div className="text-[11px] font-bold text-slate-800 font-mono">{tf.name}</div>
+                <div className="flex items-center gap-1.5 mt-1 text-[10px]">
+                  <span className={`font-bold ${isBullish ? 'text-emerald-600' : 'text-rose-600'}`}>
                     {isBullish ? 'BULLISH BIAS' : 'BEARISH BIAS'}
                   </span>
-                  <span className="text-zinc-600">•</span>
-                  <span className="text-zinc-500">{tf.structure}</span>
+                  <span className="text-slate-300">•</span>
+                  <span className="text-slate-500 font-mono text-[9px]">{tf.structure}</span>
                 </div>
               </div>
               <div className="text-right">
-                <div className="text-xs font-mono font-bold text-zinc-100">{strengthVal}%</div>
-                <div className="w-16 h-1 bg-zinc-800 rounded-full mt-1.5 overflow-hidden">
+                <div className="text-xs font-mono font-bold text-slate-900">{strengthVal}%</div>
+                <div className="w-16 h-1 bg-slate-200 rounded-full mt-1.5 overflow-hidden">
                   <div 
-                    className={`h-full ${strengthVal > 75 ? 'bg-emerald-500' : strengthVal > 50 ? 'bg-blue-500' : 'bg-rose-500'}`} 
+                    className={`h-full ${strengthVal > 75 ? 'bg-emerald-500' : strengthVal > 50 ? 'bg-orange-500' : 'bg-rose-500'}`} 
                     style={{ width: `${strengthVal}%` }} 
                   />
                 </div>
@@ -167,45 +167,45 @@ export function SmartMoneyConceptsPanel({ selectedAsset, livePrice = 1.0 }: Extr
   const premiumRange = livePrice * 1.008;
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-teal-500 to-indigo-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-amber-500" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Crosshair className="w-4 h-4 text-teal-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Smart Money Concepts Dashboard</h3>
+          <Crosshair className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Smart Money Concepts</h3>
         </div>
-        <span className="text-[9px] font-mono bg-teal-500/10 text-teal-300 px-2 py-0.5 rounded border border-teal-500/20 uppercase tracking-widest font-bold">HTF Structural Ledger</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">Structure Ledger</span>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 mb-4">
-        <div className="bg-[#030614] border border-white/5 rounded-xl p-3">
-          <span className="text-[10px] font-mono font-bold uppercase text-zinc-500 block">Premium Zone</span>
-          <span className="text-sm font-mono font-bold text-rose-400 mt-1 block">&gt; {premiumRange.toFixed(activeDecimals(selectedAsset))}</span>
-          <span className="text-[10px] text-zinc-600 font-mono mt-1 block">Exhaustive buying region</span>
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 shadow-sm">
+          <span className="text-[9px] font-mono font-bold uppercase text-slate-400 block">Premium Zone</span>
+          <span className="text-sm font-mono font-extrabold text-rose-600 mt-0.5 block">&gt; {premiumRange.toFixed(activeDecimals(selectedAsset))}</span>
+          <span className="text-[10px] text-slate-500 font-sans mt-0.5 block">Exhaustive buying region</span>
         </div>
-        <div className="bg-[#030614] border border-white/5 rounded-xl p-3">
-          <span className="text-[10px] font-mono font-bold uppercase text-zinc-500 block">Discount Zone</span>
-          <span className="text-sm font-mono font-bold text-emerald-400 mt-1 block">&lt; {discountRange.toFixed(activeDecimals(selectedAsset))}</span>
-          <span className="text-[10px] text-zinc-600 font-mono mt-1 block">Optimal trade entry (OTE) block</span>
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 shadow-sm">
+          <span className="text-[9px] font-mono font-bold uppercase text-slate-400 block">Discount Zone</span>
+          <span className="text-sm font-mono font-extrabold text-emerald-600 mt-0.5 block">&lt; {discountRange.toFixed(activeDecimals(selectedAsset))}</span>
+          <span className="text-[10px] text-slate-500 font-sans mt-0.5 block">Optimal trade entry (OTE)</span>
         </div>
       </div>
 
       <div className="flex flex-col gap-2 font-mono text-[11px]">
-        <div className="flex justify-between py-1.5 border-b border-white/5">
-          <span className="text-zinc-500">Breaker Block Status:</span>
-          <span className="text-zinc-300 font-bold">Bullish Mitigation (Tested)</span>
+        <div className="flex justify-between py-1.5 border-b border-slate-100">
+          <span className="text-slate-450">Breaker Block Status:</span>
+          <span className="text-slate-700 font-bold">Bullish Mitigation (Tested)</span>
         </div>
-        <div className="flex justify-between py-1.5 border-b border-white/5">
-          <span className="text-zinc-500">Liquidity Voids:</span>
-          <span className="text-orange-400 font-bold">Detected at { (livePrice * 1.002).toFixed(activeDecimals(selectedAsset)) }</span>
+        <div className="flex justify-between py-1.5 border-b border-slate-100">
+          <span className="text-slate-450">Liquidity Voids:</span>
+          <span className="text-orange-600 font-bold">Detected at { (livePrice * 1.002).toFixed(activeDecimals(selectedAsset)) }</span>
         </div>
-        <div className="flex justify-between py-1.5 border-b border-white/5">
-          <span className="text-zinc-500">Order Block Mitigation:</span>
-          <span className="text-zinc-300 font-bold">Unmitigated daily OB present below</span>
+        <div className="flex justify-between py-1.5 border-b border-slate-100">
+          <span className="text-slate-450">Order Block Mitigation:</span>
+          <span className="text-slate-700 font-bold">Unmitigated Daily OB Below</span>
         </div>
         <div className="flex justify-between py-1.5">
-          <span className="text-zinc-500">Market Efficiency:</span>
-          <span className="text-emerald-400 font-bold">92% Fairly Valued</span>
+          <span className="text-slate-450">Market Efficiency:</span>
+          <span className="text-emerald-600 font-bold">92% Fairly Valued</span>
         </div>
       </div>
     </div>
@@ -217,50 +217,50 @@ export function LiquiditySweepDetector({ selectedAsset, livePrice = 1.0 }: Extra
   let decimals = activeDecimals(selectedAsset);
   
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-emerald-500 to-indigo-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-amber-500" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Compass className="w-4 h-4 text-emerald-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Liquidity Sweep Detector</h3>
+          <Compass className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Liquidity Sweep Detector</h3>
         </div>
-        <span className="text-[9px] font-mono bg-emerald-500/10 text-emerald-300 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest font-bold">Realtime sweeps</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">Realtime sweeps</span>
       </div>
 
-      <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-        Monitors high-volatility spikes that clean buy-side/sell-side liquidity pools, followed by displacement.
+      <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+        Monitors spikes that sweep heavy stop-loss liquidity pools, followed by immediate institutional reversals.
       </p>
 
       <div className="flex flex-col gap-2.5">
-        <div className="bg-[#030614] border border-emerald-500/10 rounded-xl p-3 flex items-center justify-between">
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 flex items-center justify-between shadow-sm">
           <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 bg-emerald-500/10 border border-emerald-500/20 rounded-lg flex items-center justify-center text-emerald-400">
+            <div className="w-7 h-7 bg-emerald-50 border border-emerald-100 rounded-lg flex items-center justify-center text-emerald-600 shadow-sm">
               <ArrowDown className="w-4 h-4" />
             </div>
             <div>
-              <span className="text-[11px] font-mono font-bold text-zinc-200 block">Sell-Side Liquidity (SSL) Swapped</span>
-              <span className="text-[10px] text-zinc-500 mt-0.5 block font-mono">Previous 4H Low Cleared</span>
+              <span className="text-[11px] font-mono font-bold text-slate-800 block">Sell-Side Liquidity (SSL) Swapped</span>
+              <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">Previous 4H Low Cleared</span>
             </div>
           </div>
           <div className="text-right font-mono">
-            <span className="text-xs text-emerald-400 font-bold block">{(livePrice * 0.995).toFixed(decimals)}</span>
-            <span className="text-[9px] text-zinc-600 block">Displacement: Confirmed</span>
+            <span className="text-xs text-emerald-600 font-extrabold block">{(livePrice * 0.995).toFixed(decimals)}</span>
+            <span className="text-[8px] text-slate-400 block font-bold">Displacement: Confirmed</span>
           </div>
         </div>
 
-        <div className="bg-[#030614] border border-white/5 rounded-xl p-3 flex items-center justify-between opacity-60">
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 flex items-center justify-between shadow-sm opacity-65">
           <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 bg-rose-500/10 border border-rose-500/20 rounded-lg flex items-center justify-center text-rose-400">
+            <div className="w-7 h-7 bg-rose-50 border border-rose-100 rounded-lg flex items-center justify-center text-rose-600 shadow-sm">
               <ArrowUp className="w-4 h-4" />
             </div>
             <div>
-              <span className="text-[11px] font-mono font-bold text-zinc-300 block">Buy-Side Liquidity (BSL) Cleared</span>
-              <span className="text-[10px] text-zinc-500 mt-0.5 block font-mono">Daily High Sweep</span>
+              <span className="text-[11px] font-mono font-bold text-slate-800 block">Buy-Side Liquidity (BSL) Cleared</span>
+              <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">Daily High Sweep Completed</span>
             </div>
           </div>
           <div className="text-right font-mono">
-            <span className="text-xs text-rose-400 font-bold block">{(livePrice * 1.012).toFixed(decimals)}</span>
-            <span className="text-[9px] text-zinc-600 block">No Displacement (Rejection)</span>
+            <span className="text-xs text-rose-500 font-extrabold block">{(livePrice * 1.012).toFixed(decimals)}</span>
+            <span className="text-[8px] text-slate-400 block font-bold">Rejection Triggered</span>
           </div>
         </div>
       </div>
@@ -274,39 +274,39 @@ export function VolumeProfile({ selectedAsset }: ExtraModuleProps) {
   const pointOfControlIndex = 8; // Highest Volume Node
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full flex flex-col justify-between">
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full flex flex-col justify-between text-left">
       <div>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <BarChart2 className="w-4 h-4 text-blue-400" />
-            <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Volume Profile (VPVR)</h3>
+            <BarChart2 className="w-4 h-4 text-orange-500" />
+            <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Volume Profile (VPVR)</h3>
           </div>
-          <span className="text-[9px] font-mono bg-blue-500/10 text-blue-300 px-2 py-0.5 rounded border border-blue-500/20 uppercase tracking-widest font-bold">Session POC</span>
+          <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">Session POC</span>
         </div>
 
-        <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-          Reveals high-volume transaction nodes. POC marks price points heavily defended by commercial desks.
+        <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+          Reveals high-volume distribution nodes. Point of Control (POC) marks price levels heavily defended by heavy buyers.
         </p>
 
-        {/* Volume Bars Stacking horizontally */}
+        {/* Volume Bars */}
         <div className="flex flex-col gap-1 font-mono">
           {bars.map((vol, idx) => {
             const isPOC = idx === pointOfControlIndex;
             return (
-              <div key={idx} className="grid grid-cols-[30px_1fr] gap-3 items-center">
-                <span className="text-[9px] text-zinc-500 text-right">VA-{idx}</span>
-                <div className="h-4.5 bg-zinc-950/40 rounded flex items-center relative overflow-hidden border border-white/[0.02]">
+              <div key={idx} className="grid grid-cols-[30px_1fr] gap-2 items-center">
+                <span className="text-[9px] text-slate-400 text-right">VA-{idx}</span>
+                <div className="h-4.5 bg-slate-50 rounded flex items-center relative overflow-hidden border border-slate-200/40">
                   <div 
-                    className={`h-full transition-all ${isPOC ? 'bg-gradient-to-r from-orange-500 to-amber-500' : 'bg-gradient-to-r from-blue-500/20 to-indigo-500/40'}`}
+                    className={`h-full transition-all ${isPOC ? 'bg-gradient-to-r from-orange-400 to-orange-500' : 'bg-orange-100/40'}`}
                     style={{ width: `${vol}%` }}
                   />
                   {isPOC && (
-                    <span className="absolute left-2 text-[9px] text-white font-bold tracking-widest uppercase flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-ping" />
+                    <span className="absolute left-2 text-[9px] text-orange-800 font-bold tracking-wider uppercase flex items-center gap-1 leading-none">
+                      <span className="w-1.5 h-1.5 rounded-full bg-orange-600 animate-ping" />
                       POC (Hedge Wall)
                     </span>
                   )}
-                  <span className="absolute right-2 text-[9px] text-zinc-500 font-bold">{vol}k lots</span>
+                  <span className="absolute right-2 text-[8px] text-slate-400 font-bold">{vol}k lots</span>
                 </div>
               </div>
             );
@@ -332,23 +332,23 @@ export function InstitutionalFootprint({ selectedAsset, livePrice = 1.0 }: Extra
   ];
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-sky-500 to-indigo-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-orange-600" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Compass className="w-4 h-4 text-sky-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Institutional Order Footprint</h3>
+          <Compass className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Institutional Order Footprint</h3>
         </div>
-        <span className="text-[9px] font-mono bg-sky-500/10 text-sky-300 px-2 py-0.5 rounded border border-sky-500/20 uppercase tracking-widest font-bold">L3 BID/ASK DELTA</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">L3 DELTA CLUSTERS</span>
       </div>
 
-      <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-        Live block transaction delta clusters, identifying localized institutional buying imbalances (green highlights).
+      <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+        Live transaction volume delta clusters, identifying localized buy imbalances (green highlights).
       </p>
 
-      <div className="flex flex-col gap-2 font-mono text-[10px]">
-        <div className="grid grid-cols-4 gap-2 text-zinc-500 font-bold uppercase tracking-widest border-b border-white/5 pb-2 text-center">
-          <span className="text-left">Price Cluster</span>
+      <div className="flex flex-col gap-1.5 font-mono text-[10px]">
+        <div className="grid grid-cols-4 gap-2 text-slate-400 font-bold uppercase tracking-wider border-b border-slate-100 pb-2 text-center">
+          <span className="text-left">Price Level</span>
           <span>Bid Vol</span>
           <span>Ask Vol</span>
           <span className="text-right">State</span>
@@ -356,11 +356,11 @@ export function InstitutionalFootprint({ selectedAsset, livePrice = 1.0 }: Extra
 
         {clusters.map((c, idx) => {
           return (
-            <div key={idx} className={`grid grid-cols-4 gap-2 py-2 items-center border-b border-white/5 text-center ${c.imbalance && c.bidDelta ? 'bg-emerald-500/10 text-emerald-400 rounded px-1' : ''}`}>
-              <span className="text-left font-bold text-zinc-400">{c.price.toFixed(activeDecimals(selectedAsset))}</span>
-              <span className={c.bidDelta ? 'text-emerald-400 font-semibold' : 'text-zinc-500'}>{c.bid}k</span>
-              <span className={!c.bidDelta ? 'text-rose-400 font-semibold' : 'text-zinc-500'}>{c.ask}k</span>
-              <span className="text-right font-bold text-zinc-300">
+            <div key={idx} className={`grid grid-cols-4 gap-2 py-1.5 items-center border-b border-slate-50 text-center ${c.imbalance && c.bidDelta ? 'bg-emerald-50 text-emerald-800 rounded px-1' : ''}`}>
+              <span className="text-left font-bold text-slate-600">{c.price.toFixed(activeDecimals(selectedAsset))}</span>
+              <span className={c.bidDelta ? 'text-emerald-600 font-bold' : 'text-slate-400'}>{c.bid}k</span>
+              <span className={!c.bidDelta ? 'text-rose-600 font-bold' : 'text-slate-400'}>{c.ask}k</span>
+              <span className="text-right font-bold text-slate-700">
                 {c.imbalance ? (c.bidDelta ? '⚡ BID IMB' : '🔥 ASK IMB') : 'BALANCED'}
               </span>
             </div>
@@ -383,39 +383,39 @@ export function CorrelationMatrix({ selectedAsset }: ExtraModuleProps) {
   };
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-indigo-500 to-purple-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-orange-600" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Activity className="w-4 h-4 text-indigo-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Intermarket Correlation Matrix</h3>
+          <Activity className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Intermarket Covariance</h3>
         </div>
-        <span className="text-[9px] font-mono bg-indigo-500/10 text-indigo-300 px-2 py-0.5 rounded border border-indigo-500/20 uppercase tracking-widest font-bold">COVARIANCE ALPHA</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">COVARIANCE ALPHA</span>
       </div>
 
       <div className="grid grid-cols-[70px_1fr] gap-2 items-center font-mono">
         {/* Header line */}
         <div />
-        <div className="grid grid-cols-5 gap-1.5 text-center text-[10px] font-bold text-zinc-500">
+        <div className="grid grid-cols-5 gap-1 text-center text-[10px] font-bold text-slate-400">
           {rowAssets.map(a => <div key={a}>{a.slice(0,3)}</div>)}
         </div>
 
         {rowAssets.map(rowAsset => (
           <React.Fragment key={rowAsset}>
-            <span className="text-[11px] font-bold text-zinc-400">{rowAsset}</span>
-            <div className="grid grid-cols-5 gap-1.5">
+            <span className="text-[11px] font-bold text-slate-700">{rowAsset}</span>
+            <div className="grid grid-cols-5 gap-1">
               {rowAssets.map(colAsset => {
                 const coeff = matrix[rowAsset][colAsset];
-                let colorClass = 'bg-[#030614] text-zinc-500 border-white/5';
-                if (coeff === 1) colorClass = 'bg-blue-600/30 text-blue-300 border-blue-500/40 font-bold';
-                else if (coeff >= 0.7) colorClass = 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30';
-                else if (coeff <= -0.4) colorClass = 'bg-rose-500/20 text-rose-400 border-rose-500/30';
-                else if (coeff > 0) colorClass = 'bg-blue-500/10 text-blue-300 border-blue-500/15';
+                let colorClass = 'bg-slate-50 text-slate-400 border-slate-200/40';
+                if (coeff === 1) colorClass = 'bg-orange-500 text-white border-orange-600 font-bold';
+                else if (coeff >= 0.7) colorClass = 'bg-emerald-50 text-emerald-800 border-emerald-100';
+                else if (coeff <= -0.4) colorClass = 'bg-rose-50 text-rose-800 border-rose-100';
+                else if (coeff > 0) colorClass = 'bg-orange-50 text-orange-800 border-orange-100';
 
                 return (
                   <div 
                     key={colAsset}
-                    className={`text-[10px] py-1.5 rounded border flex items-center justify-center font-mono ${colorClass}`}
+                    className={`text-[9px] py-1.5 rounded border flex items-center justify-center font-mono font-bold ${colorClass}`}
                     title={`Correlation: ${rowAsset} vs ${colAsset} is ${coeff}`}
                   >
                     {coeff > 0 && coeff !== 1 ? `+${coeff.toFixed(2)}` : coeff.toFixed(2)}
@@ -440,38 +440,38 @@ export function EconomicImpactScanner({ selectedAsset }: ExtraModuleProps) {
   ];
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-500 to-red-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-red-500" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Calendar className="w-4 h-4 text-orange-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Economic Impact Scanner</h3>
+          <Calendar className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Economic Impact Scanner</h3>
         </div>
-        <span className="text-[9px] font-mono bg-rose-500/10 text-rose-300 px-2 py-0.5 rounded border border-rose-500/20 uppercase tracking-widest font-bold">Hard Blocks active</span>
+        <span className="text-[9px] font-mono bg-red-50 text-red-700 px-2.5 py-0.5 rounded border border-red-200 uppercase font-bold font-mono">Risk Auto-block active</span>
       </div>
 
-      <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-        Active macroeconomic feeds linked to automatic risk-off filters. System bans new trades ±15m from high impact.
+      <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+        Realtime economic indicator feeds linked to risk protection modules. System automatically halts scans ±15m around releases.
       </p>
 
       <div className="flex flex-col gap-2 font-mono">
         {events.map((e, idx) => (
-          <div key={idx} className={`p-3 rounded-xl border ${e.warning ? 'bg-rose-500/5 border-rose-500/20' : 'bg-white/[0.01] border-white/5'} flex items-start justify-between`}>
+          <div key={idx} className={`p-3 rounded-xl border ${e.warning ? 'bg-red-50/40 border-red-100' : 'bg-slate-50 border-slate-200/60'} flex items-start justify-between shadow-sm`}>
             <div>
-              <div className="flex items-center gap-2">
-                <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold ${e.impact === 'HIGH' ? 'bg-rose-500/15 text-rose-400 border border-rose-500/30' : 'bg-amber-500/15 text-amber-400 border border-amber-500/30'}`}>
+              <div className="flex items-center gap-1.5">
+                <span className={`text-[8px] px-1.5 py-0.5 rounded font-black ${e.impact === 'HIGH' ? 'bg-red-100 text-red-800' : 'bg-amber-100 text-amber-800'}`}>
                   {e.impact}
                 </span>
-                <span className="text-[11px] text-zinc-300 font-bold">{e.title}</span>
+                <span className="text-[11px] text-slate-800 font-black">{e.title}</span>
               </div>
-              <span className="text-[10px] text-zinc-500 mt-1 block">{e.time}</span>
+              <span className="text-[10px] text-slate-400 mt-1 block">{e.time}</span>
             </div>
             <div className="text-right text-[10px]">
-              <span className="text-zinc-500 block">Forecast: <strong className="text-zinc-300">{e.forecast}</strong></span>
-              <span className="text-zinc-500 block mt-0.5">Previous: <strong className="text-zinc-300">{e.previous}</strong></span>
+              <span className="text-slate-500 block">Forecast: <strong className="text-slate-800">{e.forecast}</strong></span>
+              <span className="text-slate-500 block mt-0.5">Previous: <strong className="text-slate-800">{e.previous}</strong></span>
               {e.warning && (
-                <span className="text-[9px] text-rose-400 font-bold mt-1 inline-flex items-center gap-1">
-                  <ShieldAlert className="w-3 h-3" /> Auto-Block Active
+                <span className="text-[9px] text-red-600 font-bold mt-1 inline-flex items-center gap-1 leading-none">
+                  <ShieldAlert className="w-3 h-3 text-red-500 animate-pulse" /> Auto-Block Active
                 </span>
               )}
             </div>
@@ -485,46 +485,46 @@ export function EconomicImpactScanner({ selectedAsset }: ExtraModuleProps) {
 // 9. Portfolio Risk Dashboard Component
 export function PortfolioRiskDashboard({ selectedAsset }: ExtraModuleProps) {
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-[#3b82f6] to-[#8b5cf6]" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-amber-500" />
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Sliders className="w-4 h-4 text-blue-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Portfolio Risk & VaR Engine</h3>
+          <Sliders className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Portfolio Risk & VaR Engine</h3>
         </div>
-        <span className="text-[9px] font-mono bg-blue-500/10 text-blue-300 px-2 py-0.5 rounded border border-blue-500/20 uppercase tracking-widest font-bold">Live Risk Metrics</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">Live Risk Metrics</span>
       </div>
 
       <div className="grid grid-cols-3 gap-3 mb-4 font-mono text-center">
-        <div className="bg-[#030614] border border-white/5 rounded-xl p-3">
-          <span className="text-[9px] font-bold uppercase text-zinc-500">Value at Risk (VaR)</span>
-          <span className="text-sm font-bold text-white mt-1 block">$184.20</span>
-          <span className="text-[9px] text-emerald-400 mt-1 block font-bold">1.84% (Safe)</span>
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5 shadow-sm">
+          <span className="text-[8px] font-bold uppercase text-slate-450 block">Value at Risk</span>
+          <span className="text-xs sm:text-sm font-extrabold text-slate-800 mt-0.5 block">$184.20</span>
+          <span className="text-[8px] text-emerald-600 mt-0.5 block font-bold">1.84% (Safe)</span>
         </div>
-        <div className="bg-[#030614] border border-white/5 rounded-xl p-3">
-          <span className="text-[9px] font-bold uppercase text-zinc-500">Portfolio Beta</span>
-          <span className="text-sm font-bold text-white mt-1 block">0.68</span>
-          <span className="text-[9px] text-zinc-500 mt-1 block">Low Market Beta</span>
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5 shadow-sm">
+          <span className="text-[8px] font-bold uppercase text-slate-450 block">Portfolio Beta</span>
+          <span className="text-xs sm:text-sm font-extrabold text-slate-800 mt-0.5 block">0.68</span>
+          <span className="text-[8px] text-slate-400 mt-0.5 block font-bold">Safe Beta</span>
         </div>
-        <div className="bg-[#030614] border border-white/5 rounded-xl p-3">
-          <span className="text-[9px] font-bold uppercase text-zinc-500">Correlation VaR</span>
-          <span className="text-sm font-bold text-white mt-1 block">$142.10</span>
-          <span className="text-[9px] text-purple-400 mt-1 block font-bold">Hedged Alpha</span>
+        <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2.5 shadow-sm">
+          <span className="text-[8px] font-bold uppercase text-slate-450 block">Correlation VaR</span>
+          <span className="text-xs sm:text-sm font-extrabold text-slate-800 mt-0.5 block">$142.10</span>
+          <span className="text-[8px] text-orange-600 mt-0.5 block font-bold">Hedged Alpha</span>
         </div>
       </div>
 
       <div className="flex flex-col gap-2 font-mono text-[11px]">
-        <div className="flex justify-between py-1.5 border-b border-white/5">
-          <span className="text-zinc-500">Active Margin Utilization:</span>
-          <span className="text-zinc-300 font-bold">12.4% ($1,240.00 used)</span>
+        <div className="flex justify-between py-1.5 border-b border-slate-100">
+          <span className="text-slate-400">Active Margin Utilization:</span>
+          <span className="text-slate-700 font-bold">12.4% ($1,240.00 used)</span>
         </div>
-        <div className="flex justify-between py-1.5 border-b border-white/5">
-          <span className="text-zinc-500">Covariance Exposure Bound:</span>
-          <span className="text-emerald-400 font-bold">Optimal Alignment</span>
+        <div className="flex justify-between py-1.5 border-b border-slate-100">
+          <span className="text-slate-400">Covariance Exposure Bound:</span>
+          <span className="text-emerald-600 font-bold">Optimal Alignment</span>
         </div>
         <div className="flex justify-between py-1.5">
-          <span className="text-zinc-500">Simulated Drawdown Bounds:</span>
-          <span className="text-rose-400 font-bold">-4.5% Maximum Risk Bound</span>
+          <span className="text-slate-400">Simulated Drawdown Bounds:</span>
+          <span className="text-rose-600 font-bold">-4.5% Maximum Risk Bound</span>
         </div>
       </div>
     </div>
@@ -562,30 +562,30 @@ export function MonteCarloRiskEngine() {
   }, []);
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full flex flex-col justify-between">
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full flex flex-col justify-between text-left">
       <div>
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <Activity className="w-4 h-4 text-purple-400" />
-            <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Monte Carlo Simulation (1,000 Runs)</h3>
+            <Activity className="w-4 h-4 text-orange-500" />
+            <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Monte Carlo Simulation</h3>
           </div>
           <button 
             onClick={simulateEngine}
             disabled={isRunning}
-            className="text-[9px] font-mono bg-purple-500/10 hover:bg-purple-500/20 text-purple-300 px-2 py-1 rounded border border-purple-500/20 uppercase tracking-widest font-bold flex items-center gap-1 cursor-pointer"
+            className="text-[9px] font-mono bg-orange-50 hover:bg-orange-100 text-orange-700 px-2.5 py-1 rounded border border-orange-200 uppercase font-black flex items-center gap-1 cursor-pointer transition-colors"
           >
             <RotateCcw className="w-3 h-3" /> Re-Simulate
           </button>
         </div>
 
-        <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-          Simulates 1,000 future trade outcomes using dynamic win rate / expected value. Displays terminal equity paths.
+        <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+          Simulates future trades using deterministic statistical variables. Displays 5 randomized terminal equity pathways.
         </p>
 
         {/* Pathway SVG Chart */}
-        <div className="h-36 w-full bg-[#030614]/80 border border-white/5 rounded-xl relative overflow-hidden flex items-center justify-center">
+        <div className="h-36 w-full bg-slate-50 border border-slate-200 rounded-xl relative overflow-hidden flex items-center justify-center shadow-inner">
           {isRunning ? (
-            <div className="text-[10px] font-mono text-purple-400 animate-pulse uppercase tracking-widest">
+            <div className="text-[10px] font-mono text-orange-600 animate-pulse uppercase font-bold tracking-wider">
               Computing Math Trajectories...
             </div>
           ) : (
@@ -601,19 +601,19 @@ export function MonteCarloRiskEngine() {
                   return `${x},${y}`;
                 }).join(' ');
 
-                let color = '#3b82f6';
-                if (rIdx === 1) color = '#a855f7';
-                if (rIdx === 2) color = '#10b981';
-                if (rIdx === 3) color = '#f59e0b';
-                if (rIdx === 4) color = '#ec4899';
+                let color = '#f97316'; // orange-500
+                if (rIdx === 1) color = '#d97706'; // amber-600
+                if (rIdx === 2) color = '#10b981'; // emerald-500
+                if (rIdx === 3) color = '#2563eb'; // blue-600
+                if (rIdx === 4) color = '#4f46e5'; // indigo-600
 
                 return (
                   <polyline 
                     key={rIdx}
                     fill="none"
                     stroke={color}
-                    strokeWidth="1.5"
-                    opacity="0.8"
+                    strokeWidth="1.8"
+                    opacity="0.85"
                     points={points}
                     className="transition-all duration-1000"
                   />
@@ -621,19 +621,19 @@ export function MonteCarloRiskEngine() {
               })}
             </svg>
           )}
-          <span className="absolute bottom-2 right-2 text-[8px] font-mono text-zinc-600">Horizontal: 40 simulated trials</span>
-          <span className="absolute top-2 left-2 text-[8px] font-mono text-zinc-600">Base: $10,000 Size</span>
+          <span className="absolute bottom-2 right-2 text-[8px] font-mono text-slate-400">Horizontal: 40 simulated trials</span>
+          <span className="absolute top-2 left-2 text-[8px] font-mono text-slate-400">Base: $10,000 Size</span>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 mt-4 text-[10px] font-mono">
-        <div className="bg-white/[0.01] border border-white/5 rounded-lg p-2 text-center">
-          <span className="text-zinc-500 uppercase">Risk of Ruin</span>
-          <span className="text-emerald-400 font-bold block mt-0.5">0.02% Consensus</span>
+      <div className="grid grid-cols-2 gap-3 mt-4 text-[10px] font-mono">
+        <div className="bg-slate-50 border border-slate-200/85 rounded-lg p-2 text-center">
+          <span className="text-slate-400 uppercase">Risk of Ruin</span>
+          <span className="text-emerald-600 font-bold block mt-0.5">0.02% Consensus</span>
         </div>
-        <div className="bg-white/[0.01] border border-white/5 rounded-lg p-2 text-center">
-          <span className="text-zinc-500 uppercase">Avg Yield (40 Runs)</span>
-          <span className="text-indigo-400 font-bold block mt-0.5">+24.8% Projected</span>
+        <div className="bg-slate-50 border border-slate-200/85 rounded-lg p-2 text-center">
+          <span className="text-slate-400 uppercase">Avg Yield (40 Runs)</span>
+          <span className="text-orange-600 font-bold block mt-0.5">+24.8% Projected</span>
         </div>
       </div>
     </div>
@@ -649,44 +649,44 @@ export function LiveMarketSentimentEngine({ selectedAsset }: ExtraModuleProps) {
   const bearPct = 100 - bullPct;
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-[#10b981] to-[#3b82f6]" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-[#10b981] to-orange-500" />
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <Compass className="w-4 h-4 text-emerald-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Live Consensus Sentiment</h3>
+          <Compass className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Consensus Sentiment</h3>
         </div>
-        <span className="text-[9px] font-mono bg-emerald-500/10 text-emerald-300 px-2 py-0.5 rounded border border-emerald-500/20 uppercase tracking-widest font-bold">Interbank consensus</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">Interbank consensus</span>
       </div>
 
-      <p className="text-[11px] text-zinc-500 mb-4 font-mono">
-        Aggregated sentiment indexing order book imbalance, retail positions, and high-frequency sentiment APIs.
+      <p className="text-[11px] text-slate-500 mb-4 font-mono leading-relaxed">
+        Sentiment aggregator indexing interbank order imbalances, commercial positioning data, and social momentum indices.
       </p>
 
       {/* Dual bar representing bull vs bear */}
-      <div className="h-6 w-full bg-zinc-950/40 rounded-full border border-white/5 flex overflow-hidden font-mono text-[10px] font-bold text-white">
+      <div className="h-6 w-full bg-slate-100 rounded-full border border-slate-200 flex overflow-hidden font-mono text-[9px] font-bold text-white shadow-inner">
         <div 
-          className="bg-emerald-500 flex items-center justify-start pl-4"
+          className="bg-emerald-500 flex items-center justify-start pl-3"
           style={{ width: `${bullPct}%` }}
         >
           <span>Bullish {bullPct}%</span>
         </div>
         <div 
-          className="bg-rose-500 flex items-center justify-end pr-4"
+          className="bg-rose-500 flex items-center justify-end pr-3"
           style={{ width: `${bearPct}%` }}
         >
           <span>Bearish {bearPct}%</span>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-4 mt-4 font-mono text-[11px]">
-        <div className="py-2 px-3 bg-white/[0.01] border border-white/5 rounded-xl flex items-center justify-between">
-          <span className="text-zinc-500">Retail Sentiment:</span>
-          <span className="text-rose-400 font-bold">{bullPct > 55 ? '72% Long' : '65% Short'}</span>
+      <div className="grid grid-cols-2 gap-3 mt-4 font-mono text-[11px]">
+        <div className="py-2 px-3 bg-slate-50 border border-slate-200/80 rounded-xl flex items-center justify-between shadow-sm">
+          <span className="text-slate-400">Retail Pos:</span>
+          <span className="text-rose-600 font-bold">{bullPct > 55 ? '72% Long' : '65% Short'}</span>
         </div>
-        <div className="py-2 px-3 bg-white/[0.01] border border-white/5 rounded-xl flex items-center justify-between">
-          <span className="text-zinc-500">Institutional Net Flow:</span>
-          <span className="text-emerald-400 font-bold">Strong Accumulation</span>
+        <div className="py-2 px-3 bg-slate-50 border border-slate-200/80 rounded-xl flex items-center justify-between shadow-sm">
+          <span className="text-slate-400">Desk Flow:</span>
+          <span className="text-emerald-600 font-bold">Accumulation</span>
         </div>
       </div>
     </div>
@@ -716,21 +716,21 @@ export function StrategyBacktestingCenter() {
   };
 
   return (
-    <div className="bg-[#050b24]/60 backdrop-blur-xl border border-white/5 rounded-2xl p-5 shadow-2xl relative h-full">
-      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-indigo-500 to-blue-600" />
+    <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm relative h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-orange-400 to-orange-600" />
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <Sliders className="w-4 h-4 text-indigo-400" />
-          <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-zinc-300">Strategy Backtesting Center</h3>
+          <Sliders className="w-4 h-4 text-orange-500" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-slate-900">Strategy Backtesting Center</h3>
         </div>
-        <span className="text-[9px] font-mono bg-indigo-500/10 text-indigo-300 px-2 py-0.5 rounded border border-indigo-500/20 uppercase tracking-widest font-bold">Historical simulation</span>
+        <span className="text-[9px] font-mono bg-orange-50 text-orange-700 px-2 py-0.5 rounded border border-orange-200 uppercase font-bold">Historical Simulation</span>
       </div>
 
-      <div className="flex gap-2.5 mb-4">
+      <div className="flex gap-2 mb-4">
         <select 
           value={selectedStrategy}
           onChange={(e) => setSelectedStrategy(e.target.value)}
-          className="flex-1 bg-[#030614] border border-white/10 rounded-xl p-2.5 text-xs text-zinc-300 outline-none font-mono"
+          className="flex-1 bg-slate-50 border border-slate-200/80 rounded-xl p-2 text-xs text-slate-700 outline-none font-mono cursor-pointer"
         >
           <option>Smart Money (SMC)</option>
           <option>Order Block Mitigation</option>
@@ -740,54 +740,54 @@ export function StrategyBacktestingCenter() {
         <button 
           onClick={triggerBacktest}
           disabled={isRunning}
-          className="px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 rounded-xl font-mono text-xs font-bold text-white tracking-widest uppercase flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+          className="px-4.5 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white rounded-xl font-mono text-xs font-black tracking-wider uppercase flex items-center gap-1.5 cursor-pointer transition-colors"
         >
           <Play className="w-3.5 h-3.5" /> Backtest
         </button>
       </div>
 
       {isRunning ? (
-        <div className="h-32 bg-[#030614]/80 border border-white/5 rounded-xl flex flex-col items-center justify-center gap-3">
-          <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
-          <span className="text-[10px] font-mono text-indigo-400 animate-pulse uppercase tracking-wider">Simulating 1,500 candles...</span>
+        <div className="h-32 bg-slate-50 border border-slate-200 rounded-xl flex flex-col items-center justify-center gap-2.5 shadow-inner">
+          <div className="w-7 h-7 border-2 border-orange-500 border-t-transparent rounded-full animate-spin" />
+          <span className="text-[10px] font-mono text-orange-600 animate-pulse uppercase tracking-wider font-bold">Simulating 1,500 candles...</span>
         </div>
       ) : stats ? (
-        <div className="grid grid-cols-3 gap-3 font-mono text-center">
-          <div className="bg-[#030614] border border-white/5 rounded-xl p-2">
-            <span className="text-[9px] text-zinc-500">Net Profit</span>
-            <span className="text-xs font-bold text-emerald-400 mt-0.5 block">{stats.pnl}</span>
+        <div className="grid grid-cols-3 gap-2.5 font-mono text-center">
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Net Profit</span>
+            <span className="text-xs font-extrabold text-emerald-600 mt-0.5 block">{stats.pnl}</span>
           </div>
-          <div className="bg-[#030614] border border-white/5 rounded-xl p-2">
-            <span className="text-[9px] text-zinc-500">Win Rate</span>
-            <span className="text-xs font-bold text-white mt-0.5 block">{stats.winRate}</span>
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Win Rate</span>
+            <span className="text-xs font-extrabold text-slate-800 mt-0.5 block">{stats.winRate}</span>
           </div>
-          <div className="bg-[#030614] border border-white/5 rounded-xl p-2">
-            <span className="text-[9px] text-zinc-500">Profit Factor</span>
-            <span className="text-xs font-bold text-white mt-0.5 block">{stats.profitFactor}</span>
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Profit Factor</span>
+            <span className="text-xs font-extrabold text-slate-800 mt-0.5 block">{stats.profitFactor}</span>
           </div>
-          <div className="bg-[#030614] border border-white/5 rounded-xl p-2">
-            <span className="text-[9px] text-zinc-500">Sharpe Ratio</span>
-            <span className="text-xs font-bold text-indigo-400 mt-0.5 block">{stats.sharpe}</span>
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Sharpe Ratio</span>
+            <span className="text-xs font-extrabold text-orange-600 mt-0.5 block">{stats.sharpe}</span>
           </div>
-          <div className="bg-[#030614] border border-white/5 rounded-xl p-2">
-            <span className="text-[9px] text-zinc-500">Max DD</span>
-            <span className="text-xs font-bold text-rose-400 mt-0.5 block">{stats.drawdown}</span>
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Max DD</span>
+            <span className="text-xs font-extrabold text-rose-600 mt-0.5 block">{stats.drawdown}</span>
           </div>
-          <div className="bg-[#030614] border border-white/5 rounded-xl p-2">
-            <span className="text-[9px] text-zinc-500">Total Trades</span>
-            <span className="text-xs font-bold text-zinc-300 mt-0.5 block">{stats.trades}</span>
+          <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Total Trades</span>
+            <span className="text-xs font-extrabold text-slate-700 mt-0.5 block">{stats.trades}</span>
           </div>
         </div>
       ) : (
-        <div className="h-32 border-2 border-dashed border-white/5 bg-[#030614]/30 rounded-xl flex flex-col items-center justify-center p-4 text-center">
-          <span className="text-[10px] font-mono text-zinc-600 uppercase tracking-wider">Awaiting Simulation Command</span>
+        <div className="h-32 border-2 border-dashed border-slate-250 bg-slate-50/50 rounded-xl flex flex-col items-center justify-center p-4 text-center">
+          <span className="text-[9px] font-mono text-slate-400 uppercase tracking-widest font-bold">Awaiting backtest signal</span>
         </div>
       )}
     </div>
   );
 }
 
-// Helper to determine dec points
+// Helper to determine decimals
 export function activeDecimals(asset: string) {
   if (asset.includes('JPY')) return 3;
   if (asset.includes('USD') && asset.length === 6) return 5;

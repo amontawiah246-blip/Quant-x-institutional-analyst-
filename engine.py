@@ -2602,6 +2602,156 @@ def calc_volume_profile(candles, bins=20):
     }
 
 
+def score_zone_confluence(zone_price_low: float, zone_price_high: float,
+                           fibonacci: dict, fvgs: list, obs: list,
+                           bos_choch: list, volume_profile: dict,
+                           atr: float, tolerance_atr: float = 0.25) -> dict:
+    """
+    ZONE CONFLUENCE SCORER — built directly from the user's own SMC/ICT
+    framework (6-step "Map of a High-Probability Sell Setup"):
+      Strong Supply/Demand Zone = Resistance/Support level + FVG + ChoCH
+                                   + volume cluster, ideally with a
+                                   Fibonacci level (0.5 / 0.618 golden
+                                   pocket) landing in the same area.
+
+    The engine already computes every one of these ingredients separately
+    (Fibonacci levels, FVGs, ChoCH events, volume profile HVN/POC) — this
+    function is the first place that checks whether they actually STACK at
+    the same price, and reports the result using the same "Strong/Moderate/
+    Weak Zone" vocabulary the user already uses in their own analysis.
+
+    This does NOT replace any existing pattern detector — it is a confluence
+    AGGREGATOR that scores a given candidate zone by counting how many
+    independent factors land inside it.
+
+    Returns a confluence breakdown and a zone_strength label, plus the
+    specific Fibonacci level (if any) that falls inside the zone — directly
+    answering "Fib + FVG confluence" as one explicit, checkable fact rather
+    than two separate, unconnected numbers.
+    """
+    if atr <= 0:
+        return {'zone_strength': 'UNKNOWN', 'factors': [], 'score': 0}
+
+    tolerance = atr * tolerance_atr
+    zone_mid = (zone_price_low + zone_price_high) / 2
+    factors_present = []
+
+    # ── Factor 1: Fibonacci confluence (0.5, 0.618, 0.65 golden pocket, 0.382) ─
+    fib_match = None
+    if fibonacci and not fibonacci.get('error'):
+        retracements = fibonacci.get('retracements', {})
+        # Prioritize the golden pocket and 0.5 — the user's own framework
+        # explicitly calls out "Fibonacci 0.5 level confluence with FVG"
+        priority_levels = ['0.500', '0.618', '0.650', '0.382']
+        for lvl_key in priority_levels:
+            lvl_price = retracements.get(lvl_key)
+            if lvl_price is not None and (zone_price_low - tolerance) <= lvl_price <= (zone_price_high + tolerance):
+                fib_match = {'level': lvl_key, 'price': lvl_price}
+                factors_present.append({
+                    'factor': 'FIBONACCI',
+                    'detail': f'Fib {lvl_key} retracement ({lvl_price}) lands inside this zone.',
+                    'weight': 25 if lvl_key in ('0.618', '0.650') else 20,  # golden pocket weighted slightly higher
+                })
+                break  # only count the strongest matching level once
+
+    # ── Factor 2: FVG presence (already the zone itself, often, but confirm) ──
+    matching_fvgs = [f for f in (fvgs or [])
+                     if not (f.get('top', 0) < zone_price_low - tolerance or
+                             f.get('bottom', 0) > zone_price_high + tolerance)]
+    if matching_fvgs:
+        factors_present.append({
+            'factor': 'FVG',
+            'detail': f'{len(matching_fvgs)} FVG(s) present in this zone ({matching_fvgs[0]["bottom"]}-{matching_fvgs[0]["top"]}).',
+            'weight': 25,
+        })
+
+    # ── Factor 3: Order block presence ────────────────────────────────────────
+    matching_obs = [o for o in (obs or [])
+                    if not (o.get('high', 0) < zone_price_low - tolerance or
+                            o.get('low', 0) > zone_price_high + tolerance)]
+    if matching_obs:
+        factors_present.append({
+            'factor': 'ORDER_BLOCK',
+            'detail': f'{len(matching_obs)} order block(s) present in this zone.',
+            'weight': 20,
+        })
+
+    # ── Factor 4: ChoCH/BOS event AT this zone ────────────────────────────────
+    matching_structure = [e for e in (bos_choch or [])
+                          if (zone_price_low - tolerance) <= e.get('price', -999999) <= (zone_price_high + tolerance)]
+    if matching_structure:
+        has_choch = any('CHoCH' in e.get('type', '') for e in matching_structure)
+        factors_present.append({
+            'factor': 'CHOCH' if has_choch else 'BOS',
+            'detail': f'{"CHoCH" if has_choch else "BOS"} event at {matching_structure[-1].get("price")} confirms structural significance of this zone.',
+            'weight': 20 if has_choch else 15,
+        })
+
+    # ── Factor 5: Volume cluster (HVN / POC / Value Area) ─────────────────────
+    # Honest note: this is an activity-weighted price-time PROXY, not real
+    # exchange volume (most retail forex/CFD feeds don't provide true tick
+    # volume) — reported as such so the AI never overstates its precision.
+    vol_match = None
+    if volume_profile and volume_profile.get('status') != 'INSUFFICIENT DATA':
+        poc = volume_profile.get('poc') # Wait, in calc_volume_profile the returned field is 'poc'
+        vah = volume_profile.get('vah')
+        val = volume_profile.get('val')
+        hvn_list = volume_profile.get('hvn', [])
+
+        if poc is not None and (zone_price_low - tolerance) <= poc <= (zone_price_high + tolerance):
+            vol_match = 'POC'
+        elif vah is not None and val is not None and not (zone_price_high < val - tolerance or zone_price_low > vah + tolerance):
+            vol_match = 'VALUE_AREA'
+        elif hvn_list:
+            for hvn_price in (hvn_list if isinstance(hvn_list, list) else []):
+                hp = hvn_price.get('price') if isinstance(hvn_price, dict) else hvn_price
+                if hp is not None and (zone_price_low - tolerance) <= hp <= (zone_price_high + tolerance):
+                    vol_match = 'HVN'
+                    break
+
+        if vol_match:
+            factors_present.append({
+                'factor': 'VOLUME_CLUSTER',
+                'detail': f'{vol_match} (activity-weighted volume proxy) falls inside this zone — note: proxy-based, not true exchange volume.',
+                'weight': 15,
+            })
+
+    # ── Aggregate score and label, using the user's own vocabulary ───────────
+    total_score = sum(f['weight'] for f in factors_present)
+    factor_count = len(factors_present)
+
+    if factor_count >= 4:
+        zone_strength = 'STRONG ZONE'   # matches user's own "Strong Supply Zone" terminology
+    elif factor_count == 3:
+        zone_strength = 'MODERATE ZONE'
+    elif factor_count >= 1:
+        zone_strength = 'WEAK ZONE'
+    else:
+        zone_strength = 'NO CONFLUENCE'
+
+    fib_fvg_confluence = (fib_match is not None) and any(f['factor'] == 'FVG' for f in factors_present)
+
+    description = (
+        f"{zone_strength} ({factor_count} confluence factors, score {total_score}/100): " +
+        ", ".join(f['factor'] for f in factors_present)
+        if factors_present else
+        "No confluence factors detected in this zone — treat with low confidence."
+    )
+    if fib_fvg_confluence:
+        description += f" ★ Fibonacci {fib_match['level']} + FVG confluence confirmed — matches high-probability entry criteria."
+
+    return {
+        'zone_strength':          zone_strength,
+        'score':                  min(100, total_score),
+        'factor_count':           factor_count,
+        'factors':                factors_present,
+        'fib_match':              fib_match,
+        'fib_fvg_confluence':     fib_fvg_confluence,
+        'volume_cluster_present': vol_match is not None,
+        'description':            description,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — SMC/ICT STRUCTURE ENGINES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5473,6 +5623,119 @@ def ml_signal_score(htf_data, etf_data, indicators_by_tf, session_score, asset='
                             all_tf_results=all_tf_results)
 
 
+def scan_all_timeframes_for_zones(tf_results: dict, thesis_direction: str,
+                                   etf_label: str, current_price: float,
+                                   etf_atr: float) -> dict:
+    """
+    MULTI-TIMEFRAME ZONE SCANNER
+    ══════════════════════════════════════════════════════════
+    Real trading insight this implements: a trader's HTF zone sets the
+    directional bias and a FAR target, but price routinely gets intercepted
+    by a closer, fresher zone on an intermediate timeframe before ever
+    reaching the original HTF zone — and that interception is often where
+    the real reaction and entry happens.
+
+    This function scans EVERY available timeframe between (and including)
+    the HTF and the ETF for fresh FVGs/OBs in the thesis direction, and
+    returns the zone CLOSEST to current price that meets a minimum
+    confluence bar — regardless of which specific timeframe it formed on.
+    A 30M zone that's closer and well-confirmed beats a 4H zone that's
+    further away and still untouched, exactly as the user described from
+    their own real trade.
+
+    This does NOT discard the original HTF zone — it is still returned as
+    the "far target" / fallback reference. It simply stops insisting that
+    price must reach the HTF zone specifically when a nearer, qualifying
+    zone has already formed and is more immediately relevant.
+
+    Returns the prioritized zone plus full visibility into every candidate
+    considered, so the AI can explain WHY a particular timeframe's zone was
+    chosen over another — directly answering "why this zone and not the
+    4H one" the way the user would want explained.
+    """
+    target_direction = 'BULL' if thesis_direction == 'BULLISH' else 'BEAR'
+    candidates = []
+
+    # Scan every available timeframe (skip the ETF itself — that's handled
+    # separately by the existing confirmation engine, v18)
+    for tf_label, tf_data in tf_results.items():
+        if tf_label == etf_label or tf_label.startswith('_'):
+            continue
+        atr = tf_data.get('atr', 0)
+        if atr <= 0:
+            continue
+
+        for fvg in tf_data.get('fvg_fresh', []):
+            if fvg.get('direction') != target_direction:
+                continue
+            mid = (fvg.get('top', 0) + fvg.get('bottom', 0)) / 2
+            dist_atr = abs(current_price - mid) / etf_atr if etf_atr > 0 else 999
+            candidates.append({
+                'timeframe': tf_label, 'type': 'FVG',
+                'top': fvg.get('top'), 'bottom': fvg.get('bottom'),
+                'mid': mid, 'dist_atr': dist_atr,
+            })
+
+        for ob in tf_data.get('ob_fresh', []):
+            if ob.get('direction') != target_direction:
+                continue
+            mid = (ob.get('high', 0) + ob.get('low', 0)) / 2
+            dist_atr = abs(current_price - mid) / etf_atr if etf_atr > 0 else 999
+            candidates.append({
+                'timeframe': tf_label, 'type': 'OB',
+                'top': ob.get('high'), 'bottom': ob.get('low'),
+                'mid': mid, 'dist_atr': dist_atr,
+            })
+
+    if not candidates:
+        return {
+            'has_qualifying_zone': False,
+            'prioritized_zone':    None,
+            'all_candidates':      [],
+            'description':         'No fresh FVG/OB found on any timeframe in the thesis direction.',
+        }
+
+    # Sort by proximity to current price — nearest wins, regardless of timeframe
+    candidates.sort(key=lambda c: c['dist_atr'])
+    nearest = candidates[0]
+
+    # Identify the most distant candidate too (typically the original HTF
+    # zone) so both the near and far reference points are visible together
+    farthest = max(candidates, key=lambda c: c['dist_atr'])
+
+    all_tf_mentioned = sorted(set(c['timeframe'] for c in candidates))
+
+    description = (
+        f"Scanned {len(all_tf_mentioned)} timeframe(s) ({', '.join(all_tf_mentioned)}) for "
+        f"{thesis_direction.lower()} zones. NEAREST qualifying zone: {nearest['timeframe']} "
+        f"{nearest['type']} at {nearest['bottom']}-{nearest['top']} ({nearest['dist_atr']:.2f} ATR away). "
+    )
+    if farthest['timeframe'] != nearest['timeframe']:
+        description += (
+            f"A more distant reference also exists on {farthest['timeframe']} "
+            f"({farthest['bottom']}-{farthest['top']}, {farthest['dist_atr']:.2f} ATR away) — "
+            f"this remains a valid FAR target if price runs through the nearer zone, but the "
+            f"nearer zone should be the PRIMARY watch level."
+        )
+
+    return {
+        'has_qualifying_zone': True,
+        'prioritized_zone': {
+            'timeframe': nearest['timeframe'], 'type': nearest['type'],
+            'top': nearest['top'], 'bottom': nearest['bottom'],
+            'dist_atr': round(nearest['dist_atr'], 2),
+        },
+        'far_reference_zone': {
+            'timeframe': farthest['timeframe'], 'type': farthest['type'],
+            'top': farthest['top'], 'bottom': farthest['bottom'],
+            'dist_atr': round(farthest['dist_atr'], 2),
+        } if farthest['timeframe'] != nearest['timeframe'] else None,
+        'all_candidates':      candidates,
+        'timeframes_scanned':  all_tf_mentioned,
+        'description':         description,
+    }
+
+
 def detect_pullback_setup(htf_data: dict, etf_data: dict,
                            all_tf_results: dict, indicators_by_tf: dict) -> dict:
     """
@@ -6103,7 +6366,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
                live_mid_price=None, live_bid=None, live_ask=None, live_tick_epoch=None):
     result={}
     has_live_price = live_mid_price is not None and live_mid_price > 0
-    tf_order=['D1','4H','1H','15M','5M']
+    tf_order=['D1','4H','1H','30M','15M','5M']
     avail=[tf for tf in tf_order if tf in candles_by_tf and len(candles_by_tf[tf])>20]
     if not avail: return {'error':'No valid timeframes provided'}
 
@@ -6114,7 +6377,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         SYNTHETIC_ASSETS = {'BOOM1000', 'CRASH1000', 'VOL75', 'VOL100'}
         if asset in SYNTHETIC_ASSETS and tf in ('W1', 'D1'):
             continue
-        candles = candles[-300:] if tf in ('1H', '15M') else candles[-500:]
+        candles = candles[-300:] if tf in ('1H', '15M', '30M') else candles[-500:]
         
         # Cache candles for reuse within 2 minutes
         cache_key = f"{tf}_{candles[-1]['epoch'] if candles else 0}"
@@ -6129,7 +6392,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         # more generous tolerance since one HTF candle represents much more
         # real time than one LTF candle of the same count.
         _staleness_map = {
-            '4H': 18, '1H': 24, '15M': 40, '5M': 45, '1M': 50,
+            '4H': 18, '1H': 24, '30M': 32, '15M': 40, '5M': 45, '1M': 50,
             'D1': 20, 'W1': 15,
         }
         _staleness = _staleness_map.get(tf, None)  # None → auto 40% of window
@@ -6298,6 +6561,20 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
 
     mode_label = 'SCALPING MODE' if etf in ('5M', '15M') and htf in ('4H', '1H') else 'SWING MODE'
     existing_thesis = get_active_thesis(asset, mode_label)
+
+    # v20: Scan ALL intermediate timeframes for a nearer, qualifying zone
+    # before falling back to the single HTF zone detect_pullback_setup()
+    # would otherwise use. This directly implements the real trading
+    # behavior of checking 4H → 1H → 30M → 15M for whichever zone price
+    # actually respects, rather than rigidly waiting on the HTF zone alone.
+    multi_tf_zones = scan_all_timeframes_for_zones(
+        tf_results        = result,
+        thesis_direction  = direction if 'direction' in dir() else (existing_thesis['direction'] if 'existing_thesis' in dir() and existing_thesis else result.get(etf, {}).get('trend', 'NEUTRAL')),
+        etf_label         = etf,
+        current_price     = result.get(etf, {}).get('current_price', 0),
+        etf_atr           = result.get(etf, {}).get('atr', 0),
+    )
+
     thesis_status_note = None
     current_etf_price = result.get(etf, {}).get('current_price', 0)
     etf_atr = result.get(etf, {}).get('atr', 0)
@@ -6317,9 +6594,54 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         else:
             # Thesis survives — track proximity and attempt zone refinement
             proximity_result = track_zone_proximity(existing_thesis, current_etf_price, etf_atr)
-            existing_thesis = refine_thesis_zone(
-                existing_thesis, result.get(etf, {}), result.get(htf, {}), etf_atr
-            )
+
+            # v20: Check if a nearer zone has developed on ANY timeframe
+            # since the thesis was formed — this takes priority over the
+            # narrower FVG-only refinement from v16, since it's a broader
+            # search across the full timeframe stack, not just zones near
+            # the original price level.
+            if multi_tf_zones.get('has_qualifying_zone'):
+                prioritized = multi_tf_zones['prioritized_zone']
+                # Only actually update if this zone is genuinely closer than
+                # what the thesis currently has, and meaningfully different
+                # (avoid no-op churn on a zone that's basically the same)
+                current_dist = abs(current_etf_price - ((existing_thesis.get('entry_low', 0) + existing_thesis.get('entry_high', 0)) / 2)) / etf_atr if etf_atr > 0 else 999
+                if prioritized['dist_atr'] < current_dist - 0.15:  # meaningful improvement, not noise
+                    old_zone_desc = f"{existing_thesis.get('entry_low')}-{existing_thesis.get('entry_high')} (originally identified)"
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        c = conn.cursor()
+                        now = datetime.now(timezone.utc).isoformat()
+                        c.execute('''UPDATE active_thesis SET entry_low=?, entry_high=?, zone_source=?,
+                                     zone_refined_count=zone_refined_count+1, updated_at=? WHERE id=?''',
+                                  (prioritized['bottom'], prioritized['top'],
+                                   f"MTF_INTERCEPT_{prioritized['timeframe']}_{prioritized['type']}",
+                                   now, existing_thesis['id']))
+                        conn.commit()
+                        conn.close()
+                        existing_thesis = dict(existing_thesis)
+                        existing_thesis['entry_low']  = prioritized['bottom']
+                        existing_thesis['entry_high'] = prioritized['top']
+                        existing_thesis['zone_source'] = f"MTF_INTERCEPT_{prioritized['timeframe']}_{prioritized['type']}"
+                        existing_thesis['_refinement_note'] = (
+                            f"ZONE INTERCEPTED: A nearer {prioritized['timeframe']} {prioritized['type']} "
+                            f"({prioritized['bottom']}-{prioritized['top']}, {prioritized['dist_atr']} ATR away) "
+                            f"has developed and now takes priority over the original target "
+                            f"{old_zone_desc}. Direction and overall thesis remain unchanged — "
+                            f"only the specific entry zone has updated to the nearer, more "
+                            f"immediately relevant level."
+                        )
+                    except Exception:
+                        pass
+                else:
+                    existing_thesis = refine_thesis_zone(
+                        existing_thesis, result.get(etf, {}), result.get(htf, {}), etf_atr,
+                    )
+            else:
+                existing_thesis = refine_thesis_zone(
+                    existing_thesis, result.get(etf, {}), result.get(htf, {}), etf_atr,
+                )
+
             confirm_thesis(existing_thesis['id'])
 
             # v16.1: THIS is the actual fix — use the LOCKED numbers from
@@ -6501,6 +6823,23 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         )
         thesis_status_note = f'NEW THESIS FORMED (#{new_thesis_id}). No prior active thesis existed for this asset/mode.'
 
+    # v19: Score the final entry zone against the user's own SMC framework —
+    # Fibonacci + FVG + ChoCH + volume cluster confluence, exactly mirroring
+    # the "Strong Supply/Demand Zone" criteria from their own methodology.
+    zone_confluence = None
+    if 'approx_entry_low' in locals() and approx_entry_low and 'approx_entry_high' in locals() and approx_entry_high:
+        etf_data_for_confluence = result.get(etf, {})
+        zone_confluence = score_zone_confluence(
+            zone_price_low   = approx_entry_low,
+            zone_price_high  = approx_entry_high,
+            fibonacci        = etf_data_for_confluence.get('fibonacci'),
+            fvgs             = etf_data_for_confluence.get('fvg_fresh', []) + etf_data_for_confluence.get('fvg_mitigated', []),
+            obs              = etf_data_for_confluence.get('ob_fresh', []),
+            bos_choch        = etf_data_for_confluence.get('bos_choch', []),
+            volume_profile   = etf_data_for_confluence.get('volume_profile'),
+            atr              = etf_data_for_confluence.get('atr', 0),
+        )
+
     # v18: Multi-trigger LTF confirmation — checks FVG retest quality, OB
     # retest, structural CHoCH, sweep+displacement, and polarity-flip retest
     # IN PARALLEL, returning whichever valid confirmation actually fired.
@@ -6588,6 +6927,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         'htf_polarity_flip': result.get(htf, {}).get('polarity_flip', {'flip_detected': False}),
         'etf_polarity_flip': result.get(etf, {}).get('polarity_flip', {'flip_detected': False}),
         'pullback_pattern':   pullback_pattern,
+        'multi_tf_zone_scan': multi_tf_zones,
         'pullback_stage':     pullback_stage,
         'trigger_proximity':  trigger_proximity,
         'ltf_confirmation':   ltf_confirmation,
@@ -6599,6 +6939,7 @@ def run_engine(candles_by_tf, asset='', account_size=10000, risk_pct=1.0,
         'fundamental_intel':  fundamental_intel,
         'quant_evidence':     quant_evidence,
         'technical_evidence': technical_evidence,
+        'zone_confluence':    zone_confluence,
     }
     return result
 

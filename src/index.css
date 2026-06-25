@@ -12,7 +12,7 @@
   body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    @apply bg-[#030712] text-zinc-300;
+    @apply bg-slate-50 text-slate-800;
   }
 }
 

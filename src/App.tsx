@@ -27,7 +27,7 @@ export default function App() {
     }
     clearTimeout(timeoutId);
     const data = await response.json();
-    return data.result;
+    return data;
   };
 
   if (!hasStarted) {

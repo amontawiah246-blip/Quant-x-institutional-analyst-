@@ -38,6 +38,7 @@ const TIMEFRAMES: Record<string, { granularity: number; label: string }[]> = {
     {granularity:604800,label:'W1'},
     {granularity:14400, label:'4H'},
     {granularity:3600,  label:'1H'},
+    {granularity:1800,  label:'30M'},
     {granularity:900,   label:'15M'},
     {granularity:300,   label:'5M'},
   ],
@@ -46,17 +47,20 @@ const TIMEFRAMES: Record<string, { granularity: number; label: string }[]> = {
     {granularity:86400, label:'D1'},
     {granularity:14400, label:'4H'},
     {granularity:3600,  label:'1H'},
+    {granularity:1800,  label:'30M'},
     {granularity:900,   label:'15M'},
   ],
   'SYNTHETIC SCALP': [
     {granularity:14400, label:'4H'},
     {granularity:3600,  label:'1H'},
+    {granularity:1800,  label:'30M'},
     {granularity:900,   label:'15M'},
     {granularity:300,   label:'5M'},
   ],
   'SYNTHETIC SWING': [
     {granularity:14400, label:'4H'},
     {granularity:3600,  label:'1H'},
+    {granularity:1800,  label:'30M'},
     {granularity:900,   label:'15M'},
   ],
 };
@@ -567,6 +571,13 @@ function formatEngineResults(engineData:any): string {
     block += `\n⚠️ CONFIDENCE DRIFT: ${s.confidence_drift_note}\n`;
   }
 
+  if (s.multi_tf_zone_scan?.has_qualifying_zone) {
+    const mtz = s.multi_tf_zone_scan;
+    block += `\nMULTI_TIMEFRAME_ZONE_SCAN:\n`;
+    block += `  ${mtz.description}\n`;
+    block += `  Timeframes scanned: ${mtz.timeframes_scanned.join(', ')}\n`;
+  }
+
   // Technical Evidence Package
   if(s.technical_evidence){
     const te = s.technical_evidence;
@@ -639,6 +650,17 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
     block += `  Win Probability: ${qe.win_probability?.value}% [${qe.win_probability?.mode}] TP1:${qe.win_probability?.tp1_pct}% SL:${qe.win_probability?.sl_pct}%\n`;
     block += `  Expected Value: ${qe.expected_value?.value}R | ${qe.expected_value?.verdict} | Kelly Half:${qe.expected_value?.kelly_half_pct}%\n`;
     block += `  Backtest: WR=${qe.backtest?.win_rate_raw}%(adj:${qe.backtest?.win_rate_adj}%) PF=${qe.backtest?.profit_factor} n=${qe.backtest?.trades} | ${qe.backtest?.verdict}\n`;
+  }
+
+  // Zone Confluence Scoring (v19)
+  if (s.zone_confluence) {
+    const zc = s.zone_confluence;
+    block += `\nZONE_CONFLUENCE_SCORE (Fib+FVG+ChoCH+Volume):\n`;
+    block += `  ${zc.zone_strength} — Score: ${zc.score}/100 (${zc.factor_count} factors)\n`;
+    block += `  ${zc.description}\n`;
+    if (zc.fib_fvg_confluence) {
+      block += `  ★ FIBONACCI + FVG CONFLUENCE CONFIRMED — this is the user's defined high-probability entry pattern.\n`;
+    }
   }
 
   if(s.cross_asset?.status==='OK'&&s.cross_asset.correlations?.length){
@@ -972,6 +994,29 @@ Check the 🔒 THESIS STATUS line before writing your Market Narrative.
   continuity system over a momentary fresh read — this is precisely the
   discipline that prevents flip-flopping on small, noisy price wobbles.
 
+MULTI-TIMEFRAME ZONE INTERCEPTION (v20):
+The thesis DIRECTION is locked once formed (v16). The specific ENTRY ZONE
+is NOT permanently locked to whichever timeframe it was first identified
+on — it updates to the NEAREST qualifying zone found across ALL scanned
+timeframes (4H, 1H, 30M, 15M), not just the original HTF zone.
+- This reflects real trading behavior: price often gets intercepted by a
+  closer, fresher zone on an intermediate timeframe before ever reaching
+  the original, more distant HTF zone — and that interception is frequently
+  where the actual reaction happens.
+- If the thesis_status_note or zone_source mentions "MTF_INTERCEPT", explain
+  this PLAINLY to the trader: "the original [X timeframe] zone at [old
+  level] hasn't been reached, but a fresher [Y timeframe] zone has formed
+  closer to current price and now takes priority — direction is unchanged,
+  only the specific level to watch has updated."
+- NEVER insist on waiting for the original HTF zone specifically if a
+  nearer, qualifying zone on ANY scanned timeframe has already formed.
+  The market does not owe a visit to any one specific timeframe's zone —
+  it will respect whichever zone it actually respects, and the job is to
+  track that, not to dogmatically wait on one timeframe.
+- The original, more distant zone (if still relevant) should still be
+  mentioned as a FAR reference/fallback target — not discarded entirely,
+  just deprioritized as the PRIMARY watch level in favor of the nearer one.
+
 LOCKED VS FRESH CONFIDENCE (v16.1):
 When an active thesis is CONFIRMED (not new), the win probability and
 confluence score you are given are the LOCKED values from when the thesis
@@ -1001,6 +1046,34 @@ conviction works.
       do not describe this as a "moderate conflict" or "tug-of-war." Describe
       it accurately as "HTF structure lacks recent confirmation" or similar,
       and weight the fresher timeframe's trend more heavily in your bias.
+
+ZONE CONFLUENCE SCORING (v19) — MATCHES THE USER'S OWN SMC FRAMEWORK:
+Check the ZONE_CONFLUENCE_SCORE block. This scores the entry zone against
+five factors: Fibonacci level, FVG, order block, ChoCH/BOS, and volume
+cluster (POC/Value Area/HVN — an activity-weighted proxy, not true exchange
+volume; state this honestly if asked about precision).
+- "STRONG ZONE" (4-5 factors): This matches the user's own definition of a
+  high-probability "Strong Supply/Demand Zone." Cite this explicitly and
+  treat it as meaningfully increasing confidence — this is the BEST possible
+  zone quality in their framework.
+- "MODERATE ZONE" (3 factors): A reasonable zone, but missing one element of
+  the full stack. Still tradeable, but say so plainly — don't inflate this
+  to the same confidence as a STRONG ZONE.
+- "WEAK ZONE" (1-2 factors) or "NO CONFLUENCE": This zone lacks the
+  confluence the user's own framework requires for a high-probability entry.
+  If the verdict is otherwise leaning EXECUTE, this is a real reason to
+  reconsider sizing down further or waiting for a better zone — chasing a
+  weak-confluence zone is explicitly listed as a "Common Mistake" in their
+  own framework ("Entering without FVG or strong confluence").
+- If fib_fvg_confluence is true, explicitly use the phrase "Fibonacci +
+  FVG confluence" in your narrative — this is the user's own named, specific
+  high-probability pattern, and using their own vocabulary makes the report
+  directly actionable against their existing trading process.
+- NEVER claim the volume cluster factor reflects true exchange volume —
+  always describe it as an activity-weighted price-time proxy if you
+  reference it, since retail forex/CFD data does not include real tick
+  volume.
+
 - Is price at a significant level (OB, FVG, liquidity, POC) or in no-man's land?
 - Does the regime support this type of entry? (Trending regime → BOS+OB entries. Ranging → mean reversion.)
 - Has a liquidity sweep occurred? Is it genuine displacement or a trap?
@@ -2045,6 +2118,7 @@ Respond ONLY with this JSON (no markdown):
       // Falls back to regex if JSON block is missing
       let summaryCard = '';
       let numberMismatchDetected = false;
+      let finalSignalData: any = null;
       try {
         const summary    = engineData?._summary || {};
         const etfData    = engineData?.[summary.etf] || {};
@@ -2318,6 +2392,7 @@ Respond ONLY with this JSON (no markdown):
             }
           }).catch((e:any) => console.log('Thesis save failed (non-fatal):', e.message));
         }
+        finalSignalData = signalData;
       } catch(saveErr:any){ console.log('Signal save:',saveErr.message); }
 
       const aiFooter = [
@@ -2336,7 +2411,7 @@ Respond ONLY with this JSON (no markdown):
       responseText += `\n\n---\n*${aiFooter}*`;
 
       console.log(`Done. AI:${aiUsed} | News:${newsData.freshCount}fresh/${newsData.staleCount}stale | Reasoning:${openRouterReasoning?'YES':'NO'}`);
-      res.json({result:responseText});
+      res.json({result:responseText, signalData: finalSignalData});
 
     } catch(err:any){ console.log('Error:',err); res.status(500).json({error:err.message}); } finally { analysisInProgress = false; }
   });
