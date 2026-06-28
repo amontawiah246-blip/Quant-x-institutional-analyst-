@@ -237,7 +237,7 @@ async function fetchRSSNews(asset:string): Promise<{
   await Promise.allSettled(sources.map(async (source) => {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(()=>controller.abort(), 8000);
+      const timeout = setTimeout(()=>controller.abort(), 2000);
       const resp = await fetch(source.url, {
         signal:controller.signal,
         headers:{'User-Agent':'Mozilla/5.0','Accept':'application/rss+xml,application/xml,text/xml,*/*'},
@@ -1823,6 +1823,7 @@ async function startServer() {
       });
 
       // 1. Fetch candles
+      console.time('fetchCandles');
       const isSynthetic = SYNTHETICS.has(derivSymbol);
       const modeKey = isSynthetic
         ? (mode === 'SWING MODE' ? 'SYNTHETIC SWING' : 'SYNTHETIC SCALP')
@@ -1840,24 +1841,13 @@ async function startServer() {
           rawBlock+=`time,open,high,low,close\n${r.value.slice(-200).map(c=>`${c.date},${c.open},${c.high},${c.low},${c.close}`).join('\n')}\n`;
         } else { rawBlock+=`\n${tf.label}: FETCH FAILED\n`; }
       }
+      console.timeEnd('fetchCandles');
 
-      // 2, 3, 4 — Engine + News + OpenRouter ALL run in parallel
-      // OpenRouter only needs candles (already available), not the engine output
-      // This saves 3-5 seconds by not waiting for engine before starting reasoning
       const etfLabel      = timeframes[timeframes.length-1]?.label;
       const etfCandles    = candlesByTF[etfLabel] || [];
 
-      // Build a minimal early context for OpenRouter — candles only, no engine needed
-      const earlyContext = {
-        asset,
-        etfCandles,
-        htfTrend: 'CALCULATING', // engine not done yet — OpenRouter works from candles directly
-      };
-
       // v9 fix: Fetch LIVE tick price to override the stale candle close
-      // The last candle in any timeframe is a COMPLETED candle — its close
-      // can be up to 5 minutes old on 5M TF, compounded by the 2min cache.
-      // This single tick fetch is near-instant and gives the real current price.
+      console.time('fetchLiveTick');
       const liveTick = derivSymbol ? await fetchLiveTick(derivSymbol) : null;
       const liveMidPrice = liveTick?.mid ?? null;
 
@@ -1866,8 +1856,10 @@ async function startServer() {
       } else {
         console.warn(`Live tick unavailable for ${asset} — falling back to last candle close`);
       }
+      console.timeEnd('fetchLiveTick');
 
       // Engine and news run in parallel — independent of each other
+      console.time('engineAndNews');
       const [engineResult, newsResult] = await Promise.allSettled([
         runPythonEngine(
           candlesByTF,
@@ -1883,118 +1875,13 @@ async function startServer() {
       ]);
       const engineData = engineResult.status === 'fulfilled' ? engineResult.value : {error:'Engine failed'};
       const newsData   = newsResult.status  === 'fulfilled' ? newsResult.value  : {items:[], hasHighImpact:false, highImpactEvents:[], freshCount:0, staleCount:0};
+      console.timeEnd('engineAndNews');
 
-      // OpenRouter runs AFTER engine — gets full calculated context for better reasoning
       const engineBlock          = formatEngineResults(engineData);
       const newsBlock            = formatNewsBlock(newsData as any, asset);
-      const openRouterReasoning  = await fetchOpenRouterReasoning(asset, engineData, etfCandles, newsBlock);
+      const openRouterReasoning  = ''; // Bypassed for speed
 
-            // ── Tier 1: Python keyword sentiment (fast baseline) ──────────────────
-      const sentimentResult = await runPythonOperation({
-        operation:  'score_sentiment',
-        news_items: (newsData as any).items || [],
-        asset:      asset,
-      });
-      let sentimentIntel = sentimentResult?.error ? null : sentimentResult;
-
-      // ── Tier 2: AI Sentiment Interpretation (priced-in detection) ─────────
-      const headlines = (newsData as any).items || [];
-      if (headlines.length > 0 && process.env.GEMINI_API_KEY && sentimentIntel) {
-        try {
-          const headlineBlock = headlines
-            .slice(0, 10)
-            .map((h: any, i: number) =>
-              `${i+1}. [${h.ageMinutes}min ago | ${h.source}] ${h.title}`
-              + (h.summary ? `\n   ${h.summary.slice(0, 100)}` : '')
-            ).join('\n');
-
-          const dxyFact   = engineData?._summary?.fundamental_intel?.dxy_environment?.raw_fact || 'DXY unavailable';
-          const yieldFact = engineData?._summary?.fundamental_intel?.yield_environment?.raw_fact || 'Yields unavailable';
-          const macroBias = engineData?._summary?.cross_asset?.macro_bias || 'Unknown';
-
-          const sentimentAIPrompt = `You are a professional macro analyst evaluating news sentiment for ${asset}.
-
-LIVE MACRO CONTEXT:
-- ${dxyFact}
-- ${yieldFact}
-- Macro bias: ${macroBias}
-
-RECENT HEADLINES (newest first):
-${headlineBlock}
-
-KEYWORD SCORE (Python baseline): ${sentimentIntel.sentiment_label} (score: ${sentimentIntel.overall_score})
-
-For each headline, classify: GENUINE (new market-moving info), PRICED_IN (market expected this), NOISE (irrelevant), or TRAP (sounds bullish but likely distribution/retail bait).
-
-Rules:
-- "Fed stays hawkish" after months of hawkish guidance = PRICED_IN
-- "CPI beats" when consensus expected a beat = PRICED_IN
-- "Emergency rate decision" or "surprise GDP miss" = GENUINE
-- Gold bullish news during DXY strength = possible TRAP
-- Headlines describing moves that already happened = PRICED_IN
-
-Respond ONLY with this JSON (no markdown):
-{"ai_sentiment_label":"STRONGLY_BULLISH|BULLISH|NEUTRAL|BEARISH|STRONGLY_BEARISH","ai_sentiment_score":0.0,"priced_in_assessment":"one sentence","actionable_headlines":["..."],"noise_headlines":["..."],"trap_detected":false,"trap_explanation":null,"ai_sentiment_note":"2-3 sentences for the trader","confidence":"HIGH|MEDIUM|LOW"}`;
-
-          let aiSentResp: any;
-          let attempt = 0;
-          let currentModel = 'gemini-3.5-flash';
-          const backoff = [1500, 3000];
-          while (attempt < 3) {
-            try {
-              aiSentResp = await ai.models.generateContent({
-                model: currentModel,
-                contents: [{ role: 'user', parts: [{ text: sentimentAIPrompt }] }],
-                config: { temperature: 0.1, maxOutputTokens: 600 },
-              });
-              break;
-            } catch (err: any) {
-              const m = err.message || '';
-              const isQuotaExceeded = m.includes('429') || m.includes('quota') || m.includes('RESOURCE_EXHAUSTED');
-              const isUnavailable = m.includes('503') || m.includes('UNAVAILABLE') || m.includes('overloaded');
-              if ((isQuotaExceeded || isUnavailable) && currentModel === 'gemini-3.5-flash') {
-                console.log(`Gemini ${currentModel} quota exceeded or unavailable. Falling back to gemini-3.1-flash-lite...`);
-                currentModel = 'gemini-3.1-flash-lite';
-                continue;
-              }
-              attempt++;
-              if (attempt >= 3) {
-                console.log(`Gemini AI sentiment generation failed completely for all models: ${m}`);
-                throw err;
-              }
-              await new Promise(r => setTimeout(r, backoff[attempt - 1]));
-            }
-          }
-
-          const rawAI = (aiSentResp.text || '').replace(/```json|```/g, '').trim();
-          try {
-            const parsed = JSON.parse(rawAI);
-            sentimentIntel = {
-              ...sentimentIntel,
-              ai_interpreted:          true,
-              ai_sentiment_label:      parsed.ai_sentiment_label      || sentimentIntel.sentiment_label,
-              ai_sentiment_score:      parsed.ai_sentiment_score      ?? sentimentIntel.overall_score,
-              priced_in_assessment:    parsed.priced_in_assessment    || '',
-              actionable_headlines:    parsed.actionable_headlines    || [],
-              noise_headlines:         parsed.noise_headlines         || [],
-              trap_detected:           parsed.trap_detected           ?? false,
-              trap_explanation:        parsed.trap_explanation        || null,
-              ai_sentiment_note:       parsed.ai_sentiment_note       || '',
-              ai_confidence:           parsed.confidence              || 'LOW',
-              keyword_sentiment_label: sentimentIntel.sentiment_label,
-              keyword_score:           sentimentIntel.overall_score,
-              sentiment_divergence: (
-                sentimentIntel.sentiment_label !== parsed.ai_sentiment_label
-                  ? `DIVERGENCE: Keywords=${sentimentIntel.sentiment_label} vs AI=${parsed.ai_sentiment_label} — likely priced-in`
-                  : 'ALIGNED'
-              ),
-            };
-          } catch { sentimentIntel.ai_interpreted = false; }
-        } catch (err: any) {
-          console.log('AI sentiment failed:', err.message);
-          if (sentimentIntel) sentimentIntel.ai_interpreted = false;
-        }
-      }
+      let sentimentIntel = null; // Bypassed for speed
 
       // Merge sentiment intelligence into engine summary
       if(engineData?._summary && sentimentIntel) {
@@ -2015,11 +1902,10 @@ Respond ONLY with this JSON (no markdown):
         ? `\n⛔ CALENDAR HARD PAUSE: ${calPauseReason}\nShow PRE-EVENT SETUP BRIEF only.\n` : '';
 
       const userPrompt = [
-        rawBlock, engineBlock, newsBlock, reasoningBlock, calWarning,
+        engineBlock, newsBlock, reasoningBlock, calWarning,
         `Perform complete institutional analysis for ${asset} in ${mode}.`,
         `BIDIRECTIONAL: Analyse both bull and bear scenarios. Do not only look for one direction.`,
         `NEWS: Only cite FRESH or BREAKING items. Never stale news as current driver.`,
-        `SPIKES: If last 10 candles show >0.3% move, address it explicitly in narrative.`,
         `LEVELS: Use engine results for all prices. Never "wait for tap" on MITIGATED level.`,
         calHardPause ? 'CALENDAR HARD PAUSE ACTIVE. PRE-EVENT SETUP BRIEF only.'
           : hasHighImpact ? '⚠️ HIGH-IMPACT EVENT. Add trade pause warning.'
@@ -2038,11 +1924,12 @@ Respond ONLY with this JSON (no markdown):
       let responseText = ''; let aiUsed = 'none';
 
       // ── ANALYSIS LAYER ────────────────────────────────────────────────────
+      console.time('geminiAnalysis');
       // Step 1: Gemini 2.5 Flash (3 retries with exponential backoff)
 
       try {
         let response:any; let attempt=0;
-        let currentAnalysisModel = 'gemini-3.5-flash';
+        let currentAnalysisModel = 'gemini-3.1-flash-lite';
         const backoff=[2000, 4000];
         while(attempt<3){
            try {
@@ -2058,12 +1945,6 @@ Respond ONLY with this JSON (no markdown):
              const m=e1.message||'';
              const isRateLimit = m.includes('429') || m.includes('quota') || m.includes('RESOURCE_EXHAUSTED');
              const retry = m.includes('503') || m.includes('UNAVAILABLE') || m.includes('overloaded');
-             
-             if((isRateLimit || retry) && currentAnalysisModel === 'gemini-3.5-flash') {
-               console.log(`Gemini ${currentAnalysisModel} quota/rate limit reached or unavailable. Switching to gemini-3.1-flash-lite model...`);
-               currentAnalysisModel = 'gemini-3.1-flash-lite';
-               continue;
-             }
              
              attempt++;
              
@@ -2082,7 +1963,6 @@ Respond ONLY with this JSON (no markdown):
       } catch(geminiErr:any){
         console.log('Gemini skipped:', geminiErr.message);
 
-        // Compact prompt for fallback models (no raw CSV, just engine+news+reasoning)
         const compactPrompt = buildCompactPrompt(asset, mode, timeframes, candlesByTF, engineBlock, newsBlock, reasoningBlock, calWarning, hasHighImpact, calHardPause);
 
         // Step 2: GPT-4o via old GITHUB_TOKEN
