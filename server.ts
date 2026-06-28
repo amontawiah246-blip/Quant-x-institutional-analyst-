@@ -923,7 +923,7 @@ If your verdict is EXECUTE, you MUST define a clear structural invalidation leve
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
-function buildSystemPrompt(_asset: string, _mode: string): string {
+function buildSystemPrompt(asset: string, mode: string): string {
   return `You are QUANT-X — a Senior Portfolio Manager reviewing research prepared by your quantitative analysis team.
 
 CURRENT UTC TIME: ${new Date().toISOString()}
@@ -1648,7 +1648,7 @@ INTEGRITY:
 }
 
 // ─── Rule-based fallback ──────────────────────────────────────────────────────
-function generateRuleBasedSummary(asset:string, _mode:string, engineData:any): string {
+function generateRuleBasedSummary(asset:string, mode:string, engineData:any): string {
   if(!engineData||engineData.error) return `## ⚠️ ALL AI MODELS UNAVAILABLE\n\nPython engine data below.\nTry again in 2-3 minutes.\n`;
   const s=engineData._summary||{}; const cal=s.calendar||{};
   const etf=engineData[s.etf]||{}; const htf=engineData[s.htf]||{};
@@ -1680,7 +1680,7 @@ async function startServer() {
   app.use(express.urlencoded({extended:true,limit:'50mb'}));
 
   // Health check endpoint
-  app.get('/api/health', (_req, res) => {
+  app.get('/api/health', (req, res) => {
     res.json({
       status:   'OK',
       version:  'QUANT-X v9',
@@ -1696,10 +1696,10 @@ async function startServer() {
   app.get('/api/live-price', async (req, res) => {
     const asset  = (req.query.asset as string || '').toUpperCase();
     const symbol = DERIV_SYMBOLS[asset];
-    if (!symbol) { res.status(400).json({ error: 'Unknown asset' }); return; }
+    if (!symbol) return res.status(400).json({ error: 'Unknown asset' });
 
     const tick = await fetchLiveTick(symbol);
-    if (!tick) { res.status(503).json({ error: 'Price unavailable' }); return; }
+    if (!tick) return res.status(503).json({ error: 'Price unavailable' });
 
     res.json({
       asset,
@@ -1791,25 +1791,6 @@ async function startServer() {
     catch(e:any){ res.status(500).json({error:e.message}); }
   });
 
-  app.get('/api/signals', async (req, res) => {
-    try {
-      const response = await runPythonOperation({ operation: 'get_dashboard', limit: parseInt(req.query.limit as string || '50') });
-      res.json({ success: true, data: response.signals || [] });
-    } catch(e:any) { res.status(500).json({ error: e.message }); }
-  });
-
-  app.get('/api/active-thesis', async (_req, res) => {
-    res.json({ success: true, data: [] });
-  });
-
-  app.get('/api/asset-weights', async (_req, res) => {
-    res.json({ success: true, data: [] });
-  });
-
-  app.get('/api/daily-performance', async (_req, res) => {
-    res.json({ success: true, data: [] });
-  });
-
   app.post('/api/save-signal', async(req,res)=>{
     try { res.json(await runPythonOperation({operation:'save_signal',signal:req.body})); }
     catch(e:any){ res.status(500).json({error:e.message}); }
@@ -1819,20 +1800,19 @@ async function startServer() {
 
   app.post('/api/analyze', async(req,res)=>{
     if(analysisInProgress) {
-      res.status(429).json({
+      return res.status(429).json({
         error: 'Analysis already in progress. Please wait for it to complete.',
         retry_after: 30,
       });
-      return;
     }
     analysisInProgress = true;
     try {
       const {asset, mode, image, accountSize, riskPct} = req.body;
       const userAccountSize = parseFloat(accountSize) || 10000;
       const userRiskPct     = parseFloat(riskPct) || 1.0;
-      if(!process.env.GEMINI_API_KEY) { res.status(500).json({error:'GEMINI_API_KEY not configured.'}); return; }
+      if(!process.env.GEMINI_API_KEY) return res.status(500).json({error:'GEMINI_API_KEY not configured.'});
       const derivSymbol = DERIV_SYMBOLS[asset];
-      if(!derivSymbol) { res.status(400).json({error:`No Deriv symbol: ${asset}`}); return; }
+      if(!derivSymbol) return res.status(400).json({error:`No Deriv symbol: ${asset}`});
       const ai = new GoogleGenAI({
         apiKey: process.env.GEMINI_API_KEY as string,
         httpOptions: {
@@ -1868,7 +1848,11 @@ async function startServer() {
       const etfCandles    = candlesByTF[etfLabel] || [];
 
       // Build a minimal early context for OpenRouter — candles only, no engine needed
-      // const earlyContext = { ... };
+      const earlyContext = {
+        asset,
+        etfCandles,
+        htfTrend: 'CALCULATING', // engine not done yet — OpenRouter works from candles directly
+      };
 
       // v9 fix: Fetch LIVE tick price to override the stale candle close
       // The last candle in any timeframe is a COMPLETED candle — its close
@@ -2438,7 +2422,7 @@ Respond ONLY with this JSON (no markdown):
   } else {
     const distPath=path.join(process.cwd(),'dist');
     app.use(express.static(distPath));
-    app.get('*all',(_req,res)=>res.sendFile(path.join(distPath,'index.html')));
+    app.get('*all',(req,res)=>res.sendFile(path.join(distPath,'index.html')));
   }
 
   app.listen(PORT,'0.0.0.0',()=>{
