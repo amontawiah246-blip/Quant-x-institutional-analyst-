@@ -1837,18 +1837,8 @@ async function startServer() {
           candlesByTF[tf.label]=r.value;
           const last=r.value[r.value.length-1]; const oldest=r.value[0];
           rawBlock+=`\n${tf.label}: ${r.value.length} candles | ${oldest.date} to ${last.date} | Close:${last.close}\n`;
+          rawBlock+=`time,open,high,low,close\n${r.value.slice(-200).map(c=>`${c.date},${c.open},${c.high},${c.low},${c.close}`).join('\n')}\n`;
         } else { rawBlock+=`\n${tf.label}: FETCH FAILED\n`; }
-      }
-
-      // Build a small recentPriceBlock with only the last 20 candles for specific timeframes
-      const recentTFs = mode === 'SWING MODE' ? ['1H', '4H'] : ['1H', '30M', '5M'];
-      let recentPriceBlock = `# RECENT PRICE DATA (Last 20 Candles)\n`;
-      for (const tfLabel of recentTFs) {
-        const candles = candlesByTF[tfLabel];
-        if (candles && candles.length > 0) {
-          recentPriceBlock += `\n## ${tfLabel} Timeframe (Recent 20 Candles)\n`;
-          recentPriceBlock += `time,open,high,low,close\n${candles.slice(-20).map(c => `${c.date},${c.open},${c.high},${c.low},${c.close}`).join('\n')}\n`;
-        }
       }
 
       // 2, 3, 4 — Engine + News + OpenRouter ALL run in parallel
@@ -2025,7 +2015,7 @@ Respond ONLY with this JSON (no markdown):
         ? `\n⛔ CALENDAR HARD PAUSE: ${calPauseReason}\nShow PRE-EVENT SETUP BRIEF only.\n` : '';
 
       const userPrompt = [
-        recentPriceBlock, engineBlock, newsBlock, reasoningBlock, calWarning,
+        rawBlock, engineBlock, newsBlock, reasoningBlock, calWarning,
         `Perform complete institutional analysis for ${asset} in ${mode}.`,
         `BIDIRECTIONAL: Analyse both bull and bear scenarios. Do not only look for one direction.`,
         `NEWS: Only cite FRESH or BREAKING items. Never stale news as current driver.`,
@@ -2260,32 +2250,11 @@ Respond ONLY with this JSON (no markdown):
         const verdictLabel2 = realVerdict.replace(/_/g, ' ');
         const emoji = verdictEmoji[realVerdict] || '⚪';
 
-        // Step 3A: Extract and normalize core engine-computed components
-        const winPctVal      = realWinPct !== null ? realWinPct : 50;
-        const confluenceVal  = realConfluence !== null ? realConfluence : 50;
-        const evVal          = realEV !== null ? realEV : 0.0;
-
-        // Step 3B: Compute a weighted, EV-adjusted composite confidence score
-        // Base score = 60% Win Probability + 40% Confluence Score
-        let compositeConfidence = (winPctVal * 0.6) + (confluenceVal * 0.4);
-
-        // Dynamic adjustment based on expected value (EV)
-        if (evVal > 0.2) {
-          // Grant positive EV boost, capped at +10 pts
-          compositeConfidence += Math.min(10, (evVal - 0.2) * 5);
-        } else if (evVal < 0) {
-          // Penalize negative EV up to -20 pts
-          compositeConfidence -= Math.min(20, Math.abs(evVal) * 10);
-        }
-
-        const finalCompositeScore = Math.max(0, Math.min(100, Math.round(compositeConfidence)));
-
-        // Step 3C: Determine verbal confidence bucket using the composite score
         let confidenceBucket = 'UNKNOWN';
-        if (realWinPct !== null || realConfluence !== null) {
-          if (finalCompositeScore >= 70) confidenceBucket = 'STRONG';
-          else if (finalCompositeScore >= 55) confidenceBucket = 'MODERATE';
-          else if (finalCompositeScore >= 40) confidenceBucket = 'WEAK';
+        if (realWinPct !== null) {
+          if (realWinPct >= 65) confidenceBucket = 'STRONG';
+          else if (realWinPct >= 50) confidenceBucket = 'MODERATE';
+          else if (realWinPct >= 35) confidenceBucket = 'WEAK';
           else confidenceBucket = 'VERY WEAK';
         }
 
@@ -2315,9 +2284,7 @@ Respond ONLY with this JSON (no markdown):
         if (realDirection !== 'NEUTRAL') summaryCard += ` — ${realDirection}`;
         summaryCard += `\n\n`;
         summaryCard += `| Metric | Value |\n|---|---|\n`;
-        // Step 3D: Display composite confidence and components in the markdown table
-        summaryCard += `| Composite Confidence | ${finalCompositeScore}% (${confidenceBucket}) |\n`;
-        summaryCard += `| Win Probability | ${realWinPct !== null ? realWinPct + '%' : 'N/A'} |\n`;
+        summaryCard += `| Confidence | ${realWinPct !== null ? realWinPct + '%' : 'N/A'} (${confidenceBucket}) |\n`;
         summaryCard += `| Confluence Score | ${realConfluence !== null ? realConfluence + '/100' : 'N/A'} |\n`;
         summaryCard += `| Expected Value | ${realEV !== null ? realEV + 'R' : 'N/A'} |\n`;
         if (sampleSize !== null) {
