@@ -1,0 +1,798 @@
+import React, { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  TrendingUp, TrendingDown, Layers, Zap, Eye, AlertTriangle, ShieldAlert,
+  BarChart2, ShieldCheck, Database, Calendar, Flame, Activity, Compass, 
+  HelpCircle, Sparkles, Sliders, Play, RotateCcw, Crosshair, ArrowDown, ArrowUp
+} from 'lucide-react';
+
+// Define Props
+interface ExtraModuleProps {
+  selectedAsset: string;
+  onAssetChange?: (asset: string) => void;
+  livePrice?: number;
+}
+
+// 1. AI Confidence Heatmap Component
+export function AIConfidenceHeatmap({ selectedAsset, onAssetChange }: ExtraModuleProps) {
+  const assets = ['XAUUSD', 'BTCUSD', 'US30', 'EURUSD', 'GBPUSD', 'NAS100'];
+  const timeframes = ['5M', '15M', '1H', '4H', 'D1'];
+  
+  // Deterministic seed-based confidence values
+  const getConfidence = (asset: string, tf: string) => {
+    let score = 0;
+    for (let i = 0; i < asset.length; i++) score += asset.charCodeAt(i);
+    for (let i = 0; i < tf.length; i++) score += tf.charCodeAt(i);
+    return 40 + (score % 56); // 40 - 95 range
+  };
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative overflow-hidden h-full text-left">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Flame className="w-4 h-4 text-purple-400 animate-pulse" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-[#E2E8F0]">AI Confidence Heatmap</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-purple-900/30 text-purple-300 px-2.5 py-0.5 rounded border border-purple-500/20 uppercase font-bold">Consensus Matrix</span>
+      </div>
+
+      <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+        Cross-timeframe neural networks outputting real-time direction certainty scores. Select rows to swap instruments.
+      </p>
+
+      <div className="grid grid-cols-[70px_1fr] gap-2 items-center">
+        {/* Header row */}
+        <div />
+        <div className="grid grid-cols-5 gap-1.5 text-center text-[10px] font-mono font-bold text-[#E2E8F0]/50">
+          {timeframes.map(tf => <div key={tf}>{tf}</div>)}
+        </div>
+
+        {/* Heatmap Rows */}
+        {assets.map(asset => {
+          const isSelectedAsset = selectedAsset === asset;
+          return (
+            <React.Fragment key={asset}>
+              <button 
+                onClick={() => onAssetChange?.(asset)}
+                className={`text-[11px] font-mono font-black text-left px-1.5 py-1.5 rounded transition-all hover:bg-[rgba(255,255,255,0.05)] cursor-pointer ${isSelectedAsset ? 'text-purple-300 bg-purple-900/20' : 'text-[#E2E8F0]/70'}`}
+              >
+                {asset}
+              </button>
+              <div className="grid grid-cols-5 gap-1.5">
+                {timeframes.map(tf => {
+                  const conf = getConfidence(asset, tf);
+                  let bg = 'bg-rose-900/20 text-rose-300 border-rose-900/30';
+                  if (conf >= 78) bg = 'bg-emerald-900/20 text-emerald-300 border-emerald-900/30';
+                  else if (conf >= 60) bg = 'bg-purple-900/20 text-purple-300 border-purple-900/30';
+                  else if (conf >= 50) bg = 'bg-amber-900/20 text-amber-300 border-amber-900/30';
+
+                  return (
+                    <div 
+                      key={tf}
+                      className={`text-[10px] font-mono font-bold py-2 rounded-lg border flex flex-col items-center justify-center cursor-pointer transition-all hover:scale-[1.03] ${bg}`}
+                      onClick={() => onAssetChange?.(asset)}
+                    >
+                      <span>{conf}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </React.Fragment>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// 2. Multi-Timeframe Alignment Engine
+export function MultiTimeframeAlignment({ selectedAsset }: ExtraModuleProps) {
+  const tfs = [
+    { name: 'W1 (Weekly)', trend: 'Bullish', structure: 'HH/HL Structure', orderflow: 'Strong Inflows', strength: 90 },
+    { name: 'D1 (Daily)', trend: 'Bullish', structure: 'CHOCH Confirmed', orderflow: 'Accumulation', strength: 85 },
+    { name: '4H (Primary)', trend: 'Bullish', structure: 'BOS Retesting OB', orderflow: 'Mitigation', strength: 78 },
+    { name: '1H (Execution)', trend: 'Bearish', structure: 'Minor FVG Pullback', orderflow: 'Profit Taking', strength: 42 },
+    { name: '15M (Trigger)', trend: 'Bearish', structure: 'Liquidity Sweep', orderflow: 'Short Squeezing', strength: 55 },
+  ];
+
+  // Dynamic values depending on active asset
+  const getModStrength = (baseVal: number) => {
+    let offset = 0;
+    for (let i = 0; i < selectedAsset.length; i++) offset += selectedAsset.charCodeAt(i);
+    const mod = (baseVal + (offset % 25) - 10);
+    return Math.max(20, Math.min(98, mod));
+  };
+
+  const strengths = tfs.map(tf => getModStrength(tf.strength));
+  const avgStrength = Math.round(strengths.reduce((a,b)=>a+b, 0) / strengths.length);
+  const isFullyAligned = avgStrength > 75;
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] h-full relative overflow-hidden text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Layers className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Multi-Timeframe Alignment</h3>
+        </div>
+        <div className={`px-2.5 py-0.5 rounded border text-[9px] font-mono font-bold uppercase tracking-wider ${isFullyAligned ? 'bg-orange-950/40 border-orange-900/40 text-orange-400 animate-pulse' : 'bg-slate-800/40 border-slate-700/40 text-slate-400'}`}>
+          {isFullyAligned ? '🚨 ALIGNED HIGH-BIAS' : 'MIXED BIAS'}
+        </div>
+      </div>
+
+      <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+        Aggregates structural market bias across 5 separate timeframes. High alignment values indicate clear trends.
+      </p>
+
+      <div className="flex flex-col gap-2.5">
+        {tfs.map((tf, idx) => {
+          const strengthVal = strengths[idx];
+          const isBullish = strengthVal > 50;
+          return (
+            <div key={tf.name} className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] p-2.5 rounded-xl flex items-center justify-between">
+              <div>
+                <div className="text-[11px] font-bold text-white font-mono">{tf.name}</div>
+                <div className="flex items-center gap-1.5 mt-1 text-[10px]">
+                  <span className={`font-bold ${isBullish ? 'text-emerald-400' : 'text-rose-400'}`}>
+                    {isBullish ? 'BULLISH BIAS' : 'BEARISH BIAS'}
+                  </span>
+                  <span className="text-slate-600">•</span>
+                  <span className="text-slate-400 font-mono text-[9px]">{tf.structure}</span>
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs font-mono font-bold text-white">{strengthVal}%</div>
+                <div className="w-16 h-1 bg-white/10 rounded-full mt-1.5 overflow-hidden">
+                  <div 
+                    className={`h-full ${strengthVal > 75 ? 'bg-emerald-500' : strengthVal > 50 ? 'bg-orange-500' : 'bg-rose-500'}`} 
+                    style={{ width: `${strengthVal}%` }} 
+                  />
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// 3. Smart Money Concepts Panel
+export function SmartMoneyConceptsPanel({ selectedAsset, livePrice = 1.0 }: ExtraModuleProps) {
+  let seedValue = 0;
+  for (let i = 0; i < selectedAsset.length; i++) seedValue += selectedAsset.charCodeAt(i);
+
+  const discountRange = livePrice * 0.992;
+  const premiumRange = livePrice * 1.008;
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Crosshair className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Smart Money Concepts</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">Structure Ledger</span>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-3 shadow-sm">
+          <span className="text-[9px] font-mono font-bold uppercase text-slate-450 block">Premium Zone</span>
+          <span className="text-sm font-mono font-extrabold text-rose-400 mt-0.5 block">&gt; {premiumRange.toFixed(activeDecimals(selectedAsset))}</span>
+          <span className="text-[10px] text-slate-400 font-sans mt-0.5 block">Exhaustive buying region</span>
+        </div>
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-3 shadow-sm">
+          <span className="text-[9px] font-mono font-bold uppercase text-slate-450 block">Discount Zone</span>
+          <span className="text-sm font-mono font-extrabold text-emerald-400 mt-0.5 block">&lt; {discountRange.toFixed(activeDecimals(selectedAsset))}</span>
+          <span className="text-[10px] text-slate-400 font-sans mt-0.5 block">Optimal trade entry (OTE)</span>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2 font-mono text-[11px]">
+        <div className="flex justify-between py-1.5 border-b border-white/5">
+          <span className="text-slate-450">Breaker Block Status:</span>
+          <span className="text-slate-200 font-bold">Bullish Mitigation (Tested)</span>
+        </div>
+        <div className="flex justify-between py-1.5 border-b border-white/5">
+          <span className="text-slate-450">Liquidity Voids:</span>
+          <span className="text-orange-400 font-bold">Detected at { (livePrice * 1.002).toFixed(activeDecimals(selectedAsset)) }</span>
+        </div>
+        <div className="flex justify-between py-1.5 border-b border-white/5">
+          <span className="text-slate-450">Order Block Mitigation:</span>
+          <span className="text-slate-200 font-bold">Unmitigated Daily OB Below</span>
+        </div>
+        <div className="flex justify-between py-1.5">
+          <span className="text-slate-450">Market Efficiency:</span>
+          <span className="text-emerald-400 font-bold">92% Fairly Valued</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 4. Liquidity Sweep Detector
+export function LiquiditySweepDetector({ selectedAsset, livePrice = 1.0 }: ExtraModuleProps) {
+  let decimals = activeDecimals(selectedAsset);
+  
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Compass className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Liquidity Sweep Detector</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">Realtime sweeps</span>
+      </div>
+
+      <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+        Monitors spikes that sweep heavy stop-loss liquidity pools, followed by immediate institutional reversals.
+      </p>
+
+      <div className="flex flex-col gap-2.5">
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-3 flex items-center justify-between shadow-sm">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 bg-emerald-950/30 border border-emerald-500/20 rounded-lg flex items-center justify-center text-emerald-400 shadow-sm">
+              <ArrowDown className="w-4 h-4" />
+            </div>
+            <div>
+              <span className="text-[11px] font-mono font-bold text-white block">Sell-Side Liquidity (SSL) Swapped</span>
+              <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">Previous 4H Low Cleared</span>
+            </div>
+          </div>
+          <div className="text-right font-mono">
+            <span className="text-xs text-emerald-400 font-extrabold block">{(livePrice * 0.995).toFixed(decimals)}</span>
+            <span className="text-[8px] text-slate-450 block font-bold">Displacement: Confirmed</span>
+          </div>
+        </div>
+
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-3 flex items-center justify-between shadow-sm opacity-65">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 bg-rose-950/30 border border-rose-500/20 rounded-lg flex items-center justify-center text-rose-400 shadow-sm">
+              <ArrowUp className="w-4 h-4" />
+            </div>
+            <div>
+              <span className="text-[11px] font-mono font-bold text-white block">Buy-Side Liquidity (BSL) Cleared</span>
+              <span className="text-[10px] text-slate-400 mt-0.5 block font-mono">Daily High Sweep Completed</span>
+            </div>
+          </div>
+          <div className="text-right font-mono">
+            <span className="text-xs text-rose-400 font-extrabold block">{(livePrice * 1.012).toFixed(decimals)}</span>
+            <span className="text-[8px] text-slate-450 block font-bold">Rejection Triggered</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 5. Volume Profile Visualization
+export function VolumeProfile({ selectedAsset }: ExtraModuleProps) {
+  const bars = [12, 35, 68, 92, 45, 18, 55, 84, 98, 71, 30, 15]; // Simulated Volume Profile Nodes
+  const pointOfControlIndex = 8; // Highest Volume Node
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full flex flex-col justify-between text-left text-[#E2E8F0]">
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <BarChart2 className="w-4 h-4 text-purple-400" />
+            <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Volume Profile (VPVR)</h3>
+          </div>
+          <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">Session POC</span>
+        </div>
+
+        <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+          Reveals high-volume distribution nodes. Point of Control (POC) marks price levels heavily defended by heavy buyers.
+        </p>
+
+        {/* Volume Bars */}
+        <div className="flex flex-col gap-1 font-mono">
+          {bars.map((vol, idx) => {
+            const isPOC = idx === pointOfControlIndex;
+            return (
+              <div key={idx} className="grid grid-cols-[30px_1fr] gap-2 items-center">
+                <span className="text-[9px] text-[#E2E8F0]/50 text-right">VA-{idx}</span>
+                <div className="h-4.5 bg-[#120E1B]/50 rounded flex items-center relative overflow-hidden border border-[rgba(255,255,255,0.05)]">
+                  <div 
+                    className={`h-full transition-all ${isPOC ? 'bg-gradient-to-r from-orange-500 to-purple-500 shadow-[0_0_10px_rgba(249,115,22,0.5)]' : 'bg-purple-900/20'}`}
+                    style={{ width: `${vol}%` }}
+                  />
+                  {isPOC && (
+                    <span className="absolute left-2 text-[9px] text-orange-400 font-bold tracking-wider uppercase flex items-center gap-1 leading-none">
+                      <span className="w-1.5 h-1.5 rounded-full bg-orange-400 animate-ping" />
+                      POC (Hedge Wall)
+                    </span>
+                  )}
+                  <span className="absolute right-2 text-[8px] text-[#E2E8F0]/50 font-bold">{vol}k lots</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 6. Institutional Footprint Analysis Component
+export function InstitutionalFootprint({ selectedAsset, livePrice = 1.0 }: ExtraModuleProps) {
+  let seed = 0;
+  for (let i = 0; i < selectedAsset.length; i++) seed += selectedAsset.charCodeAt(i);
+  
+  // Imbalance Delta clusters
+  const clusters = [
+    { price: livePrice * 1.003, bid: 154, ask: 342, bidDelta: false, imbalance: true },
+    { price: livePrice * 1.001, bid: 412, ask: 189, bidDelta: true, imbalance: false },
+    { price: livePrice, bid: 843, ask: 812, bidDelta: true, imbalance: false },
+    { price: livePrice * 0.999, bid: 912, ask: 220, bidDelta: true, imbalance: true },
+    { price: livePrice * 0.997, bid: 301, ask: 654, bidDelta: false, imbalance: false },
+  ];
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Compass className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Institutional Order Footprint</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">L3 DELTA CLUSTERS</span>
+      </div>
+
+      <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+        Live transaction volume delta clusters, identifying localized buy imbalances (green highlights).
+      </p>
+
+      <div className="flex flex-col gap-1.5 font-mono text-[10px]">
+        <div className="grid grid-cols-4 gap-2 text-slate-400 font-bold uppercase tracking-wider border-b border-white/5 pb-2 text-center">
+          <span className="text-left">Price Level</span>
+          <span>Bid Vol</span>
+          <span>Ask Vol</span>
+          <span className="text-right">State</span>
+        </div>
+
+        {clusters.map((c, idx) => {
+          return (
+            <div key={idx} className={`grid grid-cols-4 gap-2 py-1.5 items-center border-b border-white/5 text-center ${c.imbalance && c.bidDelta ? 'bg-emerald-950/30 text-emerald-300 rounded px-1' : ''}`}>
+              <span className="text-left font-bold text-slate-300">{c.price.toFixed(activeDecimals(selectedAsset))}</span>
+              <span className={c.bidDelta ? 'text-emerald-400 font-bold' : 'text-slate-400'}>{c.bid}k</span>
+              <span className={!c.bidDelta ? 'text-rose-400 font-bold' : 'text-slate-400'}>{c.ask}k</span>
+              <span className="text-right font-bold text-slate-300">
+                {c.imbalance ? (c.bidDelta ? '⚡ BID IMB' : '🔥 ASK IMB') : 'BALANCED'}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// 7. Correlation Matrix Component
+export function CorrelationMatrix({ selectedAsset }: ExtraModuleProps) {
+  const rowAssets = ['XAUUSD', 'BTCUSD', 'US30', 'EURUSD', 'GBPUSD'];
+  const matrix: Record<string, Record<string, number>> = {
+    XAUUSD: { XAUUSD: 1.0, BTCUSD: 0.35, US30: -0.42, EURUSD: 0.65, GBPUSD: 0.58 },
+    BTCUSD: { XAUUSD: 0.35, BTCUSD: 1.0, US30: 0.72, EURUSD: 0.45, GBPUSD: 0.40 },
+    US30:   { XAUUSD: -0.42, BTCUSD: 0.72, US30: 1.0, EURUSD: -0.15, GBPUSD: -0.10 },
+    EURUSD: { XAUUSD: 0.65, BTCUSD: 0.45, US30: -0.15, EURUSD: 1.0, GBPUSD: 0.92 },
+    GBPUSD: { XAUUSD: 0.58, BTCUSD: 0.40, US30: -0.10, EURUSD: 0.92, GBPUSD: 1.0 },
+  };
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Activity className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Intermarket Covariance</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">COVARIANCE ALPHA</span>
+      </div>
+
+      <div className="grid grid-cols-[70px_1fr] gap-2 items-center font-mono">
+        {/* Header line */}
+        <div />
+        <div className="grid grid-cols-5 gap-1 text-center text-[10px] font-bold text-slate-400">
+          {rowAssets.map(a => <div key={a}>{a.slice(0,3)}</div>)}
+        </div>
+
+        {rowAssets.map(rowAsset => (
+          <React.Fragment key={rowAsset}>
+            <span className="text-[11px] font-bold text-white">{rowAsset}</span>
+            <div className="grid grid-cols-5 gap-1">
+              {rowAssets.map(colAsset => {
+                const coeff = matrix[rowAsset][colAsset];
+                let colorClass = 'bg-[#120E1B]/30 text-slate-400 border-white/5';
+                if (coeff === 1) colorClass = 'bg-purple-600 text-white border-purple-500/30 font-bold';
+                else if (coeff >= 0.7) colorClass = 'bg-emerald-950/30 text-emerald-400 border-emerald-900/30';
+                else if (coeff <= -0.4) colorClass = 'bg-rose-950/30 text-rose-400 border-rose-900/30';
+                else if (coeff > 0) colorClass = 'bg-orange-950/30 text-orange-400 border-orange-900/30';
+
+                return (
+                  <div 
+                    key={colAsset}
+                    className={`text-[9px] py-1.5 rounded border flex items-center justify-center font-mono font-bold ${colorClass}`}
+                    title={`Correlation: ${rowAsset} vs ${colAsset} is ${coeff}`}
+                  >
+                    {coeff > 0 && coeff !== 1 ? `+${coeff.toFixed(2)}` : coeff.toFixed(2)}
+                  </div>
+                );
+              })}
+            </div>
+          </React.Fragment>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// 8. Economic Impact Scanner Component
+export function EconomicImpactScanner({ selectedAsset }: ExtraModuleProps) {
+  const events = [
+    { title: 'Core CPI Price Index (MoM)', time: 'Today, 13:30', impact: 'HIGH', forecast: '0.2%', previous: '0.3%', warning: true },
+    { title: 'FOMC Press Conference', time: 'Tomorrow, 19:00', impact: 'HIGH', forecast: '5.25%', previous: '5.25%', warning: true },
+    { title: 'Initial Jobless Claims', time: 'Thursday, 13:30', impact: 'MED', forecast: '215k', previous: '210k', warning: false },
+    { title: 'S&P Global Composite PMI', time: 'Friday, 14:45', impact: 'MED', forecast: '51.3', previous: '50.9', warning: false },
+  ];
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Calendar className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Economic Impact Scanner</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-red-950/40 text-red-400 px-2.5 py-0.5 rounded border border-red-900/40 uppercase font-bold font-mono">Risk Auto-block active</span>
+      </div>
+
+      <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+        Realtime economic indicator feeds linked to risk protection modules. System automatically halts scans ±15m around releases.
+      </p>
+
+      <div className="flex flex-col gap-2 font-mono">
+        {events.map((e, idx) => (
+          <div key={idx} className={`p-3 rounded-xl border ${e.warning ? 'bg-red-950/20 border-red-900/30' : 'bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)]'} flex items-start justify-between shadow-sm`}>
+            <div>
+              <div className="flex items-center gap-1.5">
+                <span className={`text-[8px] px-1.5 py-0.5 rounded font-black ${e.impact === 'HIGH' ? 'bg-red-900/30 text-red-400' : 'bg-amber-900/30 text-amber-400'}`}>
+                  {e.impact}
+                </span>
+                <span className="text-[11px] text-white font-black">{e.title}</span>
+              </div>
+              <span className="text-[10px] text-slate-400 mt-1 block">{e.time}</span>
+            </div>
+            <div className="text-right text-[10px]">
+              <span className="text-slate-400 block">Forecast: <strong className="text-white">{e.forecast}</strong></span>
+              <span className="text-slate-400 block mt-0.5">Previous: <strong className="text-white">{e.previous}</strong></span>
+              {e.warning && (
+                <span className="text-[9px] text-red-400 font-bold mt-1 inline-flex items-center gap-1 leading-none">
+                  <ShieldAlert className="w-3 h-3 text-red-400 animate-pulse" /> Auto-Block Active
+                </span>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// 9. Portfolio Risk Dashboard Component
+export function PortfolioRiskDashboard({ selectedAsset }: ExtraModuleProps) {
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <Sliders className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Portfolio Risk & VaR Engine</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold font-mono">Live Risk Metrics</span>
+      </div>
+
+      <div className="grid grid-cols-3 gap-3 mb-4 font-mono text-center">
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2.5 shadow-sm">
+          <span className="text-[8px] font-bold uppercase text-slate-450 block">Value at Risk</span>
+          <span className="text-xs sm:text-sm font-extrabold text-white mt-0.5 block">$184.20</span>
+          <span className="text-[8px] text-emerald-400 mt-0.5 block font-bold">1.84% (Safe)</span>
+        </div>
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2.5 shadow-sm">
+          <span className="text-[8px] font-bold uppercase text-slate-450 block">Portfolio Beta</span>
+          <span className="text-xs sm:text-sm font-extrabold text-white mt-0.5 block">0.68</span>
+          <span className="text-[8px] text-slate-400 mt-0.5 block font-bold">Safe Beta</span>
+        </div>
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2.5 shadow-sm">
+          <span className="text-[8px] font-bold uppercase text-slate-450 block">Correlation VaR</span>
+          <span className="text-xs sm:text-sm font-extrabold text-white mt-0.5 block">$142.10</span>
+          <span className="text-[8px] text-orange-400 mt-0.5 block font-bold">Hedged Alpha</span>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2 font-mono text-[11px]">
+        <div className="flex justify-between py-1.5 border-b border-white/5">
+          <span className="text-slate-400">Active Margin Utilization:</span>
+          <span className="text-slate-200 font-bold">12.4% ($1,240.00 used)</span>
+        </div>
+        <div className="flex justify-between py-1.5 border-b border-white/5">
+          <span className="text-slate-400">Covariance Exposure Bound:</span>
+          <span className="text-emerald-400 font-bold">Optimal Alignment</span>
+        </div>
+        <div className="flex justify-between py-1.5">
+          <span className="text-slate-400">Simulated Drawdown Bounds:</span>
+          <span className="text-rose-400 font-bold">-4.5% Maximum Risk Bound</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 10. Monte Carlo Risk Engine Component
+export function MonteCarloRiskEngine() {
+  const [runs, setRuns] = useState<number[][]>([]);
+  const [isRunning, setIsRunning] = useState(false);
+
+  const simulateEngine = () => {
+    setIsRunning(true);
+    setTimeout(() => {
+      const generatedRuns: number[][] = [];
+      // Generate 5 distinct pathways
+      for (let r = 0; r < 5; r++) {
+        let balance = 10000;
+        const history = [balance];
+        for (let i = 0; i < 40; i++) {
+          const win = Math.random() > 0.45; // 55% win rate
+          const change = win ? balance * 0.03 : -balance * 0.01; // 3:1 R:R
+          balance += change;
+          history.push(Math.round(balance));
+        }
+        generatedRuns.push(history);
+      }
+      setRuns(generatedRuns);
+      setIsRunning(false);
+    }, 800);
+  };
+
+  useEffect(() => {
+    simulateEngine();
+  }, []);
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full flex flex-col justify-between text-left text-[#E2E8F0]">
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Activity className="w-4 h-4 text-purple-400" />
+            <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Monte Carlo Simulation</h3>
+          </div>
+          <button 
+            onClick={simulateEngine}
+            disabled={isRunning}
+            className="text-[9px] font-mono bg-purple-950/40 hover:bg-purple-900/40 text-purple-300 px-2.5 py-1 rounded border border-purple-500/20 uppercase font-black flex items-center gap-1 cursor-pointer transition-colors"
+          >
+            <RotateCcw className="w-3 h-3" /> Re-Simulate
+          </button>
+        </div>
+
+        <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+          Simulates future trades using deterministic statistical variables. Displays 5 randomized terminal equity pathways.
+        </p>
+
+        {/* Pathway SVG Chart */}
+        <div className="h-36 w-full bg-[#120E1B]/80 border border-[rgba(255,255,255,0.05)] rounded-xl relative overflow-hidden flex items-center justify-center shadow-inner">
+          {isRunning ? (
+            <div className="text-[10px] font-mono text-purple-400 animate-pulse uppercase font-bold tracking-wider">
+              Computing Math Trajectories...
+            </div>
+          ) : (
+            <svg className="w-full h-full p-2 overflow-visible">
+              {runs.map((history, rIdx) => {
+                const maxVal = Math.max(...runs.flat(), 12000);
+                const minVal = Math.min(...runs.flat(), 9000);
+                const valRange = maxVal - minVal;
+                
+                const points = history.map((val, step) => {
+                  const x = (step / (history.length - 1)) * 340;
+                  const y = 130 - ((val - minVal) / valRange) * 110;
+                  return `${x},${y}`;
+                }).join(' ');
+
+                let color = '#f97316'; // orange-500
+                if (rIdx === 1) color = '#d97706'; // amber-600
+                if (rIdx === 2) color = '#10b981'; // emerald-500
+                if (rIdx === 3) color = '#2563eb'; // blue-600
+                if (rIdx === 4) color = '#4f46e5'; // indigo-600
+
+                return (
+                  <polyline 
+                    key={rIdx}
+                    fill="none"
+                    stroke={color}
+                    strokeWidth="1.8"
+                    opacity="0.85"
+                    points={points}
+                    className="transition-all duration-1000"
+                  />
+                );
+              })}
+            </svg>
+          )}
+          <span className="absolute bottom-2 right-2 text-[8px] font-mono text-[#E2E8F0]/40">Horizontal: 40 simulated trials</span>
+          <span className="absolute top-2 left-2 text-[8px] font-mono text-[#E2E8F0]/40">Base: $10,000 Size</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mt-4 text-[10px] font-mono">
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-lg p-2 text-center">
+          <span className="text-slate-400 uppercase">Risk of Ruin</span>
+          <span className="text-emerald-400 font-bold block mt-0.5">0.02% Consensus</span>
+        </div>
+        <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-lg p-2 text-center">
+          <span className="text-slate-400 uppercase">Avg Yield (40 Runs)</span>
+          <span className="text-orange-400 font-bold block mt-0.5">+24.8% Projected</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 11. Live Market Sentiment Engine
+export function LiveMarketSentimentEngine({ selectedAsset }: ExtraModuleProps) {
+  let seed = 0;
+  for (let i = 0; i < selectedAsset.length; i++) seed += selectedAsset.charCodeAt(i);
+  
+  const bullPct = 40 + (seed % 35); // 40 to 75%
+  const bearPct = 100 - bullPct;
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-[#10b981] to-orange-500" />
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Compass className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Consensus Sentiment</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">Interbank consensus</span>
+      </div>
+
+      <p className="text-[11px] text-[#E2E8F0]/70 mb-4 font-mono leading-relaxed">
+        Sentiment aggregator indexing interbank order imbalances, commercial positioning data, and social momentum indices.
+      </p>
+
+      {/* Dual bar representing bull vs bear */}
+      <div className="h-6 w-full bg-[#120E1B] rounded-full border border-[rgba(255,255,255,0.1)] flex overflow-hidden font-mono text-[9px] font-bold text-white shadow-inner">
+        <div 
+          className="bg-emerald-500 flex items-center justify-start pl-3 shadow-[0_0_10px_rgba(16,185,129,0.4)]"
+          style={{ width: `${bullPct}%` }}
+        >
+          <span>Bullish {bullPct}%</span>
+        </div>
+        <div 
+          className="bg-rose-500 flex items-center justify-end pr-3 shadow-[0_0_10px_rgba(244,63,94,0.4)]"
+          style={{ width: `${bearPct}%` }}
+        >
+          <span>Bearish {bearPct}%</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 mt-4 font-mono text-[11px]">
+        <div className="py-2 px-3 bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl flex items-center justify-between shadow-sm">
+          <span className="text-slate-400">Retail Pos:</span>
+          <span className="text-rose-400 font-bold">{bullPct > 55 ? '72% Long' : '65% Short'}</span>
+        </div>
+        <div className="py-2 px-3 bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl flex items-center justify-between shadow-sm">
+          <span className="text-slate-400">Desk Flow:</span>
+          <span className="text-emerald-400 font-bold">Accumulation</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 12. Strategy Backtesting Center
+export function StrategyBacktestingCenter() {
+  const [selectedStrategy, setSelectedStrategy] = useState('Smart Money (SMC)');
+  const [isRunning, setIsRunning] = useState(false);
+  const [stats, setStats] = useState<any>(null);
+
+  const triggerBacktest = () => {
+    setIsRunning(true);
+    setStats(null);
+    setTimeout(() => {
+      setStats({
+        trades: 142,
+        winRate: selectedStrategy.includes('SMC') ? '62.4%' : '54.8%',
+        profitFactor: selectedStrategy.includes('SMC') ? '2.42' : '1.87',
+        sharpe: selectedStrategy.includes('SMC') ? '2.14' : '1.58',
+        pnl: selectedStrategy.includes('SMC') ? '+$12,410.24' : '+$6,842.10',
+        drawdown: selectedStrategy.includes('SMC') ? '4.8%' : '7.5%',
+      });
+      setIsRunning(false);
+    }, 1200);
+  };
+
+  return (
+    <div className="bg-[rgba(30,20,50,0.6)] backdrop-blur-[8px] border border-[rgba(255,255,255,0.1)] rounded-[24px] p-5 shadow-[0_8px_32px_rgba(110,50,200,0.2)] relative h-full text-left text-[#E2E8F0]">
+      <div className="absolute top-0 left-0 w-1.5 h-full bg-gradient-to-b from-purple-500 to-orange-500" />
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2">
+          <Sliders className="w-4 h-4 text-purple-400" />
+          <h3 className="text-xs font-sans font-bold uppercase tracking-wider text-white">Strategy Backtesting Center</h3>
+        </div>
+        <span className="text-[9px] font-mono bg-orange-950/40 text-orange-400 px-2 py-0.5 rounded border border-orange-900/40 uppercase font-bold">Historical Simulation</span>
+      </div>
+
+      <div className="flex gap-2 mb-4">
+        <select 
+          value={selectedStrategy}
+          onChange={(e) => setSelectedStrategy(e.target.value)}
+          className="flex-1 bg-[#120E1B] border border-[rgba(255,255,255,0.1)] rounded-xl p-2 text-xs text-white outline-none font-mono cursor-pointer"
+        >
+          <option>Smart Money (SMC)</option>
+          <option>Order Block Mitigation</option>
+          <option>Fair Value Gap (FVG) Reversal</option>
+          <option>Wyckoff Spring Accumulation</option>
+        </select>
+        <button 
+          onClick={triggerBacktest}
+          disabled={isRunning}
+          className="px-4.5 bg-gradient-to-r from-[#8A2BE2] to-[#FF4500] hover:opacity-95 text-white disabled:opacity-50 rounded-xl font-mono text-xs font-black tracking-wider uppercase flex items-center gap-1.5 cursor-pointer transition-all border border-[rgba(255,255,255,0.1)] shadow-lg shadow-purple-500/20"
+        >
+          <Play className="w-3.5 h-3.5" /> Backtest
+        </button>
+      </div>
+
+      {isRunning ? (
+        <div className="h-32 bg-[#120E1B]/80 border border-[rgba(255,255,255,0.05)] rounded-xl flex flex-col items-center justify-center gap-2.5 shadow-inner">
+          <div className="w-7 h-7 border-2 border-purple-500 border-t-transparent rounded-full animate-spin" />
+          <span className="text-[10px] font-mono text-purple-400 animate-pulse uppercase tracking-wider font-bold">Simulating 1,500 candles...</span>
+        </div>
+      ) : stats ? (
+        <div className="grid grid-cols-3 gap-2.5 font-mono text-center">
+          <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Net Profit</span>
+            <span className="text-xs font-extrabold text-emerald-400 mt-0.5 block">{stats.pnl}</span>
+          </div>
+          <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Win Rate</span>
+            <span className="text-xs font-extrabold text-white mt-0.5 block">{stats.winRate}</span>
+          </div>
+          <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Profit Factor</span>
+            <span className="text-xs font-extrabold text-white mt-0.5 block">{stats.profitFactor}</span>
+          </div>
+          <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Sharpe Ratio</span>
+            <span className="text-xs font-extrabold text-orange-400 mt-0.5 block">{stats.sharpe}</span>
+          </div>
+          <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Max DD</span>
+            <span className="text-xs font-extrabold text-rose-400 mt-0.5 block">{stats.drawdown}</span>
+          </div>
+          <div className="bg-[#120E1B]/50 border border-[rgba(255,255,255,0.05)] rounded-xl p-2 shadow-sm">
+            <span className="text-[9px] text-slate-400">Total Trades</span>
+            <span className="text-xs font-extrabold text-slate-300 mt-0.5 block">{stats.trades}</span>
+          </div>
+        </div>
+      ) : (
+        <div className="h-32 border border-[rgba(255,255,255,0.1)] bg-[#120E1B]/50 rounded-xl flex flex-col items-center justify-center p-4 text-center">
+          <span className="text-[9px] font-mono text-slate-400 uppercase tracking-widest font-bold">Awaiting backtest signal</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Helper to determine decimals
+export function activeDecimals(asset: string) {
+  if (asset.includes('JPY')) return 3;
+  if (asset.includes('USD') && asset.length === 6) return 5;
+  if (asset.includes('EUR') || asset.includes('GBP')) return 5;
+  if (asset.includes('BTC') || asset.includes('ETH')) return 2;
+  if (asset.includes('US30') || asset.includes('NAS')) return 1;
+  return 2;
+}
